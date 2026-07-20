@@ -17,6 +17,7 @@ from backend.app.indicator_engine.engine import calculate_indicators
 from backend.app.feature_engine.engine import calculate_features
 from backend.app.similarity_engine.engine import SimilarityEngine
 from backend.app.template_manager.manager import TemplateManager
+from backend.app.filters.boll_mid_filter import has_boll_mid_breach
 
 class BacktestEngine:
     def __init__(self):
@@ -77,7 +78,15 @@ class BacktestEngine:
         window_size = config.get("window_size", 60)
         holding_periods = config.get("default_backtest_config", {}).get("holding_periods", [5, 10, 20])
         benchmark = config.get("default_backtest_config", {}).get("benchmark", "sz399300")
-        
+
+        # 模板驱动：如果模板需要 BOLL_MIDDLE_SUPPORT 事件，则启用中轨硬过滤
+        required_events = config.get("required_events", [])
+        require_boll_mid_filter = "BOLL_MIDDLE_SUPPORT" in required_events
+        if require_boll_mid_filter:
+            print(f"🔒 [模板驱动] 该模板需要 BOLL_MIDDLE_SUPPORT，已启用中轨硬过滤（回调触中轨后收盘不可跌破）")
+        else:
+            print(f"ℹ️ [模板驱动] 该模板不需要 BOLL_MIDDLE_SUPPORT，跳过中轨硬过滤")
+
         # 2. 编译模板母体经典形态特征矩阵
         source_symbol = config.get("source_symbol", "sz000002")
         source_end = datetime.strptime(config.get("source_end", "2026-05-01"), "%Y-%m-%d").date()
@@ -144,7 +153,11 @@ class BacktestEngine:
                 min_boll_dist = df_window_t['boll_mid_dist'].abs().min()
                 if min_boll_dist > 0.045:
                     continue
-                    
+
+                # 两级半剪枝：布林中轨硬过滤（仅当模板需要 BOLL_MIDDLE_SUPPORT 时启用）
+                if require_boll_mid_filter and has_boll_mid_breach(df_window_t):
+                    continue
+
                 # 计算相似度
                 report = self.similarity_engine.compute_composite_similarity(
                     df_temp_window,
