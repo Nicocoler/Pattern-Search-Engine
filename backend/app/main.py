@@ -7,7 +7,7 @@ Pattern Search Engine (PSE) - FastAPI 核心接口微服务
 from fastapi import FastAPI, HTTPException, Query, Path, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -132,7 +132,7 @@ def list_templates():
     """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, type, created_at FROM feature_templates ORDER BY id ASC;")
+    cursor.execute("SELECT id, name, type, config, created_at FROM feature_templates ORDER BY id ASC;")
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -484,6 +484,134 @@ def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: B
 
 
 # -------------------------------------------------------------------------
+# 3.9 当日行情数据增量同步接口（快速更新当日最新数据）
+# -------------------------------------------------------------------------
+@app.post("/api/jobs/sync-today-data")
+def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: BackgroundTasks):
+    """
+    仅同步当日最新股票行情数据。
+    预查询已落库当日数据的股票，仅对缺失的个股执行增量抓取，速度快、API 请求量小。
+    内置 IS_SYNCING_LOCKED 运行状态锁，防止与全市场同步任务冲突。
+    """
+    global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
+    from backend.app.data_center.sync import DataCenterSync
+
+    current_payload_dict = payload.dict()
+
+    if IS_SYNCING_LOCKED:
+        if LAST_ACTIVE_PAYLOAD == current_payload_dict:
+            return {
+                "success": False,
+                "data": None,
+                "error": "当前有同步任务正在运行中，请等待完成后再试。"
+            }
+        else:
+            DataCenterSync.CURRENT_GENERATION_ID += 1
+            logger.info(f"检测到配置参数发生变更！最新世代已增至 {DataCenterSync.CURRENT_GENERATION_ID}。系统正在向老任务下达优雅退位指令...")
+    else:
+        IS_SYNCING_LOCKED = True
+
+    current_task_gen_id = DataCenterSync.CURRENT_GENERATION_ID
+    try:
+        LAST_ACTIVE_PAYLOAD = current_payload_dict
+
+        def sync_task_wrapper():
+            global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
+            logger.info(f"[Sync Guard Gen {current_task_gen_id}] 当日数据同步实例已安全落锁起飞。")
+            try:
+                sync_engine = DataCenterSync(
+                    max_concurrent=payload.max_workers,
+                    retry_limit=payload.retry_limit,
+                    delay_min=payload.delay_min,
+                    delay_max=payload.delay_max
+                )
+                sync_engine.sync_today_data(max_workers=payload.max_workers)
+            except Exception as ex:
+                logger.error(f"后台当日数据同步任务执行发生未捕获异常: {ex}")
+            finally:
+                if DataCenterSync.CURRENT_GENERATION_ID == current_task_gen_id:
+                    IS_SYNCING_LOCKED = False
+                    LAST_ACTIVE_PAYLOAD = None
+                    logger.info(f"[Sync Guard Gen {current_task_gen_id}] 全局当日数据同步运行锁已安全释放。")
+
+        background_tasks.add_task(sync_task_wrapper)
+
+        msg = f"当日行情数据同步进程（第 {current_task_gen_id} 世代）点火起飞成功！"
+        if current_task_gen_id > 0:
+            msg = f"成功下达老一代优雅退役指令！新世代（第 {current_task_gen_id} 世代）当日数据同步已按最新参数顺利启动。"
+
+        return {
+            "success": True,
+            "message": msg,
+            "error": None
+        }
+    except Exception as e:
+        if DataCenterSync.CURRENT_GENERATION_ID == current_task_gen_id:
+            IS_SYNCING_LOCKED = False
+            LAST_ACTIVE_PAYLOAD = None
+        logger.error(f"强制触发当日数据同步任务点火异常: {e}")
+        return {"success": False, "data": None, "error": str(e)}
+
+
+# -------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------
+# 4.5 后台同步状态查询接口
+# -------------------------------------------------------------------------
+@app.get("/api/jobs/sync-status")
+def get_sync_status():
+    """
+    查询后台数据同步状态（支持独立守护进程和 FastAPI BackgroundTasks 两种模式）。
+    返回最近一次同步的开始/结束时间、耗时、状态，以及数据库实际最新日K日期。
+    """
+    try:
+        import psycopg2
+        from datetime import date, timedelta
+        conn = psycopg2.connect(settings.DATABASE_URL)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT key, value FROM data_sync_status;")
+            rows = cursor.fetchall()
+            status_map = {k: v for k, v in rows}
+
+            cursor.execute("SELECT MAX(date) FROM daily_bars;")
+            max_row = cursor.fetchone()
+            max_bar_date = max_row[0].strftime("%Y-%m-%d") if max_row and max_row[0] else "N/A"
+
+            today = date.today()
+            weekday = today.weekday()
+            expected_latest = today
+            if weekday == 5:
+                expected_latest = today - timedelta(days=1)
+            elif weekday == 6:
+                expected_latest = today - timedelta(days=2)
+
+            data_is_fresh = (
+                isinstance(max_bar_date, str) and
+                max_bar_date != "N/A" and
+                date.fromisoformat(max_bar_date) >= expected_latest
+            )
+
+            return {
+                "success": True,
+                "data": {
+                    "sync_status_table": status_map,
+                    "actual_latest_bar_date": max_bar_date,
+                    "expected_latest_date": expected_latest.strftime("%Y-%m-%d"),
+                    "is_fresh": data_is_fresh,
+                    "last_sync_status": status_map.get("last_status", "unknown"),
+                    "last_sync_mode": status_map.get("last_mode", "none"),
+                    "last_sync_duration_sec": status_map.get("last_duration_sec", "none"),
+                },
+                "error": None
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"查询同步状态异常: {e}")
+        return {"success": False, "data": None, "error": str(e)}
+
 # 4. 核心同屏对齐比对比对 API (同屏画图神器)
 # -------------------------------------------------------------------------
 @app.get("/api/compare/template/{template_id}/stock/{symbol}")

@@ -447,6 +447,69 @@ class DataCenterSync:
         logger.info(f"   - 总共耗时: {total_elapsed:.1f}秒 (约 {total_elapsed/60:.1f}分钟)")
         logger.info("="*60)
 
+    def sync_today_data(self, max_workers=8):
+        """同步当日最新股票行情数据。预查询已落库当日数据的股票，仅对缺失的个股执行增量抓取。"""
+        logger.info("开始同步当日最新股票行情数据...")
+        today = date.today()
+        codes = self.sync_stock_list()
+        if not codes:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT code FROM stocks WHERE is_suspended = FALSE;")
+            codes = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+            logger.info(f"采用本地 stocks 表中已有活跃股票池，共 {len(codes)} 只股票。")
+        if not codes:
+            logger.error("无可用股票代码，当日数据同步中止。")
+            return
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT code FROM daily_bars WHERE date = %s;", (today,))
+        today_has_data_codes = set(row[0] for row in cursor.fetchall())
+        cursor.close()
+        conn.close()
+        stocks_to_sync = [code for code in codes if code not in today_has_data_codes]
+        skipped_count = len(codes) - len(stocks_to_sync)
+        logger.info(f"当日数据同步预检结果：共 {len(codes)} 只活跃股票 | 已落库当日数据 {skipped_count} 只 | 需要同步 {len(stocks_to_sync)} 只")
+        if not stocks_to_sync:
+            logger.info("所有股票已落库当日数据，无需同步。")
+            return
+        total_stocks = len(stocks_to_sync)
+        logger.info(f"当日行情同步任务分发完成：共计 {total_stocks} 只个股需要同步。线程池规模：{max_workers}。")
+        success_count = 0
+        failure_count = 0
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_code = {executor.submit(self.sync_single_stock_daily_bars, code): code for code in stocks_to_sync}
+            for i, future in enumerate(as_completed(future_to_code), 1):
+                if self.generation_id != DataCenterSync.CURRENT_GENERATION_ID:
+                    logger.info("[Sync Guard] 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步工作任务优雅自行解散，让出跑道。")
+                    break
+                code = future_to_code[future]
+                try:
+                    success = future.result()
+                    if success:
+                        success_count += 1
+                    else:
+                        failure_count += 1
+                except Exception as e:
+                    logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
+                    failure_count += 1
+                if i % 100 == 0 or i == total_stocks:
+                    elapsed = time.time() - start_time
+                    speed = i / elapsed if elapsed > 0 else 0
+                    logger.info(f"当日同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | 成功: {success_count} | 失败: {failure_count} | 耗时: {elapsed:.1f}s | 速度: {speed:.1f}股/秒")
+        total_elapsed = time.time() - start_time
+        logger.info("=" * 60)
+        logger.info("当日行情同步完成！")
+        logger.info(f"   - 需要同步股票数: {total_stocks}")
+        logger.info(f"   - 同步成功数: {success_count}")
+        logger.info(f"   - 同步失败数: {failure_count}")
+        logger.info(f"   - 跳过已有当日数据股票: {skipped_count}")
+        logger.info(f"   - 总共耗时: {total_elapsed:.1f}秒(约 {total_elapsed/60:.1f}分钟)")
+        logger.info("=" * 60)
+
 if __name__ == "__main__":
     sync = DataCenterSync()
     # 第一步：先测试股票列表同步

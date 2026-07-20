@@ -41,19 +41,37 @@ def calculate_indicators(df_bars: pd.DataFrame) -> pd.DataFrame:
     df['ma60'] = df['close'].rolling(window=60, min_periods=60).mean()
     df['ma120'] = df['close'].rolling(window=120, min_periods=120).mean()
 
-    # 4. 布林带精准对齐计算 (BOLL: 20日 SMA 递归中轨, 上轨, 下轨)
-    # 精确匹配通达信/国内主流软件的关键：中轨使用 SMA(CLOSE, 20, 1)，即 alpha=1/20 的 ewm
-    mid_raw = df['close'].ewm(alpha=1.0 / 20.0, adjust=False).mean()
-    
-    # 标准差精确匹配：VART1 = (CLOSE - MID)^2, VART2 = MA(VART1, 20), VART3 = SQRT(VART2)
-    vart1 = (df['close'] - mid_raw) ** 2
+    # 4. 布林带精准对齐计算 (BOLL)
+    # 严格对齐通达信公式：
+    #   N:=20;
+    #   MID:=MA(CLOSE,N);                                    -- 20日简单移动平均
+    #   VART1:=POW((CLOSE-MID),2); VART2:=MA(VART1,N);      -- 总体方差（除以N）
+    #   VART3:=SQRT(VART2);                                  -- 总体标准差
+    #   UPPER:=MID + 2*VART3; LOWER:=MID - 2*VART3;
+    #   BOLL:REF(MID,1); UB:REF(UPPER,1); LB:REF(LOWER,1);  -- 输出滞后1根K线
+
+    # 4.1 中轨：20日简单移动平均 (SMA)，非 EMA
+    mid = df['close'].rolling(window=20, min_periods=20).mean()
+
+    # 4.2 标准差：基于中轨的总体标准差（除以N，非样本标准差除以N-1）
+    vart1 = (df['close'] - mid) ** 2
     vart2 = vart1.rolling(window=20, min_periods=20).mean()
     vart3 = np.sqrt(vart2)
-    
-    # 截断前 19 天，确保前 19 个交易日由于均线暖机无法计算 BOLL
-    df['boll_mid'] = np.where(df.index >= 19, mid_raw, np.nan)
-    df['boll_upper'] = np.where(df.index >= 19, mid_raw + 2.0 * vart3, np.nan)
-    df['boll_lower'] = np.where(df.index >= 19, mid_raw - 2.0 * vart3, np.nan)
+
+    # 4.3 上轨 / 下轨
+    upper = mid + 2.0 * vart3
+    lower = mid - 2.0 * vart3
+
+    # 4.4 REF(MID,1) / REF(UPPER,1) / REF(LOWER,1) —— 滞后1根K线输出
+    # 与通达信一致：当日显示的BOLL值 = 前一日基于截至前一日收盘价计算的轨道
+    df['boll_mid'] = mid.shift(1)
+    df['boll_upper'] = upper.shift(1)
+    df['boll_lower'] = lower.shift(1)
+
+    # 截断暖机期：rolling需20日数据，shift再丢1行，故前20行无效
+    df['boll_mid'] = np.where(df.index >= 20, df['boll_mid'], np.nan)
+    df['boll_upper'] = np.where(df.index >= 20, df['boll_upper'], np.nan)
+    df['boll_lower'] = np.where(df.index >= 20, df['boll_lower'], np.nan)
     
     # 4.1 计算布林带宽度及带宽变化 Width = (Upper - Lower) / Middle
     # 预防 middle 出现 0 导致零除异常

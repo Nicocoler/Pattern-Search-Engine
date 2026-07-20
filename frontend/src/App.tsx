@@ -125,6 +125,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [syncingToday, setSyncingToday] = useState(false);
 
   // 扩展可配置参数（持久化存储到本地 localStorage，重启后自动无缝读取）
   const [windowSize, setWindowSize] = useState(() => Number(localStorage.getItem('window_size') || '60'));
@@ -165,7 +166,7 @@ export default function App() {
   const [selectedTemplateDetail, setSelectedTemplateDetail] = useState<Template | null>(null);
   
   // 每日扫描
-  const [runDate, setRunDate] = useState('2026-07-19');
+  const [runDate, setRunDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
   const [selectedStock, setSelectedStock] = useState<ScanResult | null>(null);
   const [compareData, setCompareData] = useState<ComparePayload | null>(null);
@@ -252,6 +253,33 @@ export default function App() {
     }
   };
 
+  const handleSyncTodayData = async () => {
+    setSyncingToday(true);
+    showToast('正在发送当日数据同步指令，后端已接管...');
+    try {
+      const res = await fetch(`${apiBase}/api/jobs/sync-today-data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          max_workers: maxWorkers,
+          retry_limit: retryLimit,
+          delay_min: delayMin,
+          delay_max: delayMax
+        })
+      });
+      const json = await res.json();
+      if (json.success) {
+        showToast('当日数据同步指令启动成功！后端已开始快速抓取缺失数据，请查看 Terminal 日志监控！');
+      } else {
+        showToast('同步启动失败：' + (json.error || json.message));
+      }
+    } catch (e) {
+      showToast('未连接上后端服务，同步指令发送超时。');
+    } finally {
+      setTimeout(() => setSyncingToday(false), 3000);
+    }
+  };
+
   // 4.2 当选中的模板 ID 改变时，拉取模板详情
   useEffect(() => {
     if (selectedTemplateId !== null) {
@@ -272,6 +300,13 @@ export default function App() {
         setSelectedTemplateDetail(json.data);
         if (json.data.weights) {
           setWeightsMap(json.data.weights);
+        }
+        // 回填表单字段
+        if (json.data.config) {
+          if (json.data.name) setNewTplName(json.data.name);
+          if (json.data.config.source_symbol) setNewTplSymbol(json.data.config.source_symbol);
+          if (json.data.config.source_end) setNewTplEndDate(json.data.config.source_end);
+          if (json.data.config.window_size) setNewTplWindowSize(json.data.config.window_size);
         }
       }
     } catch (e) {
@@ -516,7 +551,10 @@ export default function App() {
         showToast(`🎉 形态标尺 [${newTplName}] 一键注册点火成功！`);
         await fetchTemplates();
         setNewTplName('');
+        setNewTplName('');
         setNewTplSymbol('');
+        setNewTplEndDate('2026-07-19');
+        setNewTplWindowSize(60);
         setResolvedStockName('');
       } else {
         showToast('创建模板失败：' + json.error);
@@ -530,13 +568,19 @@ export default function App() {
 
   // 4.14 覆盖更新当前选中模板的特征权重
   const handleUpdateTemplate = async () => {
-    if (!selectedTemplateDetail || selectedTemplateId === null) return;
+    if (!selectedTemplateId || selectedTemplateDetail === null) return;
     setLoading(true);
     try {
+      const cleanSym = newTplSymbol.toLowerCase().trim();
       const payload = {
-        name: selectedTemplateDetail.name,
+        name: newTplName.trim() || selectedTemplateDetail.name,
         type: selectedTemplateDetail.type,
-        config: selectedTemplateDetail.config,
+        config: {
+          ...selectedTemplateDetail.config,
+          source_symbol: cleanSym || selectedTemplateDetail.config?.source_symbol,
+          source_end: newTplEndDate || selectedTemplateDetail.config?.source_end,
+          window_size: newTplWindowSize || selectedTemplateDetail.config?.window_size
+        },
         weights: weightsMap
       };
       
@@ -820,7 +864,7 @@ export default function App() {
     }, syncing ? 1500 : 3000);
 
     return () => clearInterval(interval);
-  }, [activeTab, syncing, apiBase]);
+  }, [activeTab, syncing, syncingToday, apiBase]);
 
   // 4.10 渲染高可扩展系统设置 Tab 面板
   const renderSettingsTab = () => {
@@ -869,6 +913,27 @@ export default function App() {
               <Database size={16} className={syncing ? 'spinner' : ''} style={{ marginRight: '0.4rem', verticalAlign: 'middle' }} />
               {syncing ? '全市场高并发增量同步抓取中...' : '一键同步全市场 A 股行情 (增量续传)'}
             </button>
+            <button
+              className="btn-primary"
+              style={{
+                padding: '0.65rem 1.5rem',
+                fontSize: '0.9rem',
+                background: 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)',
+                boxShadow: '0 4px 12px rgba(59, 130, 246, 0.3)',
+                border: 'none',
+                cursor: 'pointer',
+                borderRadius: '6px',
+                fontWeight: 'bold'
+              }}
+              onClick={handleSyncTodayData}
+              disabled={syncing || syncingToday}
+            >
+              <Calendar size={16} className={syncingToday ? 'spinner' : ''} style={{ marginRight: '0.4rem', verticalAlign: 'middle' }} />
+              {syncingToday ? '当日数据快速同步中...' : '更新获取当日最新数据'}
+            </button>
+            <p className="sync-safety-tip" style={{ color: 'var(--color-text-muted)', fontSize: '0.72rem', lineHeight: '1.5' }}>
+              快速模式仅同步当日缺失数据，已落库当日数据的股票会直接跳过，速度更快、请求更少。
+            </p>
             <p className="sync-safety-tip">
               🛡️ <b>自适应断点续传已激活：</b> 重启后端或同步中断后再次启动，系统会自动执行毫秒级秒传，自动跳过已更新完成的历史个股，绝不重头拉取！
             </p>
