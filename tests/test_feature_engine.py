@@ -166,5 +166,43 @@ class TestIndicatorAndFeatureEngine(unittest.TestCase):
         self.assertEqual(df_feat.loc[100, 'is_limit_one_line'], 1.0)
         self.assertEqual(df_feat.loc[103, 'is_limit_one_line'], 0.0) # 后续正常日子恢复为 0
 
+
+    def test_suspended_day_not_misclassified_as_one_line(self):
+        """
+        P0-1 回归测试：停牌日（volume=0）不应被误判为“一字板”。
+        一字板定义要求有成交量且高低价差极小。
+        """
+        df_suspended = self.df_main.copy()
+        # 模拟第 50 天停牌：成交量归零，价格不变（high == low）
+        df_suspended.loc[50, 'volume'] = 0
+        df_suspended.loc[50, 'amount'] = 0
+        ref_close = df_suspended.loc[49, 'close']
+        fixed_price = ref_close * 1.10  # 复牌后涨停价
+        df_suspended.loc[50, 'open'] = fixed_price
+        df_suspended.loc[50, 'high'] = fixed_price
+        df_suspended.loc[50, 'low'] = fixed_price
+        df_suspended.loc[50, 'close'] = fixed_price
+        
+        df_ind = calculate_indicators(df_suspended)
+        df_feat = calculate_features(df_ind, "sh600000")
+        
+        # 停牌日 volume=0，即使 high==low，is_limit_one_line 应为 0.0
+        self.assertEqual(df_feat.loc[50, 'is_limit_one_line'], 0.0)
+        
+        # 正常一字板（volume > 0 且 high == low）应标记为 1.0
+        df_one_line = self.df_main.copy()
+        for i in [100, 101, 102]:
+            limit_price = df_one_line.loc[i-1, 'close'] * 1.10
+            df_one_line.loc[i, 'open'] = limit_price
+            df_one_line.loc[i, 'high'] = limit_price
+            df_one_line.loc[i, 'low'] = limit_price
+            df_one_line.loc[i, 'close'] = limit_price
+            df_one_line.loc[i, 'volume'] = 50  # 象征性微量成交
+        df_ind_ol = calculate_indicators(df_one_line)
+        df_feat_ol = calculate_features(df_ind_ol, "sh600000")
+        self.assertEqual(df_feat_ol.loc[100, 'is_limit_one_line'], 1.0)
+        self.assertEqual(df_feat_ol.loc[101, 'is_limit_one_line'], 1.0)
+        self.assertEqual(df_feat_ol.loc[102, 'is_limit_one_line'], 1.0)
+
 if __name__ == "__main__":
     unittest.main()

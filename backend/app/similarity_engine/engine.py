@@ -28,6 +28,17 @@ class SimilarityEngine:
             "atr_ratio": 0.05          # 波动率
         }
 
+    def _prepare_feature_matrix(self, df: pd.DataFrame, cols: list[str]) -> np.ndarray:
+        """
+        准备 DTW 输入矩阵，正确处理暖机期 NaN：
+        - 先 bfill+ffill 利用相邻有效值传播
+        - 再用各列均值填充仍为 NaN 的位置（避免 warmup NaN 被误当作 0.0）
+        """
+        mat = df[cols].bfill().ffill()
+        for col in cols:
+            mat[col] = mat[col].fillna(mat[col].mean())
+        return mat.fillna(0.0).to_numpy()
+
     def local_zscore_normalize(self, matrix: np.ndarray) -> np.ndarray:
         """
         对传入的矩阵 $W \times F$ 在列维度（每个特征）上进行独立的局部 Z-score 标准化。
@@ -322,8 +333,8 @@ class SimilarityEngine:
         df_temp_p['close_norm'] = df_temp_p['close'] / df_temp_p['close'].iloc[0]
         df_cand_p['close_norm'] = df_cand_p['close'] / df_cand_p['close'].iloc[0]
         
-        T = df_temp_p[cols].bfill().ffill().fillna(0.0).to_numpy()
-        C = df_cand_p[cols].bfill().ffill().fillna(0.0).to_numpy()
+        T = self._prepare_feature_matrix(df_temp_p, cols)
+        C = self._prepare_feature_matrix(df_cand_p, cols)
         T_norm = self.local_zscore_normalize(T)
         C_norm = self.local_zscore_normalize(C)
         

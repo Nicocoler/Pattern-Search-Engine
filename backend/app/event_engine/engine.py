@@ -58,12 +58,17 @@ def calculate_gaussian_confidence(x: float, mu: float, sigma: float) -> float:
         return 0.0
     return float(np.exp(-((x - mu) ** 2) / (2.0 * (sigma ** 2))))
 
+
+def _safe_bool(series: pd.Series) -> pd.Series:
+    """将布尔特征列安全转为 bool，NaN（暖机期）视为 False。"""
+    return series.fillna(False).astype(bool)
+
 class EventDetector:
     """
     所有特定事件识别器的标准基类
     """
     event_type: str = "BASE_EVENT"
-    version: str = "event_v1.1.0"
+    version: str = "event_v1.1.1"
 
     def detect(self, df_window: pd.DataFrame) -> list[PatternEvent]:
         """
@@ -90,7 +95,9 @@ class TrendUpDetector(EventDetector):
         if total_valid < 5:
             return []
 
-        aligned_days = ((df_window['ma5_above_ma10'] > 0.5) & (df_window['ma10_above_ma20'] > 0.5) & valid_mask).sum()
+        ma5_above = _safe_bool(df_window['ma5_above_ma10'])
+        ma10_above = _safe_bool(df_window['ma10_above_ma20'])
+        aligned_days = ((ma5_above) & (ma10_above) & valid_mask).sum()
         x = aligned_days / total_valid
         
         # 参数：最优目标 mu = 1.0 (全窗口都是多头)，容差系数 sigma = 0.25
