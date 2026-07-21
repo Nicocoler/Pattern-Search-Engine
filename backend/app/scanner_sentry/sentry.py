@@ -64,18 +64,21 @@ class ScannerSentry:
 
         return df
 
-    def load_active_stock_pool(self, min_amount_20d: float = 10000000.0) -> list[dict]:
+    def load_active_stock_pool(
+        self,
+        min_amount_20d: float = 10000000.0,
+        allow_st: bool = False,
+    ) -> list[dict]:
         """
         查询全市场满足基础硬过滤硬指标的候选标的股票池：
-        1. stocks 表中：非 ST、非停牌。
+        1. stocks 表中：非 ST（除非 allow_st=True）、非停牌。
         2. daily_bars 20日均量成交额：均值必须大于门槛，排除僵尸股。
-        极致重构：采用 PostgreSQL 顶级 Window Function 与 Group By，在一行 SQL 内部 0.05 秒完成 5500 股分析，彻底消灭 5500 次循环物理连接开销！
         """
         conn = self.get_db_connection()
         cursor = conn.cursor()
 
-        # 采用高能窗口分区查询，一次性提取所有股票最近 20 天的平均成交额并做硬过滤
-        query = """
+        st_clause = "" if allow_st else "AND s.is_st = FALSE"
+        query = f"""
             SELECT s.code, s.name, s.board, AVG(b.amount) as avg_amount_20d
             FROM (
                 SELECT code, amount,
@@ -83,7 +86,7 @@ class ScannerSentry:
                 FROM daily_bars
             ) b
             JOIN stocks s ON b.code = s.code
-            WHERE s.is_st = FALSE
+            WHERE {st_clause}
               AND s.is_suspended = FALSE
               AND b.rn <= 20
             GROUP BY s.code, s.name, s.board
@@ -103,10 +106,21 @@ class ScannerSentry:
             cursor.close()
             conn.close()
 
-    def process_single_candidate(self, cand, target_date, df_temp_window, window_size, require_boll_mid_filter=False):
+    def process_single_candidate(
+        self,
+        cand,
+        target_date,
+        df_temp_window,
+        window_size,
+        require_boll_mid_filter=False,
+        feature_weights: dict | None = None,
+        required_events: list[str] | None = None,
+    ):
         """
         高能线程原子弹：承载单只个股日K拉取、滚动指标、特征提取、布林初筛、以及多维 DTW 对齐核分
         - require_boll_mid_filter: 当模板需要 BOLL_MIDDLE_SUPPORT 事件时启用中轨硬过滤
+        - feature_weights: 模板特征权重，传入 compute_composite_similarity
+        - required_events: 模板必需事件序列，传入 compute_composite_similarity
         """
         code = cand["code"]
         name = cand["name"]
@@ -135,16 +149,17 @@ class ScannerSentry:
                 logger.debug(f"❌ [布林中轨跌破] {code} 被硬过滤：close < boll_mid")
                 return None
 
-            # 5. DTW 相似度核分
+            # 5. DTW 相似度核分（注入模板权重和事件序列）
             report = self.similarity_engine.compute_composite_similarity(
                 df_temp_window,
                 df_cand_window,
-                code
+                code,
+                feature_weights=feature_weights,
+                required_events=required_events,
             )
             report["name"] = name
             return report
         except Exception:
-            # 抓取过程发生异常，静默跳过（比如部分新股）
             return None
 
     def run_daily_scan(self, target_date_str: str, template_id: int):
@@ -166,6 +181,7 @@ class ScannerSentry:
         window_size = config.get("window_size", 60)
         hard_filters = config.get("hard_filters", {})
         min_amount = float(hard_filters.get("min_amount_20d", 10000000.0))
+        allow_st = bool(hard_filters.get("allow_st", False))
 
         # 模板驱动：如果模板需要 BOLL_MIDDLE_SUPPORT 事件，则启用中轨硬过滤
         required_events = config.get("required_events", [])
@@ -174,6 +190,11 @@ class ScannerSentry:
             logger.info(f"🔒 [模板驱动] 该模板需要 BOLL_MIDDLE_SUPPORT，已启用中轨硬过滤（回调触中轨后收盘不可跌破）")
         else:
             logger.info(f"ℹ️ [模板驱动] 该模板不需要 BOLL_MIDDLE_SUPPORT，跳过中轨硬过滤")
+
+        # 读取模板特征权重，供相似度引擎使用
+        template_weights = template.get("weights", {}) or {}
+        if not template_weights:
+            template_weights = self.similarity_engine.feature_weights
 
         # 2. 编译模板母体的"黄金物理特征矩阵"
         source_symbol = config.get("source_symbol", "sz000002")
@@ -187,7 +208,7 @@ class ScannerSentry:
 
         df_temp_ind = calculate_indicators(df_temp_raw)
         df_temp_feat = calculate_features(df_temp_ind, source_symbol)
-        # 截取模板最后 60 天特征矩阵
+        # 截取模板最后 N 天特征矩阵
         df_temp_window = df_temp_feat.tail(window_size).copy()
         if len(df_temp_window) < window_size:
             logger.error(f"❌ 模板母体特征序列不足 {window_size} 天，计算终止。")
@@ -195,7 +216,7 @@ class ScannerSentry:
 
         # 3. 调取有流动性硬过滤的候选成分股票池 (第一级剪枝)
         logger.info("👉 正在启动第一级 [流动性硬门槛] 候选股筛选...")
-        candidate_pool = self.load_active_stock_pool(min_amount_20d=min_amount)
+        candidate_pool = self.load_active_stock_pool(min_amount_20d=min_amount, allow_st=allow_st)
         logger.info(f"✅ 第一级剪枝完毕！全市场共 {len(candidate_pool)} 只成分活跃股进入特征深度检索。")
 
         # 4. 并行多线程高并发核分 (8 线程并行碾压，合入高能进度实时日志反馈)
@@ -206,9 +227,12 @@ class ScannerSentry:
         start_time = time.time()
 
         with ThreadPoolExecutor(max_workers=8) as executor:
-            # 分发并行 Future 任务池，将模板驱动的中轨过滤标志传递给每个候选
+            # 分发并行 Future 任务池，将模板驱动的中轨过滤标志、特征权重和事件序列传递给每个候选
             future_to_cand = {
-                executor.submit(self.process_single_candidate, cand, target_date, df_temp_window, window_size, require_boll_mid_filter): cand
+                executor.submit(
+                    self.process_single_candidate, cand, target_date, df_temp_window, window_size,
+                    require_boll_mid_filter, template_weights, required_events
+                ): cand
                 for cand in candidate_pool
             }
 
@@ -262,7 +286,7 @@ class ScannerSentry:
         conn_write = self.get_db_connection()
         cursor_write = conn_write.cursor()
 
-        # 先清除今日同一模板的历史扫描数据，确保重跑幂等与数据无重
+        # 先清除今日同一模板的历史扫描数据，确保重跑幂等与数据无重复
         cursor_write.execute(
             "DELETE FROM scan_results WHERE date = %s AND template_id = %s;",
             (target_date, template_id)

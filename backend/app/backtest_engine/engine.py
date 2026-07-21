@@ -79,8 +79,18 @@ class BacktestEngine:
         holding_periods = config.get("default_backtest_config", {}).get("holding_periods", [5, 10, 20])
         benchmark = config.get("default_backtest_config", {}).get("benchmark", "sz399300")
 
-        # 模板驱动：如果模板需要 BOLL_MIDDLE_SUPPORT 事件，则启用中轨硬过滤
+        # 读取模板特征权重和必需事件序列
+        template_weights = template.get("weights", {}) or {}
+        if not template_weights:
+            template_weights = self.similarity_engine.feature_weights
         required_events = config.get("required_events", [])
+
+        # 如果模板设置了 score_threshold，用它覆盖请求中的阈值
+        template_score_threshold = config.get("default_backtest_config", {}).get("score_threshold", None)
+        if template_score_threshold is not None:
+            score_threshold = float(template_score_threshold)
+
+        # 模板驱动：如果模板需要 BOLL_MIDDLE_SUPPORT 事件，则启用中轨硬过滤
         require_boll_mid_filter = "BOLL_MIDDLE_SUPPORT" in required_events
         if require_boll_mid_filter:
             print(f"🔒 [模板驱动] 该模板需要 BOLL_MIDDLE_SUPPORT，已启用中轨硬过滤（回调触中轨后收盘不可跌破）")
@@ -158,11 +168,13 @@ class BacktestEngine:
                 if require_boll_mid_filter and has_boll_mid_breach(df_window_t):
                     continue
 
-                # 计算相似度
+                # 计算相似度（注入模板权重和事件序列）
                 report = self.similarity_engine.compute_composite_similarity(
                     df_temp_window,
                     df_window_t,
-                    code
+                    code,
+                    feature_weights=template_weights,
+                    required_events=required_events,
                 )
                 
                 # 5.2 触发信号，虚拟买入执行

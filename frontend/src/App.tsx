@@ -5,15 +5,15 @@
 
 import { useState, useEffect } from 'react';
 import ReactECharts from 'echarts-for-react';
-import { 
-  TrendingUp, 
-  BarChart2, 
-  Calendar, 
-  Settings, 
-  Play, 
-  RotateCcw, 
-  Star, 
-  Trash2, 
+import {
+  TrendingUp,
+  BarChart2,
+  Calendar,
+  Settings,
+  Play,
+  RotateCcw,
+  Star,
+  Trash2,
   AlertTriangle,
   Award,
   Sliders,
@@ -159,12 +159,43 @@ export default function App() {
   const [compareLoading, setCompareLoading] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [chartView, setChartView] = useState<'compare' | 'boll_kline'>('compare');
-  
+
   // 模板数据
   const [templates, setTemplates] = useState<Template[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null);
   const [selectedTemplateDetail, setSelectedTemplateDetail] = useState<Template | null>(null);
-  
+
+  // 模板 Schema（后端元数据）
+  const [templateSchema, setTemplateSchema] = useState<any>(null);
+
+  // 内置事件类型兜底（schema 未加载时也能显示选项）
+  const defaultEventTypes = [
+    { key: "TREND_UP", name: "上升趋势" },
+    { key: "TOUCH_BOLL_UPPER", name: "碰触布林上轨" },
+    { key: "PULLBACK", name: "良性缩量回踩" },
+    { key: "VOLUME_SHRINK", name: "极度缩量清洗" },
+    { key: "TOUCH_BOLL_MIDDLE", name: "触及布林中轨" },
+    { key: "BOLL_MIDDLE_SUPPORT", name: "中轨企稳撑住" },
+    { key: "STOP_FALLING_CANDLE", name: "收盘十字企稳" },
+    { key: "VOLUME_BREAKOUT", name: "二次放量突破" },
+  ];
+
+  // hard_filters 状态
+  const [hfMinAmount, setHfMinAmount] = useState(10000000);
+  const [hfAllowSt, setHfAllowSt] = useState(false);
+  const [hfMaxSuspended, setHfMaxSuspended] = useState(3);
+
+  // required_events 状态
+  const [requiredEvents, setRequiredEvents] = useState<string[]>([
+    "TREND_UP", "TOUCH_BOLL_UPPER", "PULLBACK", "VOLUME_SHRINK",
+    "TOUCH_BOLL_MIDDLE", "BOLL_MIDDLE_SUPPORT"
+  ]);
+
+  // default_backtest_config 状态
+  const [btConfigHoldingPeriods, setBtConfigHoldingPeriods] = useState<number[]>([5, 10, 20]);
+  const [btConfigBenchmark, setBtConfigBenchmark] = useState("sz399300");
+  const [btConfigScoreThreshold, setBtConfigScoreThreshold] = useState(80.0);
+
   // 每日扫描
   const [runDate, setRunDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
@@ -204,6 +235,22 @@ export default function App() {
   // -----------------------------------------------------------------------------
   // 4. API 数据交互 (Side Effects)
   // -----------------------------------------------------------------------------
+  // 4.0 拉取模板 Schema 元数据
+  useEffect(() => {
+    const fetchSchema = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/templates/schema`);
+        const json = await res.json();
+        if (json.success && json.data) {
+          setTemplateSchema(json.data);
+        }
+      } catch (e) {
+        console.error('拉取模板 Schema 失败:', e);
+      }
+    };
+    fetchSchema();
+  }, [apiBase]);
+
   // 4.1 拉取模板列表
   useEffect(() => {
     fetchTemplates();
@@ -284,7 +331,6 @@ export default function App() {
   useEffect(() => {
     if (selectedTemplateId !== null) {
       fetchTemplateDetails(selectedTemplateId);
-      // 同时清空当前的扫描与比对详情
       setScanResults([]);
       setSelectedStock(null);
       setCompareData(null);
@@ -301,12 +347,26 @@ export default function App() {
         if (json.data.weights) {
           setWeightsMap(json.data.weights);
         }
-        // 回填表单字段
         if (json.data.config) {
           if (json.data.name) setNewTplName(json.data.name);
           if (json.data.config.source_symbol) setNewTplSymbol(json.data.config.source_symbol);
           if (json.data.config.source_end) setNewTplEndDate(json.data.config.source_end);
           if (json.data.config.window_size) setNewTplWindowSize(json.data.config.window_size);
+
+          if (json.data.config.hard_filters) {
+            setHfMinAmount(json.data.config.hard_filters.min_amount_20d ?? 10000000);
+            setHfAllowSt(json.data.config.hard_filters.allow_st ?? false);
+            setHfMaxSuspended(json.data.config.hard_filters.max_suspended_days ?? 3);
+          }
+          if (json.data.config.required_events) {
+            setRequiredEvents(json.data.config.required_events);
+          }
+          if (json.data.config.default_backtest_config) {
+            const btc = json.data.config.default_backtest_config;
+            setBtConfigHoldingPeriods(btc.holding_periods ?? [5, 10, 20]);
+            setBtConfigBenchmark(btc.benchmark ?? "sz399300");
+            setBtConfigScoreThreshold(btc.score_threshold ?? 80.0);
+          }
         }
       }
     } catch (e) {
@@ -331,7 +391,6 @@ export default function App() {
       const json = await res.json();
       if (json.success) {
         showToast(`🎉 扫描推荐大PK成功！共搜寻到 ${json.data.results_count} 只神似个股！`);
-        // 重新获取持久化记录
         fetchScanResults();
       } else {
         showToast('每日扫描失败：' + json.error);
@@ -353,7 +412,6 @@ export default function App() {
       if (json.success) {
         setScanResults(json.data.results);
         if (json.data.results.length > 0) {
-          // 默认加载 Top 1 的股票比对数据，但不触发侧滑抽屉自动滑出，保持界面整洁
           handleSelectStockForCompare(json.data.results[0], false);
         } else {
           setSelectedStock(null);
@@ -369,11 +427,11 @@ export default function App() {
     }
   };
 
-  // 4.5 点击股票拉取核心同屏对齐比对数据 (支持自适应侧滑抽屉控制与局部 loading，彻底消灭闪烁白屏假刷新问题)
+  // 4.5 点击股票拉取核心同屏对齐比对数据
   const handleSelectStockForCompare = async (stock: ScanResult, triggerDrawer: boolean = false) => {
     setSelectedStock(stock);
     setCompareLoading(true);
-    setChartView('compare'); // 每次选择新股，默认将图表视角重置为 compare 百分比形态对比
+    setChartView('compare');
     if (triggerDrawer) {
       setDrawerOpen(true);
     }
@@ -395,7 +453,7 @@ export default function App() {
     }
   };
 
-  // 4.6 提交人工正负标注反馈 (越用越懂用户)
+  // 4.6 提交人工正负标注反馈
   const handleSubmitFeedback = async (label: 'good_match' | 'bad_match') => {
     if (!selectedStock || selectedTemplateId === null) return;
     try {
@@ -412,7 +470,6 @@ export default function App() {
       if (json.success) {
         setFeedbackVoted(prev => ({ ...prev, [selectedStock.id]: label }));
         showToast(`👍 反馈提交成功！模板特征权重已自更新归一化！`);
-        // 刷新模板详情，展示最新演化出来的权重向量
         fetchTemplateDetails(selectedTemplateId);
       } else {
         showToast('提交反馈失败：' + json.error);
@@ -452,41 +509,33 @@ export default function App() {
     }
   };
 
-  // 4.11 【核心黑客机制】特征权重滑块拉动 L1 物理自平衡算法 (L1 Self-Balancing Sliders)
+  // 4.11 【核心黑客机制】特征权重滑块拉动 L1 物理自平衡算法
   const handleWeightSliderChange = (featureKey: string, newValue: number) => {
-    // 限制单项范围为 0.01 ~ 0.99 之间，防止单项飙到 100% 锁死其余滑块
     const targetVal = Math.max(0.01, Math.min(0.99, newValue));
-    
-    // 提取其余 6 个特征列
     const otherKeys = Object.keys(weightsMap).filter(k => k !== featureKey);
     const otherSum = otherKeys.reduce((sum, k) => sum + weightsMap[k], 0);
-    
+
     const nextWeights = { ...weightsMap };
     nextWeights[featureKey] = targetVal;
-    
-    // 需要平分或等比缩放的余额
     const remaining = 1.0 - targetVal;
-    
+
     if (otherSum > 0) {
       otherKeys.forEach(k => {
-        // 等比缩放
         nextWeights[k] = Number(((weightsMap[k] / otherSum) * remaining).toFixed(4));
       });
     } else {
-      // 均分保底
       otherKeys.forEach(k => {
         nextWeights[k] = Number((remaining / otherKeys.length).toFixed(4));
       });
     }
-    
-    // 微调消除 JavaScript 浮点数累加产生的微小舍入误差，让最大的一项补差
+
     const finalSum = Object.values(nextWeights).reduce((sum, v) => sum + v, 0);
     const diff = 1.0 - finalSum;
     if (Math.abs(diff) > 0.0001) {
       const maxKey = Object.keys(nextWeights).reduce((a, b) => nextWeights[a] > nextWeights[b] ? a : b);
       nextWeights[maxKey] = Number((nextWeights[maxKey] + diff).toFixed(4));
     }
-    
+
     setWeightsMap(nextWeights);
   };
 
@@ -524,23 +573,32 @@ export default function App() {
       showToast('⚠️ 注册失败：请输入 8 位带市场前缀的代码（如 sz000002）！');
       return;
     }
-    
+
     setLoading(true);
     try {
       const payload = {
         name: newTplName,
         type: 'historical',
         config: {
-          source_symbol: cleanSym,
-          source_end: newTplEndDate,
           window_size: newTplWindowSize,
+          source_symbol: cleanSym,
+          source_start: "2026-01-01",
+          source_end: newTplEndDate,
           hard_filters: {
-            min_amount_20d: 10000000.0
-          }
+            min_amount_20d: hfMinAmount,
+            allow_st: hfAllowSt,
+            max_suspended_days: hfMaxSuspended,
+          },
+          required_events: requiredEvents,
+          default_backtest_config: {
+            holding_periods: btConfigHoldingPeriods,
+            benchmark: btConfigBenchmark,
+            score_threshold: btConfigScoreThreshold,
+          },
         },
         weights: weightsMap
       };
-      
+
       const res = await fetch(`${apiBase}/api/templates`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -551,10 +609,16 @@ export default function App() {
         showToast(`🎉 形态标尺 [${newTplName}] 一键注册点火成功！`);
         await fetchTemplates();
         setNewTplName('');
-        setNewTplName('');
         setNewTplSymbol('');
         setNewTplEndDate('2026-07-19');
         setNewTplWindowSize(60);
+        setHfMinAmount(10000000);
+        setHfAllowSt(false);
+        setHfMaxSuspended(3);
+        setRequiredEvents(["TREND_UP", "TOUCH_BOLL_UPPER", "PULLBACK", "VOLUME_SHRINK", "TOUCH_BOLL_MIDDLE", "BOLL_MIDDLE_SUPPORT"]);
+        setBtConfigHoldingPeriods([5, 10, 20]);
+        setBtConfigBenchmark("sz399300");
+        setBtConfigScoreThreshold(80.0);
         setResolvedStockName('');
       } else {
         showToast('创建模板失败：' + json.error);
@@ -566,7 +630,7 @@ export default function App() {
     }
   };
 
-  // 4.14 覆盖更新当前选中模板的特征权重
+  // 4.14 覆盖更新当前选中模板的全部参数
   const handleUpdateTemplate = async () => {
     if (!selectedTemplateId || selectedTemplateDetail === null) return;
     setLoading(true);
@@ -576,14 +640,25 @@ export default function App() {
         name: newTplName.trim() || selectedTemplateDetail.name,
         type: selectedTemplateDetail.type,
         config: {
-          ...selectedTemplateDetail.config,
+          window_size: newTplWindowSize,
           source_symbol: cleanSym || selectedTemplateDetail.config?.source_symbol,
+          source_start: selectedTemplateDetail.config?.source_start || "2026-01-01",
           source_end: newTplEndDate || selectedTemplateDetail.config?.source_end,
-          window_size: newTplWindowSize || selectedTemplateDetail.config?.window_size
+          hard_filters: {
+            min_amount_20d: hfMinAmount,
+            allow_st: hfAllowSt,
+            max_suspended_days: hfMaxSuspended,
+          },
+          required_events: requiredEvents,
+          default_backtest_config: {
+            holding_periods: btConfigHoldingPeriods,
+            benchmark: btConfigBenchmark,
+            score_threshold: btConfigScoreThreshold,
+          },
         },
         weights: weightsMap
       };
-      
+
       const res = await fetch(`${apiBase}/api/templates/${selectedTemplateId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -591,7 +666,7 @@ export default function App() {
       });
       const json = await res.json();
       if (json.success) {
-        showToast(`💾 成功覆盖更新形态模板 [${selectedTemplateDetail.name}] 权重！`);
+        showToast(`💾 成功覆盖更新形态模板 [${selectedTemplateDetail.name}] 全部参数！`);
         await fetchTemplateDetails(selectedTemplateId);
       } else {
         showToast('更新模板失败：' + json.error);
@@ -606,10 +681,10 @@ export default function App() {
   // 4.15 一键物理清除该形态
   const handleDeleteTemplate = async () => {
     if (selectedTemplateId === null || !selectedTemplateDetail) return;
-    
+
     const confirmDel = window.confirm(`🚨 物理拔线警告：\n确定要一键销毁形态模板 [${selectedTemplateDetail.name}] 吗？\n删除后将不可恢复，且关联的扫描历史也会自动幂等清理！`);
     if (!confirmDel) return;
-    
+
     setLoading(true);
     try {
       const res = await fetch(`${apiBase}/api/templates/${selectedTemplateId}`, {
@@ -635,11 +710,11 @@ export default function App() {
   const renderTemplatesTab = () => {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-        
+
         {/* 顶部：模板大卡片 Grid 列表 */}
         <div className="templates-grid">
           {templates.map(tpl => (
-            <div 
+            <div
               key={tpl.id}
               className={`tpl-item-card ${selectedTemplateId === tpl.id ? 'active' : ''}`}
               onClick={() => setSelectedTemplateId(tpl.id)}
@@ -658,18 +733,18 @@ export default function App() {
 
         {/* 中部：创建标尺与管理卡片 (Grid 1:1) */}
         <div className="settings-container">
-          
+
           {/* 左卡：注册全新形态标尺 */}
           <div className="settings-left-card">
             <div className="settings-section-title">➕ 注册全新形态对比标尺 (Add New Pattern)</div>
-            
+
             <div className="settings-form">
               <div className="form-item">
                 <label>形态模板名称 (name)</label>
-                <input 
-                  type="text" 
-                  value={newTplName} 
-                  onChange={(e) => setNewTplName(e.target.value)} 
+                <input
+                  type="text"
+                  value={newTplName}
+                  onChange={(e) => setNewTplName(e.target.value)}
                   placeholder="如：回踩中轨缩量专属形态"
                 />
               </div>
@@ -677,10 +752,10 @@ export default function App() {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                 <div className="form-item">
                   <label>锚定母体代码 (source_symbol)</label>
-                  <input 
-                    type="text" 
-                    value={newTplSymbol} 
-                    onChange={(e) => setNewTplSymbol(e.target.value)} 
+                  <input
+                    type="text"
+                    value={newTplSymbol}
+                    onChange={(e) => setNewTplSymbol(e.target.value)}
                     placeholder="如：sz000002"
                   />
                   {resolvedStockName && (
@@ -691,24 +766,132 @@ export default function App() {
                 </div>
                 <div className="form-item">
                   <label>历史截止日期 (source_end)</label>
-                  <input 
-                    type="date" 
-                    value={newTplEndDate} 
-                    onChange={(e) => setNewTplEndDate(e.target.value)} 
+                  <input
+                    type="date"
+                    value={newTplEndDate}
+                    onChange={(e) => setNewTplEndDate(e.target.value)}
                   />
                 </div>
               </div>
 
               <div className="form-item">
                 <label>计算滑动窗口步长 (window_size): <b style={{ color: 'var(--color-primary)' }}>{newTplWindowSize}天</b></label>
-                <input 
-                  type="range" 
-                  value={newTplWindowSize} 
-                  onChange={(e) => setNewTplWindowSize(Number(e.target.value))} 
-                  min={15} 
-                  max={120} 
+                <input
+                  type="range"
+                  value={newTplWindowSize}
+                  onChange={(e) => setNewTplWindowSize(Number(e.target.value))}
+                  min={15}
+                  max={120}
                   style={{ height: '6px', background: 'rgba(255,255,255,0.05)', borderRadius: '3px', outline: 'none', WebkitAppearance: 'none' }}
                 />
+              </div>
+
+              {/* 📡 必需事件序列 */}
+              <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '0.8rem', marginTop: '0.4rem' }}>
+                <span style={{ fontSize: '0.8rem', fontWeight: '700', color: 'var(--color-text-main)', display: 'block', marginBottom: '0.6rem' }}>
+                  📡 必需事件序列 (required_events)
+                </span>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+                  {(templateSchema?.event_types || defaultEventTypes).map((evt: any) => (
+                    <label key={evt.key} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                      <input
+                        type="checkbox"
+                        checked={requiredEvents.includes(evt.key)}
+                        onChange={(e) => {
+                          setRequiredEvents(prev =>
+                            e.target.checked
+                              ? [...prev, evt.key]
+                              : prev.filter(x => x !== evt.key)
+                          );
+                        }}
+                      />
+                      {evt.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {/* 🛡️ 硬性过滤条件 */}
+              <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '0.8rem', marginTop: '0.4rem' }}>
+                <span style={{ fontSize: '0.8rem', fontWeight: '700', color: 'var(--color-text-main)', display: 'block', marginBottom: '0.6rem' }}>
+                  🛡️ 硬性过滤条件 (hard_filters)
+                </span>
+                <div className="settings-form">
+                  <div className="form-item">
+                    <label>20日均成交额最低门槛 (min_amount_20d)</label>
+                    <input
+                      type="number"
+                      value={hfMinAmount}
+                      onChange={(e) => setHfMinAmount(Number(e.target.value))}
+                      min={0}
+                      step={1000000}
+                      style={{ background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#fff', padding: '0.45rem 0.8rem', fontSize: '0.85rem', outline: 'none' }}
+                    />
+                    <span className="form-item-tip">单位：元。低于此值视为僵尸股剔除。</span>
+                  </div>
+                  <div className="form-item" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                    <input
+                      type="checkbox"
+                      checked={hfAllowSt}
+                      onChange={(e) => setHfAllowSt(e.target.checked)}
+                      style={{ width: 'auto', margin: 0 }}
+                    />
+                    <label style={{ fontSize: '0.85rem' }}>允许 ST / 退市整理股 (allow_st)</label>
+                    <span className="form-item-tip">默认关闭，绝缘 ST 股。</span>
+                  </div>
+                  <div className="form-item">
+                    <label>最大允许停牌天数 (max_suspended_days)</label>
+                    <input
+                      type="number"
+                      value={hfMaxSuspended}
+                      onChange={(e) => setHfMaxSuspended(Number(e.target.value))}
+                      min={0}
+                      max={30}
+                      style={{ background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#fff', padding: '0.45rem 0.8rem', fontSize: '0.85rem', outline: 'none' }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* 📈 回测默认配置 */}
+              <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '0.8rem', marginTop: '0.4rem' }}>
+                <span style={{ fontSize: '0.8rem', fontWeight: '700', color: 'var(--color-text-main)', display: 'block', marginBottom: '0.6rem' }}>
+                  📈 回测默认配置 (default_backtest_config)
+                </span>
+                <div className="settings-form">
+                  <div className="form-item">
+                    <label>持股周期 (holding_periods)</label>
+                    <input
+                      type="text"
+                      value={btConfigHoldingPeriods.join(', ')}
+                      readOnly
+                      style={{ background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#94a3b8', padding: '0.45rem 0.8rem', fontSize: '0.85rem', outline: 'none' }}
+                    />
+                    <span className="form-item-tip">当前: {btConfigHoldingPeriods.join(', ')} 天。在回测 Tab 可覆盖。</span>
+                  </div>
+                  <div className="form-item">
+                    <label>业绩基准 (benchmark)</label>
+                    <input
+                      type="text"
+                      value={btConfigBenchmark}
+                      onChange={(e) => setBtConfigBenchmark(e.target.value)}
+                      placeholder="如 sz399300"
+                      style={{ background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#fff', padding: '0.45rem 0.8rem', fontSize: '0.85rem', outline: 'none' }}
+                    />
+                  </div>
+                  <div className="form-item">
+                    <label>默认买入阈值 (score_threshold)</label>
+                    <input
+                      type="number"
+                      value={btConfigScoreThreshold}
+                      onChange={(e) => setBtConfigScoreThreshold(Number(e.target.value))}
+                      min={0}
+                      max={100}
+                      step={1}
+                      style={{ background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#fff', padding: '0.45rem 0.8rem', fontSize: '0.85rem', outline: 'none' }}
+                    />
+                  </div>
+                </div>
               </div>
 
               {/* 7 大核心权重手工微调 (自平衡) */}
@@ -716,7 +899,7 @@ export default function App() {
                 <span style={{ fontSize: '0.8rem', fontWeight: '700', color: 'var(--color-text-main)', display: 'block', marginBottom: '0.6rem' }}>
                   🎯 7 大特征维度权重手动微调 (L1 自动 100% 守恒配平)
                 </span>
-                
+
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
                   {Object.entries(weightsMap).map(([feature, val]) => (
                     <div key={feature} style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
@@ -732,13 +915,13 @@ export default function App() {
                         </span>
                         <span style={{ color: 'var(--color-primary)', fontFamily: 'monospace' }}>{(val * 100).toFixed(2)}%</span>
                       </div>
-                      <input 
-                        type="range" 
-                        value={val} 
-                        onChange={(e) => handleWeightSliderChange(feature, Number(e.target.value))} 
-                        step={0.01} 
-                        min={0.01} 
-                        max={0.99} 
+                      <input
+                        type="range"
+                        value={val}
+                        onChange={(e) => handleWeightSliderChange(feature, Number(e.target.value))}
+                        step={0.01}
+                        min={0.01}
+                        max={0.99}
                         style={{ height: '4px', background: 'rgba(255,255,255,0.05)', borderRadius: '2px', outline: 'none', WebkitAppearance: 'none' }}
                       />
                     </div>
@@ -746,8 +929,8 @@ export default function App() {
                 </div>
               </div>
 
-              <button 
-                className="btn-primary" 
+              <button
+                className="btn-primary"
                 style={{ marginTop: '0.5rem', background: 'linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%)' }}
                 onClick={handleCreateTemplate}
               >
@@ -759,10 +942,10 @@ export default function App() {
           {/* 右卡：覆写更新与删除已有标尺 */}
           <div className="settings-right-card">
             <div className="settings-section-title">⚙️ 覆写微调与物理管护 (Update & Delete)</div>
-            
+
             {selectedTemplateDetail ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem', height: '100%', justifyContent: 'space-between' }}>
-                
+
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
                   <div style={{ background: 'rgba(255,255,255,0.01)', padding: '1rem', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                     <h4 style={{ fontSize: '0.9rem', color: '#fff', fontWeight: 'bold', marginBottom: '0.4rem' }}>
@@ -775,25 +958,25 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* 实时雷达雷达图 */}
+                  {/* 实时雷达图 */}
                   <div style={{ height: '300px', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <ReactECharts 
-                      option={getRadarOption()} 
+                    <ReactECharts
+                      option={getRadarOption()}
                       style={{ height: '100%', width: '100%' }}
                     />
                   </div>
                 </div>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem', borderTop: '1px solid var(--border-color)', paddingTop: '1rem' }}>
-                  <button 
-                    className="btn-primary" 
+                  <button
+                    className="btn-primary"
                     style={{ background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)', boxShadow: '0 4px 12px rgba(16, 185, 129, 0.2)' }}
                     onClick={handleUpdateTemplate}
                   >
-                    💾 覆写并保存当前模板权重配置
+                    💾 覆写并保存当前模板全部参数
                   </button>
-                  <button 
-                    className="btn-primary" 
+                  <button
+                    className="btn-primary"
                     style={{ background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)', boxShadow: '0 4px 12px rgba(239, 68, 68, 0.2)' }}
                     onClick={handleDeleteTemplate}
                   >
@@ -870,11 +1053,11 @@ export default function App() {
   const renderSettingsTab = () => {
     return (
       <div className="settings-container">
-        
+
         {/* 左卡：数据仓库管护与 Terminal 实况监视 */}
         <div className="settings-left-card">
           <div className="settings-section-title">📦 A 股时序行情数据仓库管护</div>
-          
+
           <div className="stats-dashboard">
             <div className="stats-card">
               <span className="stats-label">基本面个股池总数</span>
@@ -895,12 +1078,12 @@ export default function App() {
           </div>
 
           <div className="sync-control-box">
-            <button 
-              className="btn-primary" 
-              style={{ 
-                padding: '0.65rem 1.5rem', 
-                fontSize: '0.9rem', 
-                background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)', 
+            <button
+              className="btn-primary"
+              style={{
+                padding: '0.65rem 1.5rem',
+                fontSize: '0.9rem',
+                background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
                 boxShadow: '0 4px 12px rgba(16, 185, 129, 0.3)',
                 border: 'none',
                 cursor: 'pointer',
@@ -962,83 +1145,83 @@ export default function App() {
         {/* 右卡：扩展参数微调面板 */}
         <div className="settings-right-card">
           <div className="settings-section-title">⚙️ 后期扩展量化参数微调配置</div>
-          
+
           <div className="settings-form">
             <div className="form-item">
               <label>量化计算特征滑动窗口步长 (window_size)</label>
-              <input 
-                type="number" 
-                value={windowSize} 
-                onChange={(e) => setWindowSize(Number(e.target.value))} 
-                min={10} 
-                max={250} 
+              <input
+                type="number"
+                value={windowSize}
+                onChange={(e) => setWindowSize(Number(e.target.value))}
+                min={10}
+                max={250}
               />
               <span className="form-item-tip">用于对齐比对和相似度计算中取用个股时序的最大 K 线天数。</span>
             </div>
 
             <div className="form-item">
               <label>最高并发拉取线程规模 (max_workers)</label>
-              <input 
-                type="number" 
-                value={maxWorkers} 
-                onChange={(e) => setMaxWorkers(Number(e.target.value))} 
-                min={1} 
-                max={32} 
+              <input
+                type="number"
+                value={maxWorkers}
+                onChange={(e) => setMaxWorkers(Number(e.target.value))}
+                min={1}
+                max={32}
               />
               <span className="form-item-tip">全市场高并发增量拉取时的并行请求线程池规模，8 线程最均衡。</span>
             </div>
 
             <div className="form-item">
               <label>网络反爬延迟下限 (delay_min, 毫秒)</label>
-              <input 
-                type="number" 
-                value={delayMin} 
-                onChange={(e) => setDelayMin(Number(e.target.value))} 
-                min={0} 
-                max={5000} 
+              <input
+                type="number"
+                value={delayMin}
+                onChange={(e) => setDelayMin(Number(e.target.value))}
+                min={0}
+                max={5000}
               />
               <span className="form-item-tip">单次请求行情接口后的随机微小延迟下限，防爬封锁守护。</span>
             </div>
 
             <div className="form-item">
               <label>网络反爬延迟上限 (delay_max, 毫秒)</label>
-              <input 
-                type="number" 
-                value={delayMax} 
-                onChange={(e) => setDelayMax(Number(e.target.value))} 
-                min={0} 
-                max={5000} 
+              <input
+                type="number"
+                value={delayMax}
+                onChange={(e) => setDelayMax(Number(e.target.value))}
+                min={0}
+                max={5000}
               />
               <span className="form-item-tip">随机微眠延迟上限，过大虽防封，但会导致拉取进度过慢。</span>
             </div>
 
             <div className="form-item">
               <label>个股行情失败重试上限 (retry_limit)</label>
-              <input 
-                type="number" 
-                value={retryLimit} 
-                onChange={(e) => setRetryLimit(Number(e.target.value))} 
-                min={1} 
-                max={10} 
+              <input
+                type="number"
+                value={retryLimit}
+                onChange={(e) => setRetryLimit(Number(e.target.value))}
+                min={1}
+                max={10}
               />
               <span className="form-item-tip">单只股票网络阻断时的最高重试次数，重试后会自动触发指数级退避。</span>
             </div>
 
             <div className="form-item">
               <label>标注自更新在线自演化学习率 (η)</label>
-              <input 
-                type="number" 
-                value={learningRate} 
-                onChange={(e) => setLearningRate(Number(e.target.value))} 
-                step={0.01} 
-                min={0.01} 
-                max={0.5} 
+              <input
+                type="number"
+                value={learningRate}
+                onChange={(e) => setLearningRate(Number(e.target.value))}
+                step={0.01}
+                min={0.01}
+                max={0.5}
               />
               <span className="form-item-tip">人工 👍极品 / 👎不像 标签对模板特征权重的微调偏置步伐大小。</span>
             </div>
 
-            <button 
-              className="btn-primary" 
+            <button
+              className="btn-primary"
               style={{ marginTop: '1.5rem', width: '100%', background: 'linear-gradient(135deg, var(--color-primary) 0%, var(--color-secondary) 100%)' }}
               onClick={handleSaveConfigs}
             >
@@ -1060,21 +1243,15 @@ export default function App() {
     if (!compareData) return {};
     const { cand_bars, candidate_symbol } = compareData;
 
-    // 真实的 K 线序列日期
     const xAxisDates = cand_bars.map(b => b.date);
-
-    // K 线绝对价格数据：[open, close, low, high]
     const klineData = cand_bars.map(b => [b.open, b.close, b.low, b.high]);
-
-    // BOLL 价格线
     const bollMid = cand_bars.map(b => b.boll_mid);
     const bollUpper = cand_bars.map(b => b.boll_upper);
     const bollLower = cand_bars.map(b => b.boll_lower);
 
-    // 提取最新的布林数值，显示在图表顶部
     const lastBar = cand_bars[cand_bars.length - 1];
-    const boSubtitle = lastBar 
-      ? `MID: ${lastBar.boll_mid?.toFixed(2)}  UB: ${lastBar.boll_upper?.toFixed(2)}  LB: ${lastBar.boll_lower?.toFixed(2)}` 
+    const boSubtitle = lastBar
+      ? `MID: ${lastBar.boll_mid?.toFixed(2)}  UB: ${lastBar.boll_upper?.toFixed(2)}  LB: ${lastBar.boll_lower?.toFixed(2)}`
       : '';
 
     return {
@@ -1105,7 +1282,6 @@ export default function App() {
             html += `最高价: <b style="color:#ef4444; font-family: monospace;">￥${b.high.toFixed(2)}</b><br/>`;
             html += `最低价: <b style="color:#10b981; font-family: monospace;">￥${b.low.toFixed(2)}</b><br/>`;
 
-            // 轨道数据展示
             const mid = b.boll_mid ? `￥${b.boll_mid.toFixed(2)}` : 'N/A';
             const upp = b.boll_upper ? `￥${b.boll_upper.toFixed(2)}` : 'N/A';
             const low = b.boll_lower ? `￥${b.boll_lower.toFixed(2)}` : 'N/A';
@@ -1135,19 +1311,18 @@ export default function App() {
       },
       yAxis: {
         type: 'value',
-        scale: true, // 强制比例自适应拉满视口，不空出底部
+        scale: true,
         axisLabel: { color: '#94a3b8', fontSize: 10, formatter: '￥{value}' },
         splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } }
       },
       series: [
-        // 1. K 线烛台
         {
           name: '日K (前复权)',
           type: 'candlestick',
           data: klineData,
           itemStyle: {
-            color: '#ef4444',     // A 股阳线红
-            color0: '#10b981',    // A 股阴线绿
+            color: '#ef4444',
+            color0: '#10b981',
             borderColor: '#ef4444',
             borderColor0: '#10b981'
           },
@@ -1158,7 +1333,6 @@ export default function App() {
             ]
           }
         },
-        // 2. BOLL 中轨 MA20
         {
           name: 'BOLL-M(20)',
           type: 'line',
@@ -1167,7 +1341,6 @@ export default function App() {
           showSymbol: false,
           lineStyle: { color: '#e2e8f0', width: 1.5, opacity: 0.8 }
         },
-        // 3. BOLL 上轨 UB
         {
           name: 'UB',
           type: 'line',
@@ -1176,7 +1349,6 @@ export default function App() {
           showSymbol: false,
           lineStyle: { color: '#f59e0b', width: 1.5, opacity: 0.8 }
         },
-        // 4. BOLL 下轨 LB
         {
           name: 'LB',
           type: 'line',
@@ -1193,28 +1365,23 @@ export default function App() {
   const getKlineCompareOption = () => {
     if (!compareData) return {};
     const { temp_bars, cand_bars, matched_events } = compareData;
-    
-    // 强制归一化算法：各自第一天收盘价设为基准 1.0 (等效百分比起始 0%)
+
     const tempFirstClose = temp_bars[0]?.close || 1.0;
     const candFirstClose = cand_bars[0]?.close || 1.0;
 
-    // 计算归零百分比序列
     const tempClosePercent = temp_bars.map(b => ((b.close - tempFirstClose) / tempFirstClose) * 100);
     const candClosePercent = cand_bars.map(b => ((b.close - candFirstClose) / candFirstClose) * 100);
 
-    // X轴虚拟交易日序列：第 1 天 至 第 N 天
     const xAxisData = Array.from({ length: temp_bars.length }, (_, i) => `T+${i + 1}`);
 
-    // 高斯柔性气泡数据构建 (Event Markers)
     const markPointData = matched_events.map(evt => {
-      // 在候选 K 线中寻找最贴近的交易日索引
       const idx = cand_bars.findIndex(b => b.date === evt.date);
       if (idx === -1) return null;
-      
+
       const percentClose = candClosePercent[idx];
       return {
         name: evt.event_type,
-        coord: [idx, percentClose + 2.5], // 挂在K线上方 2.5% 高度
+        coord: [idx, percentClose + 2.5],
         value: getChineseEventName(evt.event_type),
         label: {
           show: true,
@@ -1243,7 +1410,6 @@ export default function App() {
           shadowBlur: 10,
           shadowColor: evt.confidence >= 0.8 ? 'rgba(245, 158, 11, 0.4)' : 'rgba(59, 130, 246, 0.4)'
         },
-        // 注入物理证据用于 tooltip 展示
         evidence: evt.evidence
       };
     }).filter(Boolean);
@@ -1272,8 +1438,7 @@ export default function App() {
             html += `<b style="color: #94a3b8;">对齐序列: ${param0.name}</b><br/>`;
             html += `<span style="color: #60a5fa;">● 模板日期: ${tDate}</span><br/>`;
             html += `<span style="color: #f59e0b;">● 候选日期: ${cDate}</span><br/>`;
-            
-            // 展现两者的百分比价格
+
             params.forEach((p: any) => {
               if (p.seriesName === '模板 (Close%)') {
                 html += `模板折算百分比: <b style="color:#60a5fa; font-family: monospace;">${p.value.toFixed(2)}%</b><br/>`;
@@ -1281,8 +1446,7 @@ export default function App() {
                 html += `候选折算百分比: <b style="color:#f59e0b; font-family: monospace;">${p.value.toFixed(2)}%</b><br/>`;
               }
             });
-            
-            // 检查当日是否有物理事件悬浮
+
             const eventToday = markPointData.find((m: any) => m.coord[0] === idx);
             if (eventToday) {
               html += `<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.1); color: #f59e0b;">`;
@@ -1316,7 +1480,6 @@ export default function App() {
         splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } }
       },
       series: [
-        // 1. 模板 K 线百分比折线 (作为对比背景)
         {
           name: '模板 (Close%)',
           type: 'line',
@@ -1326,7 +1489,6 @@ export default function App() {
           lineStyle: { color: '#3b82f6', width: 2, opacity: 0.8 },
           itemStyle: { color: '#3b82f6' }
         },
-        // 2. 候选 K 线百分比折线 (作为前景显示)
         {
           name: '候选 (Close%)',
           type: 'line',
@@ -1345,7 +1507,6 @@ export default function App() {
 
   // 5.2 【雷达图：特征维度权重/分项得分对比】
   const getRadarOption = () => {
-    // 如果在扫描页，展示当前股票的分项得分
     if (activeTab === 'scan' && selectedStock) {
       const breakdown = selectedStock.sub_scores;
       return {
@@ -1388,8 +1549,7 @@ export default function App() {
         }]
       };
     }
-    
-    // 如果在模板页，展示 7 大特征权重分配
+
     if (selectedTemplateDetail) {
       const w = selectedTemplateDetail.weights || {};
       const indicators = Object.keys(w).map(key => ({ name: key, max: 0.5 }));
@@ -1430,7 +1590,7 @@ export default function App() {
   const getBacktestOption = () => {
     if (!backtestResult) return {};
     const { equity_curve } = backtestResult;
-    
+
     const dates = equity_curve.map(e => e.trade_date);
     const portfolioVals = equity_curve.map(e => e.portfolio_value);
     const benchmarkVals = equity_curve.map(e => e.benchmark_value);
@@ -1503,7 +1663,7 @@ export default function App() {
   // -----------------------------------------------------------------------------
   return (
     <div className="dashboard-container">
-      
+
       {/* 6.1 Toast 气泡提醒 */}
       {toast && <div className="toast-msg">{toast}</div>}
 
@@ -1517,10 +1677,10 @@ export default function App() {
           <div className="api-config">
             <Server size={14} color="#3b82f6" />
             <span>后端API:</span>
-            <input 
-              type="text" 
-              value={apiBase} 
-              onChange={(e) => setApiBase(e.target.value)} 
+            <input
+              type="text"
+              value={apiBase}
+              onChange={(e) => setApiBase(e.target.value)}
               placeholder="http://localhost:8000"
             />
           </div>
@@ -1529,25 +1689,25 @@ export default function App() {
 
       {/* 6.3 Tabs 导航 */}
       <nav className="dashboard-tabs">
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'scan' ? 'active' : ''}`}
           onClick={() => setActiveTab('scan')}
         >
           <TrendingUp size={16} /> 极速形态每日扫描大PK
         </button>
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'backtest' ? 'active' : ''}`}
           onClick={() => setActiveTab('backtest')}
         >
           <BarChart2 size={16} /> 历史形态滚动仿真回测
         </button>
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'templates' ? 'active' : ''}`}
           onClick={() => setActiveTab('templates')}
         >
           <Sliders size={16} /> 形态模板与权重参数自进化
         </button>
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`}
           onClick={() => setActiveTab('settings')}
         >
@@ -1557,16 +1717,16 @@ export default function App() {
 
       {/* 6.4 内容主体布局 */}
       <main className={(activeTab === 'templates' || activeTab === 'settings') ? 'full-width-grid' : 'dashboard-grid'}>
-        
+
         {/* 左侧控制栏 (除模板管理、系统设置外) */}
         {(activeTab !== 'templates' && activeTab !== 'settings') && (
           <aside className="panel-card">
             <h2 className="panel-title">研盘控制核心</h2>
-            
+
             <div className="form-group">
               <label>形态模板选择</label>
-              <select 
-                value={selectedTemplateId || ''} 
+              <select
+                value={selectedTemplateId || ''}
                 onChange={(e) => setSelectedTemplateId(Number(e.target.value))}
               >
                 {templates.map(tpl => (
@@ -1581,15 +1741,15 @@ export default function App() {
                   <label>扫描交易日期</label>
                   <div style={{ display: 'flex', gap: '0.4rem' }}>
                     <Calendar size={18} color="#94a3b8" style={{ marginTop: '0.5rem' }} />
-                    <input 
-                      type="date" 
-                      value={runDate} 
+                    <input
+                      type="date"
+                      value={runDate}
                       onChange={(e) => setRunDate(e.target.value)}
                     />
                   </div>
                 </div>
 
-                <button 
+                <button
                   className="btn-primary"
                   onClick={handleRunMarketScan}
                   disabled={loading}
@@ -1597,7 +1757,7 @@ export default function App() {
                   <Play size={16} /> 一键激活全市场扫描
                 </button>
 
-                <button 
+                <button
                   className="btn-primary"
                   style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
                   onClick={fetchScanResults}
@@ -1612,32 +1772,32 @@ export default function App() {
               <>
                 <div className="form-group">
                   <label>回测开始日期</label>
-                  <input 
-                    type="date" 
-                    value={btStartDate} 
+                  <input
+                    type="date"
+                    value={btStartDate}
                     onChange={(e) => setBtStartDate(e.target.value)}
                   />
                 </div>
                 <div className="form-group">
                   <label>回测结束日期</label>
-                  <input 
-                    type="date" 
-                    value={btEndDate} 
+                  <input
+                    type="date"
+                    value={btEndDate}
                     onChange={(e) => setBtEndDate(e.target.value)}
                   />
                 </div>
                 <div className="form-group">
                   <label>相似度买入阈值</label>
-                  <input 
-                    type="number" 
-                    value={btScoreThreshold} 
+                  <input
+                    type="number"
+                    value={btScoreThreshold}
                     onChange={(e) => setBtScoreThreshold(Number(e.target.value))}
                     min={40}
                     max={100}
                   />
                 </div>
 
-                <button 
+                <button
                   className="btn-primary"
                   onClick={handleRunBacktest}
                   disabled={loading}
@@ -1669,14 +1829,14 @@ export default function App() {
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', width: '100%' }}>
-                  
+
                   {/* 100% 全宽平铺推荐大表格卡片 */}
                   <div className="data-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', width: '100%' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.2rem' }}>
                       <h3 style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#fff' }}>🎯 全市场形态相似度 Top 推荐大PK</h3>
                       <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>交易日: {runDate}</span>
                     </div>
-                    
+
                     <div className="table-wrapper">
                       <table className="scan-table">
                         <thead>
@@ -1690,7 +1850,7 @@ export default function App() {
                         </thead>
                         <tbody>
                           {scanResults.map(item => (
-                            <tr 
+                            <tr
                               key={item.id}
                               className={selectedStock?.id === item.id ? 'active-row' : ''}
                               onClick={() => handleSelectStockForCompare(item, true)}
@@ -1713,7 +1873,7 @@ export default function App() {
                               </td>
                               <td>
                                 <div className="feedback-actions" onClick={e => e.stopPropagation()}>
-                                  <button 
+                                  <button
                                     className={`feedback-btn good ${feedbackVoted[item.id] === 'good_match' ? 'voted' : ''}`}
                                     title="形态极像，一键加星(权重正更新)"
                                     onClick={() => {
@@ -1723,7 +1883,7 @@ export default function App() {
                                   >
                                     <Star size={13} fill={feedbackVoted[item.id] === 'good_match' ? 'currentColor' : 'none'} />
                                   </button>
-                                  <button 
+                                  <button
                                     className={`feedback-btn bad ${feedbackVoted[item.id] === 'bad_match' ? 'voted' : ''}`}
                                     title="不像，误判屏蔽(权重负更新)"
                                     onClick={() => {
@@ -1744,7 +1904,7 @@ export default function App() {
 
                   {/* 侧滑抽屉背景遮罩 (磨砂高透) */}
                   {drawerOpen && (
-                    <div 
+                    <div
                       className="drawer-mask"
                       onClick={() => setDrawerOpen(false)}
                     ></div>
@@ -1759,7 +1919,7 @@ export default function App() {
                           {selectedStock ? `🔍 【形态重叠对比】 ${selectedStock.name} (${selectedStock.code.toUpperCase()})` : '正在拉取比对数据...'}
                         </span>
                       </div>
-                      <button 
+                      <button
                         className="drawer-close-btn"
                         onClick={() => setDrawerOpen(false)}
                       >
@@ -1775,17 +1935,17 @@ export default function App() {
                         </div>
                       ) : compareData && selectedStock ? (
                         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-                          
+
                           {/* 图表视角双 Tabs 切换 */}
                           <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1.2rem', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '0.8rem' }}>
-                            <button 
+                            <button
                               className={`tab-btn ${chartView === 'compare' ? 'active' : ''}`}
                               style={{ padding: '0.45rem 1rem', fontSize: '0.8rem', height: 'auto', borderRadius: '6px' }}
                               onClick={() => setChartView('compare')}
                             >
                               🧩 异时空形态百分比归一重合对比
                             </button>
-                            <button 
+                            <button
                               className={`tab-btn ${chartView === 'boll_kline' ? 'active' : ''}`}
                               style={{ padding: '0.45rem 1rem', fontSize: '0.8rem', height: 'auto', borderRadius: '6px' }}
                               onClick={() => setChartView('boll_kline')}
@@ -1795,87 +1955,87 @@ export default function App() {
                           </div>
 
                           <div className="compare-container" style={{ margin: 0, border: 'none', background: 'transparent', boxShadow: 'none' }}>
-                            
+
                             {/* 左列：百分比价格走势重叠曲线 */}
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
                               <div style={{ height: '420px', width: '100%', background: 'rgba(255,255,255,0.01)', borderRadius: '12px', border: '1px solid var(--border-color)', padding: '1rem' }}>
-                                <ReactECharts 
-                                  option={chartView === 'compare' ? getKlineCompareOption() : getBollKlineOption()} 
+                                <ReactECharts
+                                  option={chartView === 'compare' ? getKlineCompareOption() : getBollKlineOption()}
                                   style={{ height: '100%', width: '100%' }}
                                 />
                               </div>
 
-                            {/* 人机交互评语微调 */}
-                            <div style={{ background: 'rgba(255,255,255,0.02)', padding: '1rem', borderRadius: '10px', border: '1px solid var(--border-color)' }}>
-                              <h4 style={{ fontSize: '0.85rem', fontWeight: 'bold', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                                <Sparkles size={14} color="#f59e0b" /> 人机反馈微调面板 (Adaptive Learning)
-                              </h4>
-                              <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-                                <input 
-                                  type="text" 
-                                  style={{ flex: 1, background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#fff', padding: '0.45rem 0.8rem', fontSize: '0.8rem', outline: 'none' }}
-                                  placeholder="输入感性研判评语（例如：经典缩量，大赞）..."
-                                  value={userComment}
-                                  onChange={e => setUserComment(e.target.value)}
-                                />
-                                <button 
-                                  className="btn-primary"
-                                  style={{ padding: '0.45rem 1rem', fontSize: '0.8rem' }}
-                                  onClick={() => handleSubmitFeedback('good_match')}
-                                >
-                                  极品 (👍)
-                                </button>
-                                <button 
-                                  className="btn-primary"
-                                  style={{ padding: '0.45rem 1rem', fontSize: '0.8rem', background: 'linear-gradient(135deg, #4b5563 0%, #1f2937 100%)', color: '#fff', boxShadow: 'none' }}
-                                  onClick={() => handleSubmitFeedback('bad_match')}
-                                >
-                                  不像 (👎)
-                                </button>
+                              {/* 人机交互评语微调 */}
+                              <div style={{ background: 'rgba(255,255,255,0.02)', padding: '1rem', borderRadius: '10px', border: '1px solid var(--border-color)' }}>
+                                <h4 style={{ fontSize: '0.85rem', fontWeight: 'bold', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                                  <Sparkles size={14} color="#f59e0b" /> 人机反馈微调面板 (Adaptive Learning)
+                                </h4>
+                                <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                                  <input
+                                    type="text"
+                                    style={{ flex: 1, background: '#0a0d16', border: '1px solid var(--border-color)', borderRadius: '6px', color: '#fff', padding: '0.45rem 0.8rem', fontSize: '0.8rem', outline: 'none' }}
+                                    placeholder="输入感性研判评语（例如：经典缩量，大赞）..."
+                                    value={userComment}
+                                    onChange={e => setUserComment(e.target.value)}
+                                  />
+                                  <button
+                                    className="btn-primary"
+                                    style={{ padding: '0.45rem 1rem', fontSize: '0.8rem' }}
+                                    onClick={() => handleSubmitFeedback('good_match')}
+                                  >
+                                    极品 (👍)
+                                  </button>
+                                  <button
+                                    className="btn-primary"
+                                    style={{ padding: '0.45rem 1rem', fontSize: '0.8rem', background: 'linear-gradient(135deg, #4b5563 0%, #1f2937 100%)', color: '#fff', boxShadow: 'none' }}
+                                    onClick={() => handleSubmitFeedback('bad_match')}
+                                  >
+                                    不像 (👎)
+                                  </button>
+                                </div>
                               </div>
                             </div>
-                          </div>
 
-                          {/* 右列：5维雷达图与AI事实证据 */}
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem', justifyContent: 'space-between' }}>
-                            <div style={{ height: '200px', width: '100%', background: 'rgba(255,255,255,0.01)', borderRadius: '12px', border: '1px solid var(--border-color)' }}>
-                              <ReactECharts 
-                                option={getRadarOption()} 
-                                style={{ height: '100%', width: '100%' }}
-                              />
+                            {/* 右列：5维雷达图与AI事实证据 */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem', justifyContent: 'space-between' }}>
+                              <div style={{ height: '200px', width: '100%', background: 'rgba(255,255,255,0.01)', borderRadius: '12px', border: '1px solid var(--border-color)' }}>
+                                <ReactECharts
+                                  option={getRadarOption()}
+                                  style={{ height: '100%', width: '100%' }}
+                                />
+                              </div>
+
+                              <div className="explanation-section" style={{ padding: '1.2rem', gap: '0.8rem', flex: 1, minHeight: '260px' }}>
+                                <h4 style={{ fontSize: '0.9rem', fontWeight: 'bold', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.4rem', color: '#f1f5f9' }}>
+                                  💡 AI 物理事实对齐研判 (Evidences)
+                                </h4>
+                                <ul className="explanation-list" style={{ gap: '0.6rem' }}>
+                                  {compareData.explanation_facts?.positive_facts?.map((fact, idx) => (
+                                    <li key={idx} className="explanation-item positive" style={{ fontSize: '0.85rem' }}>
+                                      <span className="bullet-dot pos"></span>
+                                      <p>{fact.text}</p>
+                                    </li>
+                                  ))}
+                                  {compareData.explanation_facts?.negative_facts?.map((fact, idx) => (
+                                    <li key={idx} className="explanation-item negative" style={{ fontSize: '0.85rem' }}>
+                                      <span className="bullet-dot neg"></span>
+                                      <p>{fact.text}</p>
+                                    </li>
+                                  ))}
+                                </ul>
+                                {selectedStock.risk_tips && (
+                                  <div style={{ marginTop: '0.5rem', padding: '0.5rem 0.6rem', background: 'rgba(239, 68, 68, 0.04)', borderRadius: '6px', border: '1px solid rgba(239, 68, 68, 0.12)', display: 'flex', gap: '0.4rem', alignItems: 'flex-start' }}>
+                                    <AlertTriangle size={12} color="#ef4444" style={{ flexShrink: 0, marginTop: '2px' }} />
+                                    <p style={{ fontSize: '0.75rem', color: '#fca5a5', lineHeight: 1.4 }}><b>破位警告：</b>{selectedStock.risk_tips}</p>
+                                  </div>
+                                )}
+                              </div>
                             </div>
 
-                            <div className="explanation-section" style={{ padding: '1.2rem', gap: '0.8rem', flex: 1, minHeight: '260px' }}>
-                              <h4 style={{ fontSize: '0.9rem', fontWeight: 'bold', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.4rem', color: '#f1f5f9' }}>
-                                💡 AI 物理事实对齐研判 (Evidences)
-                              </h4>
-                              <ul className="explanation-list" style={{ gap: '0.6rem' }}>
-                                {compareData.explanation_facts?.positive_facts?.map((fact, idx) => (
-                                  <li key={idx} className="explanation-item positive" style={{ fontSize: '0.85rem' }}>
-                                    <span className="bullet-dot pos"></span>
-                                    <p>{fact.text}</p>
-                                  </li>
-                                ))}
-                                {compareData.explanation_facts?.negative_facts?.map((fact, idx) => (
-                                  <li key={idx} className="explanation-item negative" style={{ fontSize: '0.85rem' }}>
-                                    <span className="bullet-dot neg"></span>
-                                    <p>{fact.text}</p>
-                                  </li>
-                                ))}
-                              </ul>
-                              {selectedStock.risk_tips && (
-                                <div style={{ marginTop: '0.5rem', padding: '0.5rem 0.6rem', background: 'rgba(239, 68, 68, 0.04)', borderRadius: '6px', border: '1px solid rgba(239, 68, 68, 0.12)', display: 'flex', gap: '0.4rem', alignItems: 'flex-start' }}>
-                                  <AlertTriangle size={12} color="#ef4444" style={{ flexShrink: 0, marginTop: '2px' }} />
-                                  <p style={{ fontSize: '0.75rem', color: '#fca5a5', lineHeight: 1.4 }}><b>破位警告：</b>{selectedStock.risk_tips}</p>
-                                </div>
-                              )}
-                            </div>
                           </div>
-
                         </div>
-                      </div>
-                    ) : (
-                      <div className="empty-wrapper" style={{ height: '300px', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+                      ) : (
+                        <div className="empty-wrapper" style={{ height: '300px', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
                           <Info size={32} color="#3b82f6" />
                           <p style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>暂无股票选中比对数据</p>
                         </div>
@@ -1905,7 +2065,7 @@ export default function App() {
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-                  
+
                   {/* 汇总绩效指标 (Metrics Grid) */}
                   <div className="metrics-grid">
                     <div className="metric-card">
@@ -1942,8 +2102,8 @@ export default function App() {
 
                   {/* 净值走势图 */}
                   <div className="data-card" style={{ height: '400px' }}>
-                    <ReactECharts 
-                      option={getBacktestOption()} 
+                    <ReactECharts
+                      option={getBacktestOption()}
                       style={{ height: '100%', width: '100%' }}
                     />
                   </div>

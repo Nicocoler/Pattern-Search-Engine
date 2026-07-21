@@ -138,6 +138,56 @@ def list_templates():
     conn.close()
     return {"success": True, "data": sanitize_numpy({"templates": rows}), "error": None}
 
+# ⚠️ 注意：schema 端点必须放在 {template_id} 通配符之前，否则 "schema" 会被当成 int 解析失败
+@app.get("/api/templates/schema")
+def get_template_schema():
+    """
+    返回形态模板全部可配置参数的元数据：
+    - event_types: 8 大事件类型及中文名称/描述
+    - hard_filter_fields: 硬过滤字段定义
+    - weight_keys: 7 大特征权重定义
+    - backtest_config_fields: 回测默认配置定义
+    - source_fields: 母体锚定字段定义
+    """
+    schema = {
+        "event_types": [
+            {"key": "TREND_UP", "name": "上升趋势", "description": "均线多头排列，价格持续走高"},
+            {"key": "TOUCH_BOLL_UPPER", "name": "碰触布林上轨", "description": "收盘价触及或突破布林通道上轨"},
+            {"key": "PULLBACK", "name": "良性缩量回踩", "description": "上涨后成交量逐步萎缩的回调"},
+            {"key": "VOLUME_SHRINK", "name": "极度缩量清洗", "description": "成交量缩至20日均量极低水平"},
+            {"key": "TOUCH_BOLL_MIDDLE", "name": "触及布林中轨", "description": "价格回落至布林通道中轨附近"},
+            {"key": "BOLL_MIDDLE_SUPPORT", "name": "中轨企稳撑住", "description": "触及中轨后未有效跌破并企稳"},
+            {"key": "STOP_FALLING_CANDLE", "name": "收盘十字企稳", "description": "出现十字星等止跌K线形态"},
+            {"key": "VOLUME_BREAKOUT", "name": "二次放量突破", "description": "缩量回踩后再次放量向上突破"},
+        ],
+        "hard_filter_fields": {
+            "min_amount_20d": {"type": "number", "default": 10000000, "unit": "元", "description": "20日均成交额最低门槛，低于此值视为僵尸股剔除"},
+            "allow_st": {"type": "boolean", "default": False, "description": "是否允许ST/退市整理股"},
+            "max_suspended_days": {"type": "number", "default": 3, "unit": "天", "description": "允许最大停牌天数"},
+        },
+        "weight_keys": [
+            {"key": "close_norm", "name": "归一化首日价格对齐", "description": "窗口内首日价格等效归一化走势", "min": 0.01, "max": 0.99, "step": 0.01},
+            {"key": "boll_mid_dist", "name": "距离布林中轨偏离度", "description": "收盘价相对布林中轨的偏离程度", "min": 0.01, "max": 0.99, "step": 0.01},
+            {"key": "volume_ratio_20", "name": "20日均量成交缩量比", "description": "当日成交量相对20日均量的倍率", "min": 0.01, "max": 0.99, "step": 0.01},
+            {"key": "close_position", "name": "K线收盘落脚点位置", "description": "收盘价在当日振幅中的相对位置 (0~1)", "min": 0.01, "max": 0.99, "step": 0.01},
+            {"key": "return_5d", "name": "5日局部变动收益排布", "description": "5日收益率变化趋势", "min": 0.01, "max": 0.99, "step": 0.01},
+            {"key": "range_ratio", "name": "滑动价格最高最低振幅", "description": "窗口内最高价与最低价振幅比", "min": 0.01, "max": 0.99, "step": 0.01},
+            {"key": "atr_ratio", "name": "真实波动率ATR振荡比", "description": "ATR与收盘价比值，衡量波动强度", "min": 0.01, "max": 0.99, "step": 0.01},
+        ],
+        "backtest_config_fields": {
+            "holding_periods": {"type": "array[int]", "default": [5, 10, 20], "description": "持股周期（天），以逗号分隔"},
+            "benchmark": {"type": "string", "default": "sz399300", "description": "业绩对比基准指数代码"},
+            "score_threshold": {"type": "number", "default": 80.0, "min": 0, "max": 100, "step": 1, "description": "买入相似度得分门槛"},
+        },
+        "source_fields": {
+            "window_size": {"type": "number", "default": 60, "min": 15, "max": 120, "step": 1, "description": "形态滑动窗口步长（天）"},
+            "source_symbol": {"type": "string", "format": "8 chars with market prefix (e.g. sz000002)", "description": "形态母体股票代码"},
+            "source_start": {"type": "date", "description": "母体数据起始日期（暖机加宽拉取时间）"},
+            "source_end": {"type": "date", "description": "母体形态切片截止日期"},
+        },
+    }
+    return {"success": True, "data": sanitize_numpy(schema), "error": None}
+
 @app.get("/api/templates/{template_id}")
 def get_template_details(template_id: int = Path(..., description="模板 ID")):
     """
@@ -659,9 +709,17 @@ def compare_template_with_stock(
     if len(df_cand_window) < window_size:
         raise HTTPException(status_code=400, detail="候选股滑动窗口特征数据不足")
 
-    # 3. 运行多维相似度计算
+    # 3. 运行多维相似度计算（注入模板权重和事件序列）
     sim_engine = SimilarityEngine()
-    report = sim_engine.compute_composite_similarity(df_temp_window, df_cand_window, symbol)
+    template_weights = tpl.get("weights", {}) or {}
+    if not template_weights:
+        template_weights = sim_engine.feature_weights
+    required_events = config.get("required_events", [])
+    report = sim_engine.compute_composite_similarity(
+        df_temp_window, df_cand_window, symbol,
+        feature_weights=template_weights,
+        required_events=required_events,
+    )
     
     # 4. 提取今日已匹配高斯模糊事件置信度详情，完美响应前端气泡渲染
     cand_events = sim_engine.event_engine.detect_all_events(df_cand_window)
