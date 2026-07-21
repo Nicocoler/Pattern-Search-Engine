@@ -254,9 +254,12 @@ class ScannerSentry:
         # 6. 一键将匹配度最高的 Top 20 选股落地 upsert 写入 scan_results 表
         top_20 = scored_results[:20]
 
-        logger.info(f"📊 扫描完毕！形态得分大PK已出炉。前 3 名匹配状元如下：")
-        for rank, res in enumerate(scored_results[:3], 1):
-            logger.info(f" 🏆【第{rank}名】{res['symbol']} ({res['name']}) | 匹配得分: {res['total_score']}分 | 衍生正面事实: {res['explanation_facts']['positive_facts'][:2]}")
+        if scored_results:
+            logger.info(f"📊 扫描完毕！形态得分大PK已出炉。前 3 名匹配状元如下：")
+            for rank, res in enumerate(scored_results[:3], 1):
+                logger.info(f" 🏆【第{rank}名】{res['symbol']} ({res['name']}) | 匹配得分: {res['total_score']}分 | 衍生正面事实: {res['explanation_facts']['positive_facts'][:2]}")
+        else:
+            logger.warning("📊 本次扫描完成，但没有股票通过所有筛选条件。")
 
         # 7. 整理并打包落库
         records_to_insert = []
@@ -281,7 +284,7 @@ class ScannerSentry:
 
         if not records_to_insert:
             logger.warning("本次形态扫描没有筛选出符合任何特征硬指标的股票，无数据写入。")
-            return
+            return []
 
         conn_write = self.get_db_connection()
         cursor_write = conn_write.cursor()
