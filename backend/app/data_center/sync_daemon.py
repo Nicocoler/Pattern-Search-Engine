@@ -36,7 +36,9 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from backend.app.core.config import settings
+from backend.app.core import db
 from backend.app.data_center.sync import DataCenterSync
+from psycopg2 import sql
 
 BASE_DIR = _PROJECT_ROOT
 PID_FILE = BASE_DIR / "logs" / "sync_daemon.pid"
@@ -112,55 +114,55 @@ class DaemonLock:
 
 
 def ensure_sync_status_table(db_url):
-    import psycopg2
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
-    try:
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {STATUS_DB_TABLE} (
-                key VARCHAR(32) PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            );
-        """)
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
+    # db_url 保留以兼容旧签名，实际走统一连接池
+    with db.db_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {} (
+                        key VARCHAR(32) PRIMARY KEY,
+                        value TEXT,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    );
+                """).format(sql.Identifier(STATUS_DB_TABLE))
+            )
+            conn.commit()
+        finally:
+            cursor.close()
 
 
 def get_sync_status(db_url):
     """读取同步状态，表不存在时返回空字典。"""
-    import psycopg2
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s);", (STATUS_DB_TABLE,))
-        exists = cursor.fetchone()[0]
-        if not exists:
-            return {}
-        cursor.execute(f"SELECT key, value FROM {STATUS_DB_TABLE};")
-        rows = cursor.fetchall()
-        return {k: v for k, v in rows}
-    finally:
-        cursor.close()
-        conn.close()
+    with db.db_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s);", (STATUS_DB_TABLE,))
+            exists = cursor.fetchone()[0]
+            if not exists:
+                return {}
+            cursor.execute(sql.SQL("SELECT key, value FROM {};").format(sql.Identifier(STATUS_DB_TABLE)))
+            rows = cursor.fetchall()
+            return {k: v for k, v in rows}
+        finally:
+            cursor.close()
 
 
 def set_sync_status(db_url, key, value):
-    import psycopg2
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
-    try:
-        cursor.execute(f"""
-            INSERT INTO {STATUS_DB_TABLE} (key, value, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
-        """, (key, value))
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
+    with db.db_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                sql.SQL("""
+                    INSERT INTO {} (key, value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+                """).format(sql.Identifier(STATUS_DB_TABLE)),
+                (key, value)
+            )
+            conn.commit()
+        finally:
+            cursor.close()
 
 
 def print_sync_status(db_url):
@@ -168,16 +170,14 @@ def print_sync_status(db_url):
     if not status:
         print(json.dumps({"success": True, "data": {"message": "尚未有任何同步记录"}, "error": None}, ensure_ascii=False, indent=2))
         return
-    import psycopg2
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT MAX(date) FROM daily_bars;")
-        row = cursor.fetchone()
-        max_bar_date = row[0].strftime("%Y-%m-%d") if row and row[0] else "N/A"
-    finally:
-        cursor.close()
-        conn.close()
+    with db.db_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT MAX(date) FROM daily_bars;")
+            row = cursor.fetchone()
+            max_bar_date = row[0].strftime("%Y-%m-%d") if row and row[0] else "N/A"
+        finally:
+            cursor.close()
     result = {"success": True, "data": {"status_table": status, "actual_latest_bar_date": max_bar_date}, "error": None}
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
@@ -231,7 +231,7 @@ def run_sync(full=False, max_workers=8):
     def _handle_signal(signum, frame):
         logger.warning(f"收到信号 {signum}，正在优雅停止...")
         if sync_engine:
-            DataCenterSync.CURRENT_GENERATION_ID += 1
+            DataCenterSync.next_generation_id()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

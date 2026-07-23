@@ -83,5 +83,21 @@ CREATE TABLE IF NOT EXISTS backtest_reports (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- 8. 后台行情同步状态 KV 表（守护进程与 FastAPI 后台任务共用，幂等建表）
+CREATE TABLE IF NOT EXISTS data_sync_status (
+    key VARCHAR(32) PRIMARY KEY,                       -- 状态键（last_start_time / last_status / last_mode 等）
+    value TEXT,                                         -- 状态值
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 9. 人工标注反馈记录表（API 端点内 CREATE TABLE IF NOT EXISTS 幂等兜底，此处一并声明）
+CREATE TABLE IF NOT EXISTS user_feedback (
+    id SERIAL PRIMARY KEY,
+    result_id BIGINT NOT NULL,                          -- 关联的 scan_results.id（应用层保证，未声明外键）
+    label VARCHAR(32) NOT NULL,                        -- 标注标签: good_match / bad_match / watchlist / ignore
+    comment TEXT,                                       -- 人工备注
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- 如果是普通 PostgreSQL 降级环境，创建日K线的极致检索联合索引以加速 DTW 切片提取
 CREATE INDEX IF NOT EXISTS idx_daily_bars_date_code ON daily_bars (date DESC, code);

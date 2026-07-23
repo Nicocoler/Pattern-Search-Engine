@@ -7,11 +7,11 @@ Pattern Search Engine (PSE) - 历史形态滚动无偏回测引擎 (Backtest Eng
 import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import json
 import uuid
+import logging
 
+from backend.app.core import db
 from backend.app.core.config import settings
 from backend.app.indicator_engine.engine import calculate_indicators
 from backend.app.feature_engine.engine import calculate_features
@@ -19,14 +19,12 @@ from backend.app.similarity_engine.engine import SimilarityEngine
 from backend.app.template_manager.manager import TemplateManager
 from backend.app.filters.boll_mid_filter import has_boll_mid_breach
 
+logger = logging.getLogger("BacktestEngine")
+
 class BacktestEngine:
     def __init__(self):
-        self.db_url = settings.DATABASE_URL
         self.similarity_engine = SimilarityEngine()
         self.template_manager = TemplateManager()
-
-    def get_db_connection(self):
-        return psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
 
     def load_stock_full_history(self, code: str, start_date: date, end_date: date) -> pd.DataFrame:
         """
@@ -34,18 +32,15 @@ class BacktestEngine:
         - 预拉取额外 250 天以支撑滚窗均线暖机
         """
         padded_start = start_date - timedelta(days=250)
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        query = """
-            SELECT date, open, high, low, close, volume, amount, factor
-            FROM daily_bars
-            WHERE code = %s AND date >= %s AND date <= %s
-            ORDER BY date ASC;
-        """
-        cursor.execute(query, (code, padded_start, end_date))
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        with db.db_cursor(dict_cursor=True) as (conn, cursor):
+            query = """
+                SELECT date, open, high, low, close, volume, amount, factor
+                FROM daily_bars
+                WHERE code = %s AND date >= %s AND date <= %s
+                ORDER BY date ASC;
+            """
+            cursor.execute(query, (code, padded_start, end_date))
+            rows = cursor.fetchall()
         if not rows:
             return pd.DataFrame()
             
@@ -93,9 +88,9 @@ class BacktestEngine:
         # 模板驱动：如果模板需要 BOLL_MIDDLE_SUPPORT 事件，则启用中轨硬过滤
         require_boll_mid_filter = "BOLL_MIDDLE_SUPPORT" in required_events
         if require_boll_mid_filter:
-            print(f"🔒 [模板驱动] 该模板需要 BOLL_MIDDLE_SUPPORT，已启用中轨硬过滤（回调触中轨后收盘不可跌破）")
+            logger.info("🔒 [模板驱动] 该模板需要 BOLL_MIDDLE_SUPPORT，已启用中轨硬过滤（回调触中轨后收盘不可跌破）")
         else:
-            print(f"ℹ️ [模板驱动] 该模板不需要 BOLL_MIDDLE_SUPPORT，跳过中轨硬过滤")
+            logger.info("ℹ️ [模板驱动] 该模板不需要 BOLL_MIDDLE_SUPPORT，跳过中轨硬过滤")
 
         # 2. 编译模板母体经典形态特征矩阵
         source_symbol = config.get("source_symbol", "sz000002")
@@ -108,19 +103,16 @@ class BacktestEngine:
         
         # 3. 预加载股票池并一次性算出全历史特征大表 (内存预加载性能大跃进)
         # 获取股票池
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT code, name FROM stocks WHERE is_st = FALSE AND is_suspended = FALSE;")
-        stocks = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        with db.db_cursor(dict_cursor=True) as (conn, cursor):
+            cursor.execute("SELECT code, name FROM stocks WHERE is_st = FALSE AND is_suspended = FALSE;")
+            stocks = cursor.fetchall()
         
         # 在内存中预存各股已经计算好全历史的 features 字典：{code: df_features}
         preloaded_features = {}
         # 为了回测中快速按日期定位收盘价，预存各股 {code: {date: close}} 字典
         price_maps = {}
         
-        print(f"👉 正在预加载回测股票池量价底座并完成矢量计算...")
+        logger.info("👉 正在预加载回测股票池量价底座并完成矢量计算...")
         for s in stocks:
             code = s["code"]
             df_hist = self.load_stock_full_history(code, start_date, end_date)
@@ -128,9 +120,11 @@ class BacktestEngine:
                 continue
             df_ind = calculate_indicators(df_hist)
             df_feat = calculate_features(df_ind, code)
-            
+
             preloaded_features[code] = df_feat
-            price_maps[code] = dict(zip(df_hist['date'], df_hist['close']))
+            # 价格表用指标计算后（停牌日已 ffill）的 close 构建，与买入价 df_window_t['close'] 口径一致，
+            # 避免停牌日取到 NaN 污染卖出收益核算
+            price_maps[code] = dict(zip(df_feat['date'], df_feat['close']))
 
         # 4. 获取回测历史区间的标准交易日轴 (来自股票池中最活跃股，如万科A)
         if source_symbol in preloaded_features:
@@ -141,7 +135,10 @@ class BacktestEngine:
         trading_dates = df_dates[(df_dates['date'] >= start_date) & (df_dates['date'] <= end_date)]['date'].tolist()
         trading_dates.sort()
         
-        print(f"👉 预加载完成！回测区间共包含 {len(trading_dates)} 个有效交易日。开始无偏仿真重演...")
+        logger.info("👉 预加载完成！回测区间共包含 %s 个有效交易日。开始无偏仿真重演...", len(trading_dates))
+
+        # 预建 交易日 -> 序号 字典，消除后续净值循环中的 O(n) trading_dates.index() 调用
+        date_to_idx = {d: i for i, d in enumerate(trading_dates)}
 
         trade_details = []
         signals_count = 0
@@ -161,7 +158,7 @@ class BacktestEngine:
                 
                 # 两级剪枝过滤
                 min_boll_dist = df_window_t['boll_mid_dist'].abs().min()
-                if min_boll_dist > 0.045:
+                if min_boll_dist > settings.BOLL_PRUNE_THRESHOLD:
                     continue
 
                 # 两级半剪枝：布林中轨硬过滤（仅当模板需要 BOLL_MIDDLE_SUPPORT 时启用）
@@ -245,56 +242,55 @@ class BacktestEngine:
 
         # 计算最大回撤 (基于合并后的虚拟资产净值曲线)
         equity_curve = []
+        # 复利累计净值：起点 1.0（契约：equity_curve[0].portfolio_value == 1.0）
         portfolio_value = 1.0
         peak_value = 1.0
         max_dd = 0.0
-        
-        # 为合并模拟每日净值
-        # 如果当天有正在持有的交易，计算它们的每日合并变动
+        max_hold_days = holding_periods[-1]
+
+        # 为合并模拟每日净值：若当天有正在持有的交易，计算它们的当日合并变动并复利累乘
         for idx, t in enumerate(trading_dates):
-            # 获取当天所有正处于持股周期内的交易记录
+            # 获取当天所有正处于持股周期内的交易记录（用预建索引字典消除 O(n) 查找）
             active_trades = []
             for tr in trade_details:
                 b_date = datetime.strptime(tr["buy_date"], "%Y-%m-%d").date()
-                max_hold_days = holding_periods[-1]
-                # 粗略判断是否在持仓窗口内
-                b_idx = trading_dates.index(b_date)
+                b_idx = date_to_idx.get(b_date, -1)
                 if b_idx <= idx < b_idx + max_hold_days:
                     active_trades.append(tr)
-            
-            # 每日合并收益率
+
+            # 当日合并收益率
             if active_trades:
-                # 简单合并：均分资金持仓
-                # 每日个股价格变动
+                # 均分资金持仓：用当日收盘价相对买入价的变动近似当日收益
                 daily_rets = []
                 for tr in active_trades:
                     code = tr["symbol"]
-                    b_date = datetime.strptime(tr["buy_date"], "%Y-%m-%d").date()
                     b_price = tr["buy_price"]
                     c_price = price_maps[code].get(t, b_price)
+                    if c_price is None:
+                        continue
                     daily_rets.append((c_price - b_price) / b_price)
-                day_return = np.mean(daily_rets)
-                portfolio_value = 1.0 + day_return
+                day_return = float(np.mean(daily_rets)) if daily_rets else 0.0
+                portfolio_value *= (1.0 + day_return)
             else:
                 day_return = 0.0
-                
-            # 计算回撤
+
+            # 计算回撤（基于累计净值）
             if portfolio_value > peak_value:
                 peak_value = portfolio_value
-            dd = (peak_value - portfolio_value) / peak_value
+            dd = (peak_value - portfolio_value) / peak_value if peak_value > 0 else 0.0
             if dd > max_dd:
                 max_dd = dd
-                
+
             equity_curve.append({
                 "trade_date": t.strftime("%Y-%m-%d"),
                 "portfolio_value": round(portfolio_value, 4),
-                "benchmark_value": 1.0 # 简化为平铺对比
+                "benchmark_value": 1.0  # 基准未接入，固定 1.0 平铺对比
             })
-            
+
         summary["max_drawdown"] = round(-max_dd * 100.0, 2)
 
         # 7. 一键将回测总报告保存写入数据库 backtest_reports 表
-        conn_write = self.get_db_connection()
+        conn_write = db.acquire(dict_cursor=True)
         cursor_write = conn_write.cursor()
         query_insert_report = """
             INSERT INTO backtest_reports (template_id, start_date, end_date, metrics, equity_curve)
@@ -311,14 +307,14 @@ class BacktestEngine:
             ))
             report_id = cursor_write.fetchone()["id"]
             conn_write.commit()
-            print(f"🎉【回测科研底座】回测运行大胜！总报告已成功落库 [backtest_reports] (Report ID: {report_id})。")
+            logger.info("🎉【回测科研底座】回测运行大胜！总报告已成功落库 [backtest_reports] (Report ID: %s)。", report_id)
         except Exception as e:
             conn_write.rollback()
-            print(f"❌ 回测报告写入失败: {e}")
+            logger.error("❌ 回测报告写入失败: %s", e)
             report_id = None
         finally:
             cursor_write.close()
-            conn_write.close()
+            db.release(conn_write)
 
         return {
             "backtest_id": str(uuid.uuid4()),

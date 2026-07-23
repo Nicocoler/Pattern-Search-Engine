@@ -14,6 +14,93 @@ from backend.app.event_engine.engine import EventEngine
 
 logger = logging.getLogger("SimilarityEngine")
 
+# numba 可选加速：可用则 JIT 编译 DTW 累积代价矩阵计算（提速数倍），不可用时回退纯 Python 实现
+try:
+    from numba import njit
+    _NUMBA_AVAILABLE = True
+except Exception:  # numba 未安装或与 numpy 版本不兼容时优雅降级
+    njit = None
+    _NUMBA_AVAILABLE = False
+
+
+def _dtw_accum_cost(T: np.ndarray, C: np.ndarray, weights: np.ndarray, sakoe_width: int) -> np.ndarray:
+    """
+    计算带 Sakoe-Chiba 限宽约束的多维加权 DTW 累积代价矩阵。
+    将局部距离 D(i,j)=sqrt(sum(w*(T_i-C_j)^2)) 折叠进动态规划递推，避免单独物化距离矩阵。
+    逻辑与原纯 Python 实现等价，仅做 JIT 编译加速。返回 (M x N) 累积代价矩阵（带外为 inf）。
+    """
+    if _NUMBA_AVAILABLE:
+        return _dtw_accum_cost_jit(T, C, weights, sakoe_width)
+    return _dtw_accum_cost_py(T, C, weights, sakoe_width)
+
+
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _dtw_accum_cost_jit(T, C, weights, sakoe_width):
+        M = T.shape[0]
+        N = C.shape[0]
+        accum_cost = np.full((M, N), np.inf)
+        accum_cost[0, 0] = np.sqrt(np.sum(weights * (T[0] - C[0]) ** 2))
+        for i in range(M):
+            j_start = i - sakoe_width
+            if j_start < 0:
+                j_start = 0
+            j_end = i + sakoe_width + 1
+            if j_end > N:
+                j_end = N
+            for j in range(j_start, j_end):
+                if i == 0 and j == 0:
+                    continue
+                best = np.inf
+                if i > 0:
+                    if (i - 1) - j <= sakoe_width and j - (i - 1) <= sakoe_width:
+                        v = accum_cost[i - 1, j]
+                        if v < best:
+                            best = v
+                if j > 0:
+                    if i - (j - 1) <= sakoe_width and (j - 1) - i <= sakoe_width:
+                        v = accum_cost[i, j - 1]
+                        if v < best:
+                            best = v
+                if i > 0 and j > 0:
+                    if (i - 1) - (j - 1) <= sakoe_width and (j - 1) - (i - 1) <= sakoe_width:
+                        v = accum_cost[i - 1, j - 1]
+                        if v < best:
+                            best = v
+                ld = np.sqrt(np.sum(weights * (T[i] - C[j]) ** 2))
+                accum_cost[i, j] = ld + best
+        return accum_cost
+
+
+def _dtw_accum_cost_py(T, C, weights, sakoe_width):
+    """纯 Python 回退实现（numba 不可用时使用），逻辑与 JIT 版完全一致。"""
+    M = T.shape[0]
+    N = C.shape[0]
+    accum_cost = np.full((M, N), np.inf)
+    accum_cost[0, 0] = np.sqrt(np.sum(weights * (T[0] - C[0]) ** 2))
+    for i in range(M):
+        j_start = max(0, i - sakoe_width)
+        j_end = min(N, i + sakoe_width + 1)
+        for j in range(j_start, j_end):
+            if i == 0 and j == 0:
+                continue
+            best = np.inf
+            if i > 0 and abs((i - 1) - j) <= sakoe_width:
+                v = accum_cost[i - 1, j]
+                if v < best:
+                    best = v
+            if j > 0 and abs(i - (j - 1)) <= sakoe_width:
+                v = accum_cost[i, j - 1]
+                if v < best:
+                    best = v
+            if i > 0 and j > 0 and abs((i - 1) - (j - 1)) <= sakoe_width:
+                v = accum_cost[i - 1, j - 1]
+                if v < best:
+                    best = v
+            ld = np.sqrt(np.sum(weights * (T[i] - C[j]) ** 2))
+            accum_cost[i, j] = ld + best
+    return accum_cost
+
 class SimilarityEngine:
     def __init__(self):
         self.event_engine = EventEngine()
@@ -124,54 +211,28 @@ class SimilarityEngine:
     ) -> tuple[float, list[list[int]]]:
         """
         多维加权 DTW 核心对齐算法：
-        - 输入：标准化后的模板特征 T (M x F) 与候选特征 C (N x F) 
+        - 输入：标准化后的模板特征 T (M x F) 与候选特征 C (N x F)
         - 约束：限宽 Sakoe-Chiba 约束带（防止时间轴病态对齐并压缩运算耗时 80%）
         - 权重：weights (F) 为各维度的重要性系数
         - 返回：(对齐累计最短距离, 最佳对齐路径)
         """
         M, N = len(T), len(C)
-        F = T.shape[1]
-        
+
+        # 0. 统一为连续 float64 数组，便于 JIT 编译与稳定数值计算
+        T = np.ascontiguousarray(T, dtype=np.float64)
+        C = np.ascontiguousarray(C, dtype=np.float64)
+        weights = np.ascontiguousarray(weights, dtype=np.float64)
+
         # 1. Sakoe-Chiba 约束带宽度：floor(0.15 * max(M, N))
         sakoe_width = max(3, int(np.floor(0.15 * max(M, N))))
-        
-        # 2. 初始化累积距离矩阵 (INF)
-        accum_cost = np.full((M, N), np.inf)
 
-        # 3. 计算加权点对距离矩阵 (局部距离 D(i, j))
-        # D(i, j) = sqrt( sum( w_f * (T_i,f - C_j,f)^2 ) )
-        local_dist = np.zeros((M, N))
-        for i in range(M):
-            j_start = max(0, i - sakoe_width)
-            j_end = min(N, i + sakoe_width + 1)
-            for j in range(j_start, j_end):
-                diff = T[i] - C[j]
-                local_dist[i, j] = np.sqrt(np.sum(weights * (diff ** 2)))
-
-        # 4. 动态规划递推计算累积最小距离
-        accum_cost[0, 0] = local_dist[0, 0]
-        
-        for i in range(M):
-            j_start = max(0, i - sakoe_width)
-            j_end = min(N, i + sakoe_width + 1)
-            for j in range(j_start, j_end):
-                if i == 0 and j == 0:
-                    continue
-                costs = []
-                if i > 0 and abs((i - 1) - j) <= sakoe_width:
-                    costs.append(accum_cost[i - 1, j])
-                if j > 0 and abs(i - (j - 1)) <= sakoe_width:
-                    costs.append(accum_cost[i, j - 1])
-                if i > 0 and j > 0 and abs((i - 1) - (j - 1)) <= sakoe_width:
-                    costs.append(accum_cost[i - 1, j - 1])
-                
-                if costs:
-                    accum_cost[i, j] = local_dist[i, j] + min(costs)
+        # 2. 动态规划递推计算累积最小距离（局部距离折叠进递推，numba 加速）
+        accum_cost = _dtw_accum_cost(T, C, weights, sakoe_width)
 
         if np.isinf(accum_cost[M - 1, N - 1]):
             return 999.0, []
 
-        # 5. 回溯最优对齐路径
+        # 3. 回溯最优对齐路径
         path = []
         i, j = M - 1, N - 1
         path.append([i, j])
@@ -184,7 +245,7 @@ class SimilarityEngine:
                 left = accum_cost[i, j - 1] if abs(i - (j - 1)) <= sakoe_width else np.inf
                 up = accum_cost[i - 1, j] if abs((i - 1) - j) <= sakoe_width else np.inf
                 diag = accum_cost[i - 1, j - 1] if abs((i - 1) - (j - 1)) <= sakoe_width else np.inf
-                
+
                 min_val = min(left, up, diag)
                 if min_val == diag:
                     i -= 1
@@ -194,7 +255,7 @@ class SimilarityEngine:
                 else:
                     j -= 1
             path.append([i, j])
-            
+
         path.reverse()
         normalized_distance = accum_cost[M - 1, N - 1] / (M + N)
         return float(normalized_distance), path
@@ -386,12 +447,12 @@ class SimilarityEngine:
         #    event_sequence 固定占 15%，其余 85% 按特征权重比例分配到 5 个类别
         cat_weights = self._derive_category_weights(feature_weights)
         raw_composite_score = (
-            cat_weights.get("trend", 0.25) * 0.85 * sub_scores["trend_score"]
-            + cat_weights.get("boll", 0.20) * 0.85 * sub_scores["boll_score"]
-            + cat_weights.get("volume", 0.15) * 0.85 * sub_scores["volume_score"]
-            + cat_weights.get("candle", 0.15) * 0.85 * sub_scores["candle_score"]
+            cat_weights["trend"] * 0.85 * sub_scores["trend_score"]
+            + cat_weights["boll"] * 0.85 * sub_scores["boll_score"]
+            + cat_weights["volume"] * 0.85 * sub_scores["volume_score"]
+            + cat_weights["candle"] * 0.85 * sub_scores["candle_score"]
             + 0.15 * sub_scores["event_sequence_score"]
-            + cat_weights.get("volatility", 0.05) * 0.85 * sub_scores["volatility_score"]
+            + cat_weights["volatility"] * 0.85 * sub_scores["volatility_score"]
         )
         
         # 5. 计算破位惩罚扣分
@@ -429,9 +490,14 @@ class SimilarityEngine:
             "negative_facts": negative_facts,
         }
 
-        # 7. 全路径对齐（用于画图/还原），保持固定权重不变
+        # 7. 全路径对齐（用于画图/还原），权重由模板 feature_weights 派生（与评分基准一致）
         cols = ["close_norm", "boll_mid_dist", "volume_ratio_20", "close_position"]
-        weights_arr = np.array([0.35, 0.25, 0.20, 0.20])
+        raw_align_w = [float(feature_weights.get(c, 0.0)) for c in cols]
+        w_sum_align = sum(raw_align_w)
+        if w_sum_align > 0:
+            weights_arr = np.array([w / w_sum_align for w in raw_align_w])
+        else:
+            weights_arr = np.array([0.25, 0.25, 0.25, 0.25])  # 均匀回退
 
         df_temp_p = df_temp.copy()
         df_cand_p = df_cand.copy()

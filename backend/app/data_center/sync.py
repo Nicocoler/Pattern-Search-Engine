@@ -10,46 +10,57 @@ from backend.app.core.config import settings
 import time
 import random
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import akshare as ak
-import psycopg2
 from psycopg2.extras import execute_values
 
-# 基础日志配置
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+from backend.app.core import db
+
+# 日志：仅获取命名空间 logger，输出由 main.py root logger / sync_daemon 统一配置，
+# 不再调用 basicConfig 以免与主进程日志配置互相覆盖。
 logger = logging.getLogger("DataCenter")
 
 class DataCenterSync:
     # 全局运行世代 ID，用于支持最新参数热重载、上一任优雅退让停机
     CURRENT_GENERATION_ID = 0
+    # 串行化世代 ID 自增的进程内锁（消除 +=1 读改写竞态；跨进程不可见）
+    _GEN_LOCK = threading.Lock()
+
+    @classmethod
+    def next_generation_id(cls) -> int:
+        """原子地递增并返回最新世代 ID（线程安全）。"""
+        with cls._GEN_LOCK:
+            cls.CURRENT_GENERATION_ID += 1
+            return cls.CURRENT_GENERATION_ID
+
+    @classmethod
+    def get_generation_id(cls) -> int:
+        """原子读取当前世代 ID。"""
+        with cls._GEN_LOCK:
+            return cls.CURRENT_GENERATION_ID
 
     def __init__(self, max_concurrent=None, retry_limit=None, delay_min=None, delay_max=None):
-        self.db_url = settings.DATABASE_URL
-        
         # 每一个新实例都会和当前的最新世代 ID 绑定锚定
         self.generation_id = DataCenterSync.CURRENT_GENERATION_ID
-        
+
         # 100% 允许从外部传入参数以动态覆写 settings 配置 (极佳的扩展联动基础)
         self.max_concurrent = max_concurrent or settings.MAX_CONCURRENT_REQUESTS
         self.retry_limit = retry_limit or settings.REQUEST_RETRY_LIMIT
-        
-        # 延迟参数传入以毫秒为单位，内部除以 1000 转换为秒；默认休眠 100ms ~ 300ms 
+
+        # 延迟参数传入以毫秒为单位，内部除以 1000 转换为秒；默认休眠 100ms ~ 300ms
         self.delay_min = float(delay_min if delay_min is not None else 100) / 1000.0
         self.delay_max = float(delay_max if delay_max is not None else 300) / 1000.0
-        
+
         # 线程并发信号量，严格控流，动态依据前端微调线程上限起飞
         self.semaphore = threading.Semaphore(self.max_concurrent)
 
     def get_db_connection(self):
-        return psycopg2.connect(self.db_url)
+        # 走统一连接池（普通 tuple 游标，向后兼容 row[0] 索引访问）
+        return db.acquire(dict_cursor=False)
 
     def fetch_with_retry(self, func, *args, **kwargs):
         """
@@ -135,7 +146,7 @@ class DataCenterSync:
             ))
 
         # 批量 UPSERT 入库
-        conn = self.get_db_connection()
+        conn = db.acquire()
         cursor = conn.cursor()
         upsert_query = """
             INSERT INTO stocks (code, name, list_date, board, industry, is_st, is_suspended, updated_at)
@@ -155,7 +166,7 @@ class DataCenterSync:
             logger.error(f"批量更新 stocks 表失败: {e}")
         finally:
             cursor.close()
-            conn.close()
+            db.release(conn)
 
         return [s[0] for s in stocks_to_insert]
 
@@ -163,13 +174,9 @@ class DataCenterSync:
         """
         从本地 daily_bars 提取当前个股已存的最后一根K线的日期和前复权因子
         """
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        query = "SELECT date, factor FROM daily_bars WHERE code = %s ORDER BY date DESC LIMIT 1;"
-        cursor.execute(query, (code,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        with db.db_cursor() as (conn, cursor):
+            cursor.execute("SELECT date, factor FROM daily_bars WHERE code = %s ORDER BY date DESC LIMIT 1;", (code,))
+            row = cursor.fetchone()
         if row:
             return row[0], float(row[1])
         return None, None
@@ -180,7 +187,7 @@ class DataCenterSync:
         支持：自适应增量同步、除权因子突变差分拦截与全历史强制重算触发
         """
         # 0. 世代代差检测，若已被更新一代任务废黜，主动优雅退位让出写锁和带宽
-        if self.generation_id != DataCenterSync.CURRENT_GENERATION_ID:
+        if self.generation_id != DataCenterSync.get_generation_id():
             logger.debug(f"[{code}] 🏳️ 检测到更高优先级的最新世代任务正在运行，本老一代实例主动退让退位...")
             return False
 
@@ -217,9 +224,9 @@ class DataCenterSync:
             start_date = "20200101" # 19900101 拉取全历史
             logger.debug(f"[{code}] 本地无数据，将拉取其全历史日 K 线...")
         else:
-            # 增量拉取，从最后一天往前移 2 天开始拉取（包含最近 2 天重合比对复权系数，验证是否发生最新除权）
-            # 减去几天也用于保证周末无行情或者非交易日缺失不跳空
-            start_date = max_date.strftime("%Y%m%d")
+            # 增量拉取，从本地最大日期往前移 2 天开始拉取（重合 2~3 天用于除权自交叉比对，
+            # 同时规避周末/非交易日缺失导致起点跳空）
+            start_date = (max_date - timedelta(days=2)).strftime("%Y%m%d")
 
         # 4. 直接唯一对接腾讯 ak.stock_zh_a_hist_tx 接口，弃用易断开且不稳定的东财源，极大提升成功率与抓取速度
         df_hist = None
@@ -227,7 +234,7 @@ class DataCenterSync:
             # 转换开始日期格式 (从 YYYYMMDD 转为 YYYY-MM-DD，腾讯接口格式要求)
             tx_start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
             tx_end = datetime.now().strftime("%Y-%m-%d")
-            
+
             df_tx = self.fetch_with_retry(
                 ak.stock_zh_a_hist_tx,
                 symbol=code, # 腾讯源必须带 sh/sz 前缀，如 sz000002
@@ -235,7 +242,7 @@ class DataCenterSync:
                 end_date=tx_end,
                 adjust="qfq" # 强制前复权
             )
-            
+
             if df_tx is not None and not df_tx.empty:
                 # 转换腾讯字段为契约兼容字段，完美无缝合入后续除权检查和批量 UPSERT！
                 df_hist = pd.DataFrame()
@@ -246,8 +253,9 @@ class DataCenterSync:
                 df_hist['最低'] = df_tx['low']
                 # 腾讯 API 返回的 amount 实际代表成交量（单位：手），转换为股数（1手 = 100股）
                 df_hist['成交量'] = df_tx['amount'].astype(float) * 100
-                # 估算成交额：成交量（股） * 收盘价
-                df_hist['成交额'] = df_hist['成交量'] * df_tx['close']
+                # 估算成交额：用当日均价 (开+高+低+收)/4 * 成交量（比单收盘价更接近真实成交额，仍为近似）
+                avg_price = (df_tx['open'] + df_tx['high'] + df_tx['low'] + df_tx['close']) / 4.0
+                df_hist['成交额'] = df_hist['成交量'] * avg_price
                 logger.debug(f"✅ 成功通过腾讯源同步个股 [{code}] 行情！")
             else:
                 logger.error(f"❌ 腾讯源未返回个股 [{code}] 的任何行情。")
@@ -292,40 +300,49 @@ class DataCenterSync:
             if not overlap_rows.empty:
                 latest_fetched_close = float(overlap_rows.iloc[0]['收盘'])
                 # 从本地数据库查这一天的价格（我们在上面已经取到了最新的 last_factor）
-                conn_check = self.get_db_connection()
-                cursor_check = conn_check.cursor()
-                cursor_check.execute("SELECT close FROM daily_bars WHERE code = %s AND date = %s;", (code, max_date))
-                row_local = cursor_check.fetchone()
-                cursor_check.close()
-                conn_check.close()
+                with db.db_cursor() as (conn_check, cursor_check):
+                    cursor_check.execute("SELECT close FROM daily_bars WHERE code = %s AND date = %s;", (code, max_date))
+                    row_local = cursor_check.fetchone()
 
                 if row_local:
                     local_stored_close = float(row_local[0])
                     # 比对本地存的前复权收盘价与今天新拉出来的这一天的前复权收盘价
                     price_diff = abs(local_stored_close - latest_fetched_close)
-                    if price_diff > 0.015:
+                    if price_diff > settings.DIRTY_FACTOR_PRICE_DIFF:
                         logger.warning(f"🚨 警告！检测到个股 [{code}] 历史前复权收盘价发生突变！本地存: {local_stored_close}，新抓取: {latest_fetched_close}，相差: {price_diff}元。")
                         logger.warning(f"   这说明该股近期发生了分红送配除权。系统将立即拦截该差分并写入 `dirty_factors`，准备全历史彻底覆写重算！")
-                        
+
                         # 记录到 dirty_factors 中
-                        conn_dirty = self.get_db_connection()
-                        cursor_dirty = conn_dirty.cursor()
-                        cursor_dirty.execute(
-                            "INSERT INTO dirty_factors (code, dirty_date, is_processed) VALUES (%s, %s, FALSE) ON CONFLICT (code, dirty_date) DO NOTHING;",
-                            (code, date.today())
-                        )
-                        conn_dirty.commit()
-                        cursor_dirty.close()
-                        conn_dirty.close()
+                        with db.db_conn() as conn_dirty:
+                            cursor_dirty = conn_dirty.cursor()
+                            cursor_dirty.execute(
+                                "INSERT INTO dirty_factors (code, dirty_date, is_processed) VALUES (%s, %s, FALSE) ON CONFLICT (code, dirty_date) DO NOTHING;",
+                                (code, date.today())
+                            )
+                            conn_dirty.commit()
+                            cursor_dirty.close()
 
                         # 触发“脏复权重算流程”：强制清除该股全历史，拉取完整全历史
-                        return self.sync_single_stock_daily_bars(code, force_rebuild=True)
+                        rebuild_ok = self.sync_single_stock_daily_bars(code, force_rebuild=True)
+                        if rebuild_ok:
+                            # 重算成功，消费 dirty 标记，避免脏记录只增不减
+                            with db.db_conn() as conn_mark:
+                                cur_mark = conn_mark.cursor()
+                                cur_mark.execute(
+                                    "UPDATE dirty_factors SET is_processed = TRUE, updated_at = NOW() WHERE code = %s AND dirty_date = %s;",
+                                    (code, date.today())
+                                )
+                                conn_mark.commit()
+                                cur_mark.close()
+                        return rebuild_ok
 
         # 6. 数据打包批量落库
         bars_to_insert = []
-        # 前复权模式下，最新一天的 factor 我们暂设为 1.0
-        # 即使历史除权导致旧 factor 改变，由于我们刚才已经实现了差分拦截并会重算全历史，因此将 factor 设为 1.0 (或通过价格比例倒推) 已经 100% 满足形态提取和相似匹配需求！
-        current_factor = 1.0 
+        # 前复权模式下，最新日的累计复权因子恒为 1.0（前复权以最新日为基准倒推）。
+        # 注意：历史日的真实累计复权因子并不为 1，此处对全部行写入 1.0 仅为占位——
+        # 相似度计算使用 Z-score 标准化，不依赖 factor 列，故不影响形态匹配结果。
+        # TODO: 后续如需精确复权因子，应基于不复权价/前复权价比例正确累计。
+        current_factor = 1.0
 
         for _, row in df_hist.iterrows():
             bar_date = row['日期']
@@ -348,7 +365,7 @@ class DataCenterSync:
             return True
 
         # 批量 UPSERT 入库
-        conn = self.get_db_connection()
+        conn = db.acquire()
         cursor = conn.cursor()
         upsert_query = """
             INSERT INTO daily_bars (code, date, open, high, low, close, volume, amount, factor)
@@ -372,7 +389,7 @@ class DataCenterSync:
             return False
         finally:
             cursor.close()
-            conn.close()
+            db.release(conn)
 
         return True
 
@@ -387,12 +404,9 @@ class DataCenterSync:
         codes = self.sync_stock_list()
         if not codes:
             # 如果拉取失败，尝试从本地 stocks 表读取已有股票进行增量
-            conn = self.get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT code FROM stocks WHERE is_suspended = FALSE;")
-            codes = [row[0] for row in cursor.fetchall()]
-            cursor.close()
-            conn.close()
+            with db.db_cursor() as (conn, cursor):
+                cursor.execute("SELECT code FROM stocks WHERE is_suspended = FALSE;")
+                codes = [row[0] for row in cursor.fetchall()]
             logger.info(f"采用本地 stocks 表中已有活跃股票池，共 {len(codes)} 只股票。")
 
         if not codes:
@@ -417,8 +431,11 @@ class DataCenterSync:
 
             for i, future in enumerate(as_completed(future_to_code), 1):
                 # 0. 世代比对：一旦检测到最新世代已经起飞，上一任进程立刻优雅 break 自行解散！
-                if self.generation_id != DataCenterSync.CURRENT_GENERATION_ID:
+                if self.generation_id != DataCenterSync.get_generation_id():
                     logger.info("🔓 [Sync Guard] 🏳️ 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步任务优雅自行解散，让出跑道！")
+                    # 尽可能取消尚未开始的 future（已在执行的 in-flight 任务仍会跑完，ThreadPoolExecutor 限制）
+                    for pending in future_to_code:
+                        pending.cancel()
                     break
 
                 code = future_to_code[future]
@@ -453,22 +470,16 @@ class DataCenterSync:
         today = date.today()
         codes = self.sync_stock_list()
         if not codes:
-            conn = self.get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT code FROM stocks WHERE is_suspended = FALSE;")
-            codes = [row[0] for row in cursor.fetchall()]
-            cursor.close()
-            conn.close()
+            with db.db_cursor() as (conn, cursor):
+                cursor.execute("SELECT code FROM stocks WHERE is_suspended = FALSE;")
+                codes = [row[0] for row in cursor.fetchall()]
             logger.info(f"采用本地 stocks 表中已有活跃股票池，共 {len(codes)} 只股票。")
         if not codes:
             logger.error("无可用股票代码，当日数据同步中止。")
             return
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT code FROM daily_bars WHERE date = %s;", (today,))
-        today_has_data_codes = set(row[0] for row in cursor.fetchall())
-        cursor.close()
-        conn.close()
+        with db.db_cursor() as (conn, cursor):
+            cursor.execute("SELECT DISTINCT code FROM daily_bars WHERE date = %s;", (today,))
+            today_has_data_codes = set(row[0] for row in cursor.fetchall())
         stocks_to_sync = [code for code in codes if code not in today_has_data_codes]
         skipped_count = len(codes) - len(stocks_to_sync)
         logger.info(f"当日数据同步预检结果：共 {len(codes)} 只活跃股票 | 已落库当日数据 {skipped_count} 只 | 需要同步 {len(stocks_to_sync)} 只")
@@ -483,8 +494,10 @@ class DataCenterSync:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_code = {executor.submit(self.sync_single_stock_daily_bars, code): code for code in stocks_to_sync}
             for i, future in enumerate(as_completed(future_to_code), 1):
-                if self.generation_id != DataCenterSync.CURRENT_GENERATION_ID:
+                if self.generation_id != DataCenterSync.get_generation_id():
                     logger.info("[Sync Guard] 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步工作任务优雅自行解散，让出跑道。")
+                    for pending in future_to_code:
+                        pending.cancel()
                     break
                 code = future_to_code[future]
                 try:

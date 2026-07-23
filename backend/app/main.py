@@ -9,12 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, date, timedelta
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import logging
+import threading
 import pandas as pd
 
 from backend.app.core.config import settings
+from backend.app.core import db
 from backend.app.template_manager.manager import TemplateManager
 from backend.app.scanner_sentry.sentry import ScannerSentry
 from backend.app.backtest_engine.engine import BacktestEngine
@@ -66,10 +66,24 @@ root_logger.addHandler(file_handler)
 # 6. 获取 MicroService 命名空间的 Logger
 logger = logging.getLogger("MicroService")
 
+# 应用生命周期：启动时初始化默认模板；关闭时释放数据库连接池（替代已废弃的 on_event）
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("⚡ PSE API 接口微服务正在启动，启动预先初始化检查...")
+    tpl_manager = TemplateManager()
+    tpl_manager.init_default_templates()
+    logger.info("⚡ 预设特征模板状态检查通过，准备对外倾泄行情计算服务！")
+    yield
+    db.closeall()
+    logger.info("⚡ PSE API 接口微服务已关闭，数据库连接池已释放。")
+
 app = FastAPI(
     title="Pattern Search Engine (PSE) API Service",
     description="PSE 智能形态选股与滚动回测平台微服务接口",
-    version=settings.VERSION
+    version=settings.VERSION,
+    lifespan=lifespan,
 )
 
 # 【神级全域跨域中间件】
@@ -110,6 +124,7 @@ class FeedbackPayload(BaseModel):
     result_id: int = Field(..., example=1)
     label: str = Field(..., example="good_match") # good_match, bad_match, watchlist, ignore
     comment: str = Field(None, example="缩量结构踩线中轨很像")
+    learning_rate: float = Field(default=0.05, example=0.05)  # 在线学习步长 eta，前端可调
 
 class SyncMarketDataPayload(BaseModel):
     max_workers: int = Field(default=8, example=8)
@@ -117,9 +132,9 @@ class SyncMarketDataPayload(BaseModel):
     delay_min: int = Field(default=100, example=100)
     delay_max: int = Field(default=300, example=300)
 
-# 辅助数据库连接
+# 辅助数据库连接（走统一连接池，返回字典游标）
 def get_db_connection():
-    return psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+    return db.acquire(dict_cursor=True)
 
 
 # -------------------------------------------------------------------------
@@ -130,12 +145,9 @@ def list_templates():
     """
     拉取全量形态模板配置列表
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, type, config, created_at FROM feature_templates ORDER BY id ASC;")
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    with db.db_cursor(dict_cursor=True) as (conn, cursor):
+        cursor.execute("SELECT id, name, type, config, created_at FROM feature_templates ORDER BY id ASC;")
+        rows = cursor.fetchall()
     return {"success": True, "data": sanitize_numpy({"templates": rows}), "error": None}
 
 # ⚠️ 注意：schema 端点必须放在 {template_id} 通配符之前，否则 "schema" 会被当成 int 解析失败
@@ -224,10 +236,11 @@ def create_template(payload: TemplateCreatePayload):
         return {"success": True, "data": {"template_id": new_id}, "error": None}
     except Exception as e:
         conn.rollback()
-        return {"success": False, "data": None, "error": f"创建模板失败: {e}"}
+        logger.error(f"创建模板失败: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
         cursor.close()
-        conn.close()
+        db.release(conn)
 
 
 @app.put("/api/templates/{template_id}")
@@ -254,10 +267,11 @@ def update_template(template_id: int, payload: TemplateCreatePayload):
         return {"success": True, "message": f"成功修改并覆写形态模板 ID: {template_id}", "error": None}
     except Exception as e:
         conn.rollback()
-        return {"success": False, "data": None, "error": f"覆写形态模板失败: {e}"}
+        logger.error(f"覆写形态模板失败: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
         cursor.close()
-        conn.close()
+        db.release(conn)
 
 
 @app.delete("/api/templates/{template_id}")
@@ -276,10 +290,11 @@ def delete_template(template_id: int):
         return {"success": True, "message": f"成功物理清除形态模板 ID: {template_id} 及其扫描落地大账", "error": None}
     except Exception as e:
         conn.rollback()
-        return {"success": False, "data": None, "error": f"删除形态模板失败: {e}"}
+        logger.error(f"删除形态模板失败: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
         cursor.close()
-        conn.close()
+        db.release(conn)
 
 
 # -------------------------------------------------------------------------
@@ -298,7 +313,7 @@ def run_market_scan(payload: ScanTaskPayload):
         return {"success": True, "data": sanitize_numpy({"status": "completed", "results_count": len(top_20), "results": top_20}), "error": None}
     except Exception as e:
         logger.error(f"每日扫描运行异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 @app.get("/api/search-runs/results")
 def get_scan_results(
@@ -308,18 +323,15 @@ def get_scan_results(
     """
     查询数据库中某日形态扫描推荐大PK的落地持久化记录
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT s.id, s.date, s.code, s.similarity_score, s.sub_scores, s.explanation, s.risk_tips, st.name
-        FROM scan_results s
-        JOIN stocks st ON s.code = st.code
-        WHERE s.date = %s AND s.template_id = %s
-        ORDER BY s.similarity_score DESC;
-    """, (run_date, template_id))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    with db.db_cursor(dict_cursor=True) as (conn, cursor):
+        cursor.execute("""
+            SELECT s.id, s.date, s.code, s.similarity_score, s.sub_scores, s.explanation, s.risk_tips, st.name
+            FROM scan_results s
+            JOIN stocks st ON s.code = st.code
+            WHERE s.date = %s AND s.template_id = %s
+            ORDER BY s.similarity_score DESC;
+        """, (run_date, template_id))
+        rows = cursor.fetchall()
     return {"success": True, "data": sanitize_numpy({"results": rows}), "error": None}
 
 
@@ -342,7 +354,7 @@ def run_historical_backtest(payload: BacktestPayload):
         return {"success": True, "data": sanitize_numpy(report), "error": None}
     except Exception as e:
         logger.error(f"历史回测运行异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 
 # -------------------------------------------------------------------------
@@ -356,7 +368,6 @@ def submit_feedback(payload: FeedbackPayload):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # 1. 动态建立 user_feedback 缓存表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_feedback (
                 id SERIAL PRIMARY KEY,
@@ -397,6 +408,8 @@ def submit_feedback(payload: FeedbackPayload):
         weights = tpl_row["weights"]
         
         # 5. 映射 5 大类得分到 7 个特征维度
+        # 注意：这是一张“大类得分 -> 所属特征”的近似反向映射（同一大类下的多个特征共享该类得分），
+        # 仅用于在线权重微调的梯度方向估计，非精确逐特征归因；已有 max/min 截断与 L1 归一防止权重漂移到极端。
         score_map = {
             "close_norm": sub_scores.get("trend_score", 50.0),
             "return_5d": sub_scores.get("trend_score", 50.0),
@@ -406,13 +419,13 @@ def submit_feedback(payload: FeedbackPayload):
             "range_ratio": sub_scores.get("volatility_score", 50.0),
             "atr_ratio": sub_scores.get("volatility_score", 50.0),
         }
-        
+
         features = ["close_norm", "boll_mid_dist", "volume_ratio_20", "close_position", "return_5d", "range_ratio", "atr_ratio"]
         S_f = {f: float(score_map[f]) for f in features}
         S_mean = sum(S_f.values()) / len(features)
-        
-        # 6. 计算微调增量
-        eta = 0.05
+
+        # 6. 计算微调增量（步长 eta 由前端传入，默认 0.05）
+        eta = float(payload.learning_rate)
         new_weights = {}
         for f in features:
             w = float(weights.get(f, 1.0 / len(features)))
@@ -443,10 +456,10 @@ def submit_feedback(payload: FeedbackPayload):
     except Exception as e:
         conn.rollback()
         logger.error(f"标注反馈权重微调异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
         cursor.close()
-        conn.close()
+        db.release(conn)
 
 
 # -------------------------------------------------------------------------
@@ -455,6 +468,8 @@ def submit_feedback(payload: FeedbackPayload):
 # 全局同步运行状态锁和上一任参数备份，支持新参数热插拔与连续手抖去重
 IS_SYNCING_LOCKED = False
 LAST_ACTIVE_PAYLOAD = None
+# 串行化同步状态读改写的进程内锁，消除并发请求竞态（跨进程不可见，仅单 worker 部署生效）
+_SYNC_LOCK = threading.Lock()
 
 @app.post("/api/jobs/sync-market-data")
 def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: BackgroundTasks):
@@ -465,34 +480,33 @@ def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: B
     """
     global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
     from backend.app.data_center.sync import DataCenterSync
-    
+
     # 转换为 dict 方便进行深度参数对齐比对
     current_payload_dict = payload.dict()
-    
-    if IS_SYNCING_LOCKED:
-        # 如果上一个同步正在运行，检查参数是否一致
-        if LAST_ACTIVE_PAYLOAD == current_payload_dict:
-            # 参数完全一致，说明是连续点击，进行手抖拦截
-            return {
-                "success": False,
-                "data": None,
-                "error": "🚨 警告：系统当前正有一个参数【完全相同】的同步任务在全速搬运中！为防范频繁重复触发导致您的本地 IP 遭金融网关爬虫拉黑，已自动为您安全拦截。若需要重拉，请微调一下右侧的任何一个反爬延迟或并发数再点击，系统即可自动热切换！"
-            }
+
+    # 临界区：原子地“检查运行状态 → 必要时递增世代 → 落锁 → 备份参数”，消除并发请求竞态
+    with _SYNC_LOCK:
+        if IS_SYNCING_LOCKED:
+            if LAST_ACTIVE_PAYLOAD == current_payload_dict:
+                # 参数完全一致，说明是连续点击，进行手抖拦截
+                return {
+                    "success": False,
+                    "data": None,
+                    "error": "🚨 警告：系统当前正有一个参数【完全相同】的同步任务在全速搬运中！为防范频繁重复触发导致您的本地 IP 遭金融网关爬虫拉黑，已自动为您安全拦截。若需要重拉，请微调一下右侧的任何一个反爬延迟或并发数再点击，系统即可自动热切换！"
+                }
+            else:
+                # 参数变了！宣判上一代死刑：原子递增全局世代 ID
+                current_task_gen_id = DataCenterSync.next_generation_id()
+                logger.info(f"🔄 检测到配置参数发生变更！最新世代已增至 {current_task_gen_id}。系统正在向老任务下达优雅退位指令...")
         else:
-            # 参数变了！朔哥哥调整了参数！
-            # 宣判上一代死刑：递增全局世代 ID
-            DataCenterSync.CURRENT_GENERATION_ID += 1
-            logger.info(f"🔄 检测到配置参数发生变更！最新世代已增至 {DataCenterSync.CURRENT_GENERATION_ID}。系统正在向老任务下达优雅退位指令...")
-    else:
-        # 如果本来就没有运行，直接落锁，并初始化世代
-        IS_SYNCING_LOCKED = True
-        
-    current_task_gen_id = DataCenterSync.CURRENT_GENERATION_ID
-    try:
-        # 1. 备份当前的运行参数
+            # 如果本来就没有运行，直接落锁，并锚定当前世代
+            IS_SYNCING_LOCKED = True
+            current_task_gen_id = DataCenterSync.get_generation_id()
+        # 备份当前的运行参数
         LAST_ACTIVE_PAYLOAD = current_payload_dict
-        
-        # 2. 包装带 finally 自动释锁的后台任务
+
+    try:
+        # 包装带 finally 自动释锁的后台任务
         def sync_task_wrapper():
             global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
             logger.info(f"🔒 [Sync Guard Gen {current_task_gen_id}] 新世代同步实例已安全落锁起飞。")
@@ -507,30 +521,32 @@ def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: B
             except Exception as ex:
                 logger.error(f"❌ 后台行情拉取异步任务执行发生未捕获异常: {ex}")
             finally:
-                # 3. 极其细致的安全防误解锁机制：只有当全局最新世代依然是本任务启动时的世代，才去释放状态锁！
-                if DataCenterSync.CURRENT_GENERATION_ID == current_task_gen_id:
-                    IS_SYNCING_LOCKED = False
-                    LAST_ACTIVE_PAYLOAD = None
-                    logger.info(f"🔓 [Sync Guard Gen {current_task_gen_id}] 全局行情增量同步运行锁已安全释放。")
+                # 安全防误解锁机制：只有当全局最新世代依然是本任务启动时的世代，才去释放状态锁！
+                with _SYNC_LOCK:
+                    if DataCenterSync.get_generation_id() == current_task_gen_id:
+                        IS_SYNCING_LOCKED = False
+                        LAST_ACTIVE_PAYLOAD = None
+                        logger.info(f"🔓 [Sync Guard Gen {current_task_gen_id}] 全局行情增量同步运行锁已安全释放。")
 
         background_tasks.add_task(sync_task_wrapper)
-        
+
         msg = f"🚀 全市场行情同步进程（第 {current_task_gen_id} 世代）点火起飞成功！"
         if current_task_gen_id > 0:
             msg = f"🔄 成功下达老一代优雅退役指令！新世代（第 {current_task_gen_id} 世代）行情数据巨轮已按最新参数（并发:{payload.max_workers}线程）顺利完成断点热重载！"
-            
+
         return {
-            "success": True, 
-            "message": msg, 
+            "success": True,
+            "message": msg,
             "error": None
         }
     except Exception as e:
         # 如果在点火期就产生异常，安全重置锁
-        if DataCenterSync.CURRENT_GENERATION_ID == current_task_gen_id:
-            IS_SYNCING_LOCKED = False
-            LAST_ACTIVE_PAYLOAD = None
+        with _SYNC_LOCK:
+            if DataCenterSync.get_generation_id() == current_task_gen_id:
+                IS_SYNCING_LOCKED = False
+                LAST_ACTIVE_PAYLOAD = None
         logger.error(f"强制触发全市场同步任务点火异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 
 # -------------------------------------------------------------------------
@@ -548,23 +564,24 @@ def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: Ba
 
     current_payload_dict = payload.dict()
 
-    if IS_SYNCING_LOCKED:
-        if LAST_ACTIVE_PAYLOAD == current_payload_dict:
-            return {
-                "success": False,
-                "data": None,
-                "error": "当前有同步任务正在运行中，请等待完成后再试。"
-            }
+    # 临界区：原子地“检查 → 必要时递增世代 → 落锁 → 备份参数”
+    with _SYNC_LOCK:
+        if IS_SYNCING_LOCKED:
+            if LAST_ACTIVE_PAYLOAD == current_payload_dict:
+                return {
+                    "success": False,
+                    "data": None,
+                    "error": "当前有同步任务正在运行中，请等待完成后再试。"
+                }
+            else:
+                current_task_gen_id = DataCenterSync.next_generation_id()
+                logger.info(f"检测到配置参数发生变更！最新世代已增至 {current_task_gen_id}。系统正在向老任务下达优雅退位指令...")
         else:
-            DataCenterSync.CURRENT_GENERATION_ID += 1
-            logger.info(f"检测到配置参数发生变更！最新世代已增至 {DataCenterSync.CURRENT_GENERATION_ID}。系统正在向老任务下达优雅退位指令...")
-    else:
-        IS_SYNCING_LOCKED = True
-
-    current_task_gen_id = DataCenterSync.CURRENT_GENERATION_ID
-    try:
+            IS_SYNCING_LOCKED = True
+            current_task_gen_id = DataCenterSync.get_generation_id()
         LAST_ACTIVE_PAYLOAD = current_payload_dict
 
+    try:
         def sync_task_wrapper():
             global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
             logger.info(f"[Sync Guard Gen {current_task_gen_id}] 当日数据同步实例已安全落锁起飞。")
@@ -579,10 +596,11 @@ def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: Ba
             except Exception as ex:
                 logger.error(f"后台当日数据同步任务执行发生未捕获异常: {ex}")
             finally:
-                if DataCenterSync.CURRENT_GENERATION_ID == current_task_gen_id:
-                    IS_SYNCING_LOCKED = False
-                    LAST_ACTIVE_PAYLOAD = None
-                    logger.info(f"[Sync Guard Gen {current_task_gen_id}] 全局当日数据同步运行锁已安全释放。")
+                with _SYNC_LOCK:
+                    if DataCenterSync.get_generation_id() == current_task_gen_id:
+                        IS_SYNCING_LOCKED = False
+                        LAST_ACTIVE_PAYLOAD = None
+                        logger.info(f"[Sync Guard Gen {current_task_gen_id}] 全局当日数据同步运行锁已安全释放。")
 
         background_tasks.add_task(sync_task_wrapper)
 
@@ -596,11 +614,12 @@ def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: Ba
             "error": None
         }
     except Exception as e:
-        if DataCenterSync.CURRENT_GENERATION_ID == current_task_gen_id:
-            IS_SYNCING_LOCKED = False
-            LAST_ACTIVE_PAYLOAD = None
+        with _SYNC_LOCK:
+            if DataCenterSync.get_generation_id() == current_task_gen_id:
+                IS_SYNCING_LOCKED = False
+                LAST_ACTIVE_PAYLOAD = None
         logger.error(f"强制触发当日数据同步任务点火异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 
 # -------------------------------------------------------------------------
@@ -615,55 +634,81 @@ def get_sync_status():
     返回最近一次同步的开始/结束时间、耗时、状态，以及数据库实际最新日K日期。
     """
     try:
-        import psycopg2
         from datetime import date, timedelta
-        conn = psycopg2.connect(settings.DATABASE_URL)
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT key, value FROM data_sync_status;")
-            rows = cursor.fetchall()
-            status_map = {k: v for k, v in rows}
+        from psycopg2 import sql
+        with db.db_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                # 先确保状态表存在（daemon 未先跑过时也能查询）
+                cursor.execute(
+                    sql.SQL("""
+                        CREATE TABLE IF NOT EXISTS {} (
+                            key VARCHAR(32) PRIMARY KEY,
+                            value TEXT,
+                            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+                    """).format(sql.Identifier("data_sync_status"))
+                )
+                cursor.execute("SELECT key, value FROM data_sync_status;")
+                rows = cursor.fetchall()
+                status_map = {k: v for k, v in rows}
 
-            cursor.execute("SELECT MAX(date) FROM daily_bars;")
-            max_row = cursor.fetchone()
-            max_bar_date = max_row[0].strftime("%Y-%m-%d") if max_row and max_row[0] else "N/A"
+                cursor.execute("SELECT MAX(date) FROM daily_bars;")
+                max_row = cursor.fetchone()
+                max_bar_date = max_row[0].strftime("%Y-%m-%d") if max_row and max_row[0] else "N/A"
 
-            today = date.today()
-            weekday = today.weekday()
-            expected_latest = today
-            if weekday == 5:
-                expected_latest = today - timedelta(days=1)
-            elif weekday == 6:
-                expected_latest = today - timedelta(days=2)
+                today = date.today()
+                weekday = today.weekday()
+                expected_latest = today
+                if weekday == 5:
+                    expected_latest = today - timedelta(days=1)
+                elif weekday == 6:
+                    expected_latest = today - timedelta(days=2)
 
-            data_is_fresh = (
-                isinstance(max_bar_date, str) and
-                max_bar_date != "N/A" and
-                date.fromisoformat(max_bar_date) >= expected_latest
-            )
+                data_is_fresh = (
+                    isinstance(max_bar_date, str) and
+                    max_bar_date != "N/A" and
+                    date.fromisoformat(max_bar_date) >= expected_latest
+                )
 
-            return {
-                "success": True,
-                "data": {
-                    "sync_status_table": status_map,
-                    "actual_latest_bar_date": max_bar_date,
-                    "expected_latest_date": expected_latest.strftime("%Y-%m-%d"),
-                    "is_fresh": data_is_fresh,
-                    "last_sync_status": status_map.get("last_status", "unknown"),
-                    "last_sync_mode": status_map.get("last_mode", "none"),
-                    "last_sync_duration_sec": status_map.get("last_duration_sec", "none"),
-                },
-                "error": None
-            }
-        finally:
-            cursor.close()
-            conn.close()
+                return {
+                    "success": True,
+                    "data": {
+                        "sync_status_table": status_map,
+                        "actual_latest_bar_date": max_bar_date,
+                        "expected_latest_date": expected_latest.strftime("%Y-%m-%d"),
+                        "is_fresh": data_is_fresh,
+                        "last_sync_status": status_map.get("last_status", "unknown"),
+                        "last_sync_mode": status_map.get("last_mode", "none"),
+                        "last_sync_duration_sec": status_map.get("last_duration_sec", "none"),
+                    },
+                    "error": None
+                }
+            finally:
+                cursor.close()
     except Exception as e:
         logger.error(f"查询同步状态异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 # 4. 核心同屏对齐比对比对 API (同屏画图神器)
 # -------------------------------------------------------------------------
+def _window_to_bars(df_window: pd.DataFrame) -> list:
+    """将特征窗口 DataFrame 序列化为前端 K 线契约所需的 bar 字典列表。"""
+    bars = []
+    for _, row in df_window.iterrows():
+        bars.append({
+            "date": row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"]),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "volume": float(row["volume"]),
+            "boll_mid": float(row["boll_mid"]) if "boll_mid" in row and not pd.isna(row["boll_mid"]) else None,
+            "boll_upper": float(row["boll_upper"]) if "boll_upper" in row and not pd.isna(row["boll_upper"]) else None,
+            "boll_lower": float(row["boll_lower"]) if "boll_lower" in row and not pd.isna(row["boll_lower"]) else None,
+        })
+    return bars
+
 @app.get("/api/compare/template/{template_id}/stock/{symbol}")
 def compare_template_with_stock(
     template_id: int = Path(..., description="模板 ID"),
@@ -732,34 +777,9 @@ def compare_template_with_stock(
             "evidence": evt.evidence
         })
 
-    # 5. 组装契约响应
-    temp_bars = []
-    for _, row in df_temp_window.iterrows():
-        temp_bars.append({
-            "date": row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"]),
-            "open": float(row["open"]),
-            "high": float(row["high"]),
-            "low": float(row["low"]),
-            "close": float(row["close"]),
-            "volume": float(row["volume"]),
-            "boll_mid": float(row["boll_mid"]) if "boll_mid" in row and not pd.isna(row["boll_mid"]) else None,
-            "boll_upper": float(row["boll_upper"]) if "boll_upper" in row and not pd.isna(row["boll_upper"]) else None,
-            "boll_lower": float(row["boll_lower"]) if "boll_lower" in row and not pd.isna(row["boll_lower"]) else None,
-        })
-        
-    cand_bars = []
-    for _, row in df_cand_window.iterrows():
-        cand_bars.append({
-            "date": row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"]),
-            "open": float(row["open"]),
-            "high": float(row["high"]),
-            "low": float(row["low"]),
-            "close": float(row["close"]),
-            "volume": float(row["volume"]),
-            "boll_mid": float(row["boll_mid"]) if "boll_mid" in row and not pd.isna(row["boll_mid"]) else None,
-            "boll_upper": float(row["boll_upper"]) if "boll_upper" in row and not pd.isna(row["boll_upper"]) else None,
-            "boll_lower": float(row["boll_lower"]) if "boll_lower" in row and not pd.isna(row["boll_lower"]) else None,
-        })
+    # 5. 组装契约响应（抽取通用 bar 序列化函数，消除两段重复循环）
+    temp_bars = _window_to_bars(df_temp_window)
+    cand_bars = _window_to_bars(df_cand_window)
 
     compare_report = {
         "template_symbol": source_symbol,
@@ -816,10 +836,10 @@ def get_database_statistics():
         }
     except Exception as e:
         logger.error(f"提取本地数据仓库状态事实异常: {e}")
-        return {"success": False, "data": None, "error": str(e)}
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
         cursor.close()
-        conn.close()
+        db.release(conn)
 
 
 # -------------------------------------------------------------------------
@@ -830,6 +850,8 @@ def get_server_logs(lines: int = Query(20, description="读取的尾部日志行
     """
     提取本地运行日志文件 logs/backend_app.log 的尾部行，全力支持前端极客终端实时渲染
     """
+    # 限制单次读取行数上限，避免读取超大日志文件造成内存峰值
+    lines = max(1, min(int(lines), 200))
     log_file = "logs/backend_app.log"
     if not os.path.exists(log_file):
         return {"success": True, "data": {"logs": ["📝 暂无本地日志事实记录，请先通过同步按钮触发激活。"]}, "error": None}
@@ -840,7 +862,8 @@ def get_server_logs(lines: int = Query(20, description="读取的尾部日志行
             tail_lines = [line.strip() for line in tail_lines if line.strip()]
         return {"success": True, "data": {"logs": tail_lines}, "error": None}
     except Exception as e:
-        return {"success": False, "data": None, "error": str(e)}
+        logger.error(f"读取服务端日志异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 
 # -------------------------------------------------------------------------
@@ -860,21 +883,13 @@ def get_stock_fundamental_details(symbol: str = Path(..., description="股票代
             return {"success": False, "data": None, "error": f"股票池中暂未找到此代码"}
         return {"success": True, "data": dict(row), "error": None}
     except Exception as e:
-        return {"success": False, "data": None, "error": str(e)}
+        logger.error(f"查询股票基本面异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
         cursor.close()
-        conn.close()
+        db.release(conn)
 
 
 # -------------------------------------------------------------------------
-# 服务器自动初始化与守护启动
+# 服务器生命周期由上方 lifespan 管理（启动初始化默认模板、关闭释放连接池）
 # -------------------------------------------------------------------------
-@app.on_event("startup")
-def startup_event():
-    """
-    当服务微启动时，自动调用模板管理器注册“布林回踩”形态模板，免除人工预先建库的痛苦
-    """
-    logger.info("⚡ PSE API 接口微服务正在启动，启动预先初始化检查...")
-    tpl_manager = TemplateManager()
-    tpl_manager.init_default_templates()
-    logger.info("⚡ 预设特征模板状态检查通过，准备对外倾泄行情计算服务！")

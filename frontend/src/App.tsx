@@ -463,7 +463,8 @@ export default function App() {
         body: JSON.stringify({
           result_id: selectedStock.id,
           label: label,
-          comment: userComment || (label === 'good_match' ? '好匹配' : '不像')
+          comment: userComment || (label === 'good_match' ? '好匹配' : '不像'),
+          learning_rate: learningRate
         })
       });
       const json = await res.json();

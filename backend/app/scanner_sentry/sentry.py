@@ -11,10 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 import pandas as pd
 import numpy as np
-import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import execute_values
 import logging
 
+from backend.app.core import db
 from backend.app.core.config import settings
 from backend.app.filters.boll_mid_filter import has_boll_mid_breach
 from backend.app.indicator_engine.engine import calculate_indicators
@@ -22,35 +22,27 @@ from backend.app.feature_engine.engine import calculate_features
 from backend.app.similarity_engine.engine import SimilarityEngine
 from backend.app.template_manager.manager import TemplateManager
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ScannerSentry")
 
 class ScannerSentry:
     def __init__(self):
-        self.db_url = settings.DATABASE_URL
         self.similarity_engine = SimilarityEngine()
         self.template_manager = TemplateManager()
-
-    def get_db_connection(self):
-        return psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
 
     def load_stock_bars(self, code: str, end_date: date, lookback_days: int = 250) -> pd.DataFrame:
         """
         从数据库查询个股到截止日期为止、暖机加宽的历史日 K 序列 (以确保滚动均线指标充分暖机)
         """
         start_date = end_date - timedelta(days=lookback_days)
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        query = """
-            SELECT date, open, high, low, close, volume, amount, factor
-            FROM daily_bars
-            WHERE code = %s AND date >= %s AND date <= %s
-            ORDER BY date ASC;
-        """
-        cursor.execute(query, (code, start_date, end_date))
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        with db.db_cursor(dict_cursor=True) as (conn, cursor):
+            query = """
+                SELECT date, open, high, low, close, volume, amount, factor
+                FROM daily_bars
+                WHERE code = %s AND date >= %s AND date <= %s
+                ORDER BY date ASC;
+            """
+            cursor.execute(query, (code, start_date, end_date))
+            rows = cursor.fetchall()
         if not rows:
             return pd.DataFrame()
 
@@ -74,10 +66,10 @@ class ScannerSentry:
         1. stocks 表中：非 ST（除非 allow_st=True）、非停牌。
         2. daily_bars 20日均量成交额：均值必须大于门槛，排除僵尸股。
         """
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-
-        st_clause = "" if allow_st else "AND s.is_st = FALSE"
+        if allow_st:
+            where_clause = "1=1"
+        else:
+            where_clause = "s.is_st = FALSE"
         query = f"""
             SELECT s.code, s.name, s.board, AVG(b.amount) as avg_amount_20d
             FROM (
@@ -86,7 +78,7 @@ class ScannerSentry:
                 FROM daily_bars
             ) b
             JOIN stocks s ON b.code = s.code
-            WHERE {st_clause}
+            WHERE {where_clause}
               AND s.is_suspended = FALSE
               AND b.rn <= 20
             GROUP BY s.code, s.name, s.board
@@ -94,17 +86,15 @@ class ScannerSentry:
                AND AVG(b.amount) >= %s;
         """
         try:
-            cursor.execute(query, (min_amount_20d,))
-            rows = cursor.fetchall()
+            with db.db_cursor(dict_cursor=True) as (conn, cursor):
+                cursor.execute(query, (min_amount_20d,))
+                rows = cursor.fetchall()
             # 将 RealDictRow 转为标准的 dict 以对齐上层协议
             active_pool = [dict(r) for r in rows]
             return active_pool
         except Exception as e:
             logger.error(f"❌ 高能 SQL 提取活跃股票池异常: {e}")
             return []
-        finally:
-            cursor.close()
-            conn.close()
 
     def process_single_candidate(
         self,
@@ -141,7 +131,7 @@ class ScannerSentry:
 
             # 4. 布林空间软剪枝：先确认曾回调到近中轨位置
             min_boll_dist = df_cand_window['boll_mid_dist'].abs().min()
-            if min_boll_dist > 0.045:
+            if min_boll_dist > settings.BOLL_PRUNE_THRESHOLD:
                 return None
 
             # 4b. 布林中轨硬过滤：回调触及中轨后收盘价不可跌破（仅当模板需要时启用）
@@ -286,7 +276,7 @@ class ScannerSentry:
             logger.warning("本次形态扫描没有筛选出符合任何特征硬指标的股票，无数据写入。")
             return []
 
-        conn_write = self.get_db_connection()
+        conn_write = db.acquire(dict_cursor=True)
         cursor_write = conn_write.cursor()
 
         # 先清除今日同一模板的历史扫描数据，确保重跑幂等与数据无重复
@@ -308,6 +298,6 @@ class ScannerSentry:
             logger.error(f"批量写入 scan_results 失败: {e}")
         finally:
             cursor_write.close()
-            conn_write.close()
+            db.release(conn_write)
 
         return top_20
