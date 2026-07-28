@@ -15,6 +15,7 @@ import pandas as pd
 
 from backend.app.core.config import settings
 from backend.app.core import db
+from backend.app.core.timeutil import isoformat_beijing, today_beijing
 from backend.app.template_manager.manager import TemplateManager
 from backend.app.scanner_sentry.sentry import ScannerSentry
 from backend.app.backtest_engine.engine import BacktestEngine
@@ -705,7 +706,7 @@ def get_sync_status():
                 max_row = cursor.fetchone()
                 max_bar_date = max_row[0].strftime("%Y-%m-%d") if max_row and max_row[0] else "N/A"
 
-                today = date.today()
+                today = today_beijing()
                 weekday = today.weekday()
                 expected_latest = today
                 if weekday == 5:
@@ -776,29 +777,27 @@ def compare_template_with_stock(
     config = tpl["config"]
     window_size = config.get("window_size", 60)
     
-    # 1. 载入模板母体特征窗口
+    # 1. 载入模板母体特征窗口（统一门面：与候选同源暖机 250 + features）
     source_symbol = config.get("source_symbol", "sz000002")
     source_end = datetime.strptime(config.get("source_end", "2026-05-01"), "%Y-%m-%d").date()
-    
-    sentry = ScannerSentry()
-    df_temp_raw = sentry.load_stock_bars(source_symbol, source_end, lookback_days=250)
-    if df_temp_raw.empty:
+
+    from backend.app.market_pipeline import prepare_stock_frame
+    df_temp_feat = prepare_stock_frame(
+        source_symbol, source_end, level="features", window_days=None,
+    )
+    if df_temp_feat.empty:
         raise HTTPException(status_code=500, detail="模板母体量价数据加载失败")
-        
-    df_temp_ind = calculate_indicators(df_temp_raw)
-    df_temp_feat = calculate_features(df_temp_ind, source_symbol)
     df_temp_window = df_temp_feat.tail(window_size).copy()
-    
+
     # 2. 载入候选股票特征窗口
     target_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-    df_cand_raw = sentry.load_stock_bars(symbol, target_date, lookback_days=250)
-    if df_cand_raw.empty or len(df_cand_raw) < 120:
+    df_cand_feat = prepare_stock_frame(
+        symbol, target_date, level="features", window_days=None,
+    )
+    if df_cand_feat.empty or len(df_cand_feat) < 120:
         raise HTTPException(status_code=400, detail=f"候选股 [{symbol}] 数据缺失或未暖机充分")
-        
-    df_cand_ind = calculate_indicators(df_cand_raw)
-    df_cand_feat = calculate_features(df_cand_ind, symbol)
     df_cand_window = df_cand_feat.tail(window_size).copy()
-    
+
     if len(df_cand_window) < window_size:
         raise HTTPException(status_code=400, detail="候选股滑动窗口特征数据不足")
 
@@ -1219,7 +1218,7 @@ def get_boll_pattern_matches(
                 "score": float(r["score"]) if r["score"] is not None else None,
                 "scan_date": r["scan_date"].isoformat() if r["scan_date"] else None,
                 "window_days": r["window_days"],
-                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+                "updated_at": isoformat_beijing(r.get("updated_at")),
             })
         return {
             "success": True,
@@ -1238,15 +1237,13 @@ def get_boll_pattern_matches(
 def get_stock_bars_with_boll(
     symbol: str = Path(..., description="股票代码 (如 sz000002)"),
     end_date: str | None = Query(None, description="截止日 YYYY-MM-DD，默认取最新交易日"),
-    lookback_days: int = Query(120, ge=30, le=500, description="返回窗口的日历回溯天数（计算暖机另取至少250天，与 compare 对齐）"),
+    lookback_days: int = Query(120, ge=30, le=500, description="返回窗口的日历回溯天数（计算暖机固定按 compare 的 250 天）"),
 ):
     """
-    返回个股 OHLCV + 布林三轨，供布林编排页画图。
-    布林计算链路与 /api/compare/template/.../stock/... 一致：
-    load(lookback>=250) → calculate_indicators → calculate_features，再截取展示窗口。
+    返回个股 OHLCV + 布林三轨。经 market_pipeline 统一门面，与 compare 同源暖机与布林计算。
     """
     try:
-        sentry = ScannerSentry()
+        from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, prepare_stock_frame
         code = symbol.lower().strip()
         if end_date:
             target = datetime.strptime(end_date, "%Y-%m-%d").date()
@@ -1258,23 +1255,14 @@ def get_stock_bars_with_boll(
                 return {"success": False, "data": None, "error": "该股票暂无行情数据"}
             target = row["d"] if isinstance(row["d"], date) else datetime.strptime(str(row["d"]), "%Y-%m-%d").date()
 
-        # 与 compare 相同：至少 250 日历日暖机，避免短回看导致布林与 compare 不一致
-        calc_lookback = max(int(lookback_days), 250)
-        df_raw = sentry.load_stock_bars(code, target, lookback_days=calc_lookback)
-        if df_raw.empty:
-            return {"success": False, "data": None, "error": "行情数据不足"}
-
-        df_ind = calculate_indicators(df_raw)
-        df_feat = calculate_features(df_ind, code)
-        if df_feat.empty:
-            return {"success": False, "data": None, "error": "指标计算失败"}
-
-        # 展示窗口按请求的 lookback_days 截取；布林值已在长序列上算好，与 compare 同日对齐
-        display_start = target - timedelta(days=int(lookback_days))
-        dates = pd.to_datetime(df_feat["date"]).dt.date
-        df_out = df_feat.loc[dates >= display_start].copy()
+        df_out = prepare_stock_frame(
+            code,
+            target,
+            level="features",
+            display_calendar_days=int(lookback_days),
+        )
         if df_out.empty:
-            df_out = df_feat.tail(60).copy()
+            return {"success": False, "data": None, "error": "行情数据不足"}
 
         bars = _window_to_bars(df_out)
         return {
@@ -1283,7 +1271,7 @@ def get_stock_bars_with_boll(
                 "code": code,
                 "end_date": target.isoformat(),
                 "bars": bars,
-                "calc_lookback_days": calc_lookback,
+                "calc_lookback_days": COMPARE_LOOKBACK_DAYS,
             },
             "error": None,
         }

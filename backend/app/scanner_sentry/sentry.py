@@ -8,17 +8,15 @@ Pattern Search Engine (PSE) - 全市场形态扫描自动哨兵 (Scanner Sentry)
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import pandas as pd
-import numpy as np
 from psycopg2.extras import execute_values
 import logging
 
 from backend.app.core import db
 from backend.app.core.config import settings
 from backend.app.filters.boll_mid_filter import has_boll_mid_breach
-from backend.app.indicator_engine.engine import calculate_indicators
-from backend.app.feature_engine.engine import calculate_features
+from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, load_stock_bars, prepare_stock_frame
 from backend.app.similarity_engine.engine import SimilarityEngine
 from backend.app.template_manager.manager import TemplateManager
 
@@ -29,32 +27,9 @@ class ScannerSentry:
         self.similarity_engine = SimilarityEngine()
         self.template_manager = TemplateManager()
 
-    def load_stock_bars(self, code: str, end_date: date, lookback_days: int = 250) -> pd.DataFrame:
-        """
-        从数据库查询个股到截止日期为止、暖机加宽的历史日 K 序列 (以确保滚动均线指标充分暖机)
-        """
-        start_date = end_date - timedelta(days=lookback_days)
-        with db.db_cursor(dict_cursor=True) as (conn, cursor):
-            query = """
-                SELECT date, open, high, low, close, volume, amount, factor
-                FROM daily_bars
-                WHERE code = %s AND date >= %s AND date <= %s
-                ORDER BY date ASC;
-            """
-            cursor.execute(query, (code, start_date, end_date))
-            rows = cursor.fetchall()
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows)
-        # 强制将 Decimal 类型列强制转换为 float 与 int，以支持高能 Pandas/Numpy 科学计算
-        for col in ['open', 'high', 'low', 'close', 'amount', 'factor']:
-            if col in df.columns:
-                df[col] = df[col].astype(float)
-        if 'volume' in df.columns:
-            df['volume'] = df['volume'].astype(int)
-
-        return df
+    def load_stock_bars(self, code: str, end_date: date, lookback_days: int = COMPARE_LOOKBACK_DAYS) -> pd.DataFrame:
+        """兼容入口：委托统一门面取数。"""
+        return load_stock_bars(code, end_date, lookback_days=lookback_days)
 
     def load_active_stock_pool(
         self,
@@ -115,14 +90,10 @@ class ScannerSentry:
         code = cand["code"]
         name = cand["name"]
         try:
-            # 1. 暖机日K
-            df_cand_raw = self.load_stock_bars(code, target_date, lookback_days=250)
-            if df_cand_raw.empty or len(df_cand_raw) < 120:
+            # 1–2. 统一门面：250 暖机 + indicators + features
+            df_cand_feat = prepare_stock_frame(code, target_date, level="features")
+            if df_cand_feat.empty or len(df_cand_feat) < 120:
                 return None
-
-            # 2. 计算指标特征
-            df_cand_ind = calculate_indicators(df_cand_raw)
-            df_cand_feat = calculate_features(df_cand_ind, code)
 
             # 3. 滑动特征窗口
             df_cand_window = df_cand_feat.tail(window_size).copy()
@@ -191,13 +162,11 @@ class ScannerSentry:
         source_end = datetime.strptime(config.get("source_end", "2026-05-01"), "%Y-%m-%d").date()
 
         logger.info(f"👉 正在加载模板母体经典时段数据: {source_symbol} 截止到 {source_end}...")
-        df_temp_raw = self.load_stock_bars(source_symbol, source_end, lookback_days=250)
-        if df_temp_raw.empty:
+        df_temp_feat = prepare_stock_frame(source_symbol, source_end, level="features")
+        if df_temp_feat.empty:
             logger.error(f"❌ 无法加载模板母体 [{source_symbol}] 经典日K行情底座，扫描无法对齐！")
             return
 
-        df_temp_ind = calculate_indicators(df_temp_raw)
-        df_temp_feat = calculate_features(df_temp_ind, source_symbol)
         # 截取模板最后 N 天特征矩阵
         df_temp_window = df_temp_feat.tail(window_size).copy()
         if len(df_temp_window) < window_size:

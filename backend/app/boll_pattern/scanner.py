@@ -14,7 +14,6 @@ import pandas as pd
 from psycopg2.extras import execute_values
 
 from backend.app.boll_pattern.matcher import find_patterns_with_dates
-from backend.app.boll_pattern.pct_b import calc_pct_b
 from backend.app.boll_pattern.repository import (
     ENSURE_PATTERN_TABLES_SQL,
     get_settings,
@@ -24,12 +23,10 @@ from backend.app.boll_pattern.repository import (
 from backend.app.boll_pattern.scoring import score_match_from_window
 from backend.app.boll_pattern.zone import apply_denoise_to_states, state_string, zones_from_series
 from backend.app.core import db
-from backend.app.indicator_engine.engine import calculate_indicators
+from backend.app.core.timeutil import today_beijing
+from backend.app.market_pipeline import prepare_stock_frame
 
 logger = logging.getLogger("BollPatternScanner")
-
-# BOLL / 均线暖机：与 compare 接口 ScannerSentry.load_stock_bars 默认 250 日历日对齐
-_INDICATOR_WARMUP_CALENDAR_DAYS = 250
 
 ENSURE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS stock_state_daily (
@@ -86,6 +83,7 @@ class BollPatternScanner:
         self.reload_config()
 
     def load_stock_bars(self, code: str, end_date: date, lookback_calendar_days: int) -> pd.DataFrame:
+        """保留兼容；新逻辑请用 prepare_stock_frame。"""
         start_date = end_date - timedelta(days=lookback_calendar_days)
         with db.db_cursor(dict_cursor=True) as (conn, cursor):
             cursor.execute(
@@ -107,6 +105,21 @@ class BollPatternScanner:
         if "volume" in df.columns:
             df["volume"] = df["volume"].astype(int)
         return df
+
+    def build_state_frame(self, df_pattern: pd.DataFrame) -> pd.DataFrame:
+        """
+        输入 level=pattern 的帧（含 pct_b），用全局尺子写 zone 快照。
+        """
+        if df_pattern is None or df_pattern.empty:
+            return pd.DataFrame()
+        if "pct_b" not in df_pattern.columns:
+            return pd.DataFrame()
+        zones = zones_from_series(df_pattern["pct_b"], self.zone_thresholds)
+        return pd.DataFrame({
+            "date": df_pattern["date"],
+            "pct_b": df_pattern["pct_b"],
+            "zone": zones,
+        })
 
     def list_candidate_codes(self, codes: Sequence[str] | None = None) -> list[str]:
         if codes:
@@ -131,23 +144,7 @@ class BollPatternScanner:
         if row and row.get("d"):
             d = row["d"]
             return d if isinstance(d, date) else datetime.strptime(str(d), "%Y-%m-%d").date()
-        return date.today()
-
-    def build_state_frame(self, df_bars: pd.DataFrame) -> pd.DataFrame:
-        """输入日K → 含 pct_b / zone 的 DataFrame（暖机期 zone=NA）。"""
-        if df_bars is None or df_bars.empty:
-            return pd.DataFrame()
-        df_ind = calculate_indicators(df_bars)
-        if df_ind.empty:
-            return pd.DataFrame()
-        pct_b = calc_pct_b(df_ind["close"], df_ind["boll_upper"], df_ind["boll_lower"])
-        zones = zones_from_series(pct_b, self.zone_thresholds)
-        out = pd.DataFrame({
-            "date": df_ind["date"],
-            "pct_b": pct_b,
-            "zone": zones,
-        })
-        return out
+        return today_beijing()
 
     def upsert_states(self, code: str, state_df: pd.DataFrame) -> int:
         if state_df is None or state_df.empty:
@@ -199,6 +196,40 @@ class BollPatternScanner:
         df = pd.DataFrame(rows)
         df = df.sort_values("date").reset_index(drop=True)
         return df
+
+    def clear_pattern_matches(
+        self,
+        pattern_ids: Sequence[str],
+        codes: Sequence[str] | None = None,
+    ) -> int:
+        """
+        扫描前清理旧命中，避免改 regex 后残留不满足新规则的历史行。
+        - codes 为 None：清这些编排的全市场命中（全量扫描）
+        - codes 给定：仅清这些股票上的命中（子集扫描）
+        """
+        ids = [str(p).strip() for p in pattern_ids if str(p).strip()]
+        if not ids:
+            return 0
+        with db.db_cursor(dict_cursor=False) as (conn, cur):
+            if codes is None:
+                cur.execute(
+                    "DELETE FROM pattern_match_result WHERE pattern_id = ANY(%s);",
+                    (ids,),
+                )
+            else:
+                code_list = [str(c).lower().strip() for c in codes if str(c).strip()]
+                if not code_list:
+                    return 0
+                cur.execute(
+                    """
+                    DELETE FROM pattern_match_result
+                    WHERE pattern_id = ANY(%s) AND code = ANY(%s);
+                    """,
+                    (ids, code_list),
+                )
+            n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            conn.commit()
+        return int(n)
 
     def upsert_matches(
         self,
@@ -254,17 +285,16 @@ class BollPatternScanner:
         scan_date: date,
         window_days: int = 60,
     ) -> dict[str, Any]:
-        # 与 compare 一致：指标暖机回看至少 250 日历日
-        lookback = max(int(window_days) * 2 + 40, _INDICATOR_WARMUP_CALENDAR_DAYS)
-        df_bars = self.load_stock_bars(code, scan_date, lookback)
-        if df_bars.empty or len(df_bars) < 25:
+        # 统一门面：与 compare 相同 250 日历日暖机 + indicators + pct_b
+        df_full = prepare_stock_frame(code, scan_date, level="pattern")
+        if df_full.empty or len(df_full) < 25:
             return {"code": code, "states": 0, "matches": 0, "skipped": True}
 
         # 全局尺子写入 zone 快照（验真）；匹配按编排 effective 尺子现算
-        state_df = self.build_state_frame(df_bars)
+        state_df = self.build_state_frame(df_full)
         n_states = self.upsert_states(code, state_df)
 
-        win = self.load_states_window(code, scan_date, window_days)
+        win = df_full.tail(int(window_days)).copy().reset_index(drop=True)
         if win.empty:
             return {"code": code, "states": n_states, "matches": 0, "skipped": False}
 
@@ -281,7 +311,7 @@ class BollPatternScanner:
             win_for_score["zone"] = zones
             for m in hits:
                 try:
-                    m["score"] = score_match_from_window(m, win_for_score, df_bars)
+                    m["score"] = score_match_from_window(m, win_for_score, df_full)
                 except Exception as ex:
                     logger.warning(
                         "打分失败 code=%s pattern=%s: %s",
@@ -307,9 +337,14 @@ class BollPatternScanner:
 
         end = self.resolve_scan_date(scan_date)
         pool = self.list_candidate_codes(codes)
+        pattern_ids = [p["id"] for p in self.enabled_patterns]
+        cleared = self.clear_pattern_matches(
+            pattern_ids,
+            codes=None if codes is None else pool,
+        )
         logger.info(
-            "布林编排扫描开始: scan_date=%s window_days=%s stocks=%d patterns=%d",
-            end, window_days, len(pool), len(self.enabled_patterns),
+            "布林编排扫描开始: scan_date=%s window_days=%s stocks=%d patterns=%d cleared_old_matches=%d",
+            end, window_days, len(pool), len(self.enabled_patterns), cleared,
         )
 
         total_states = 0
@@ -342,7 +377,8 @@ class BollPatternScanner:
             "errors": errors,
             "state_rows_upserted": total_states,
             "match_rows_upserted": total_matches,
-            "patterns": [p["id"] for p in self.enabled_patterns],
+            "match_rows_cleared": cleared,
+            "patterns": pattern_ids,
         }
         logger.info("布林编排扫描完成: %s", summary)
         return summary
@@ -406,14 +442,14 @@ def run_post_sync_boll_scan(window_days: int = 60) -> dict[str, Any] | None:
     失败只记日志并写 status=failed，不向外抛（不拖垮同步成功态）。
     """
     import json
-    from datetime import datetime as _dt
+    from backend.app.core.timeutil import isoformat_beijing, now_beijing
 
-    _write_boll_scan_status("boll_scan_start", _dt.now().isoformat())
+    _write_boll_scan_status("boll_scan_start", isoformat_beijing(now_beijing()))
     _write_boll_scan_status("boll_scan_status", "running")
     try:
         scanner = BollPatternScanner()
         summary = scanner.run_scan(window_days=window_days)
-        _write_boll_scan_status("boll_scan_end", _dt.now().isoformat())
+        _write_boll_scan_status("boll_scan_end", isoformat_beijing(now_beijing()))
         _write_boll_scan_status("boll_scan_status", "success")
         # summary 可能较长，截断写入
         payload = json.dumps(summary, ensure_ascii=False)
@@ -424,7 +460,7 @@ def run_post_sync_boll_scan(window_days: int = 60) -> dict[str, Any] | None:
         return summary
     except Exception as ex:
         logger.error("同步下游布林编排扫描失败（不影响行情同步成功态）: %s", ex)
-        _write_boll_scan_status("boll_scan_end", _dt.now().isoformat())
+        _write_boll_scan_status("boll_scan_end", isoformat_beijing(now_beijing()))
         _write_boll_scan_status("boll_scan_status", "failed")
         _write_boll_scan_status("boll_scan_summary", str(ex)[:500])
         return None

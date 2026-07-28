@@ -37,6 +37,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from backend.app.core.config import settings
 from backend.app.core import db
+from backend.app.core.timeutil import isoformat_beijing, now_beijing
 from backend.app.data_center.sync import DataCenterSync
 from psycopg2 import sql
 
@@ -239,7 +240,7 @@ def run_sync(full=False, max_workers=8, skip_boll_scan=False):
     try:
         db_url = settings.DATABASE_URL
         ensure_sync_status_table(db_url)
-        set_sync_status(db_url, "last_start_time", datetime.now().isoformat())
+        set_sync_status(db_url, "last_start_time", isoformat_beijing(now_beijing()))
         set_sync_status(db_url, "last_status", "running")
 
         mode = "全量同步" if full else "增量同步"
@@ -255,7 +256,7 @@ def run_sync(full=False, max_workers=8, skip_boll_scan=False):
             sync_engine.sync_today_data(max_workers=max_workers)
 
         elapsed = time.time() - start_time
-        set_sync_status(db_url, "last_end_time", datetime.now().isoformat())
+        set_sync_status(db_url, "last_end_time", isoformat_beijing(now_beijing()))
         set_sync_status(db_url, "last_duration_sec", str(round(elapsed, 2)))
         set_sync_status(db_url, "last_status", "success")
         set_sync_status(db_url, "last_mode", "full" if full else "incremental")

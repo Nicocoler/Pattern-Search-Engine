@@ -61,12 +61,29 @@ def acquire(dict_cursor: bool = False):
     - dict_cursor=True 时设置 conn.cursor_factory=RealDictCursor，使 conn.cursor() 返回字典游标
       （向后兼容 main/sentry/backtest/template_manager 的 dict 访问）。
     - dict_cursor=False 时返回普通 tuple 游标（向后兼容 sync / sync_daemon 的索引访问）。
+    - 每条连接固定会话时区为 Asia/Shanghai，保证 NOW()/读出 timestamptz 均为北京时间。
     调用方必须在 finally 中调用 release(conn) 归还，或直接使用 db_cursor 上下文管理器。
     """
+    from backend.app.core.timeutil import BEIJING_TZ_NAME
+
     conn = _get_pool().getconn()
-    if dict_cursor:
-        conn.cursor_factory = RealDictCursor
-    return conn
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET TIME ZONE %s;", (BEIJING_TZ_NAME,))
+        conn.commit()
+        if dict_cursor:
+            conn.cursor_factory = RealDictCursor
+        return conn
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            _get_pool().putconn(conn, close=True)
+        except Exception:
+            pass
+        raise
 
 
 def release(conn) -> None:

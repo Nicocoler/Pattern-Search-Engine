@@ -12,7 +12,10 @@ def sanitize_numpy(obj):
     """
     递归将字典/列表等任何嵌套结构中的 numpy 数据类型（np.int64, np.float64, np.bool_等）
     转换为 Python 标准原生基本类型（int, float, bool），消除 FastAPI / JSON 序列化冲突。
+    datetime 统一转为北京时间 ISO（带 +08:00）。
     """
+    from backend.app.core.timeutil import isoformat_beijing
+
     if isinstance(obj, dict):
         return {k: sanitize_numpy(v) for k, v in obj.items()}
     elif isinstance(obj, (list, tuple)):
@@ -25,6 +28,8 @@ def sanitize_numpy(obj):
         return bool(obj)
     elif isinstance(obj, np.ndarray):
         return sanitize_numpy(obj.tolist())
+    elif isinstance(obj, (datetime, date)):
+        return isoformat_beijing(obj)
     return obj
 
 class PatternEvent:

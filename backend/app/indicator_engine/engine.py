@@ -7,6 +7,38 @@ Pattern Search Engine (PSE) - 基础指标计算引擎 (Indicator Engine)
 import pandas as pd
 import numpy as np
 
+
+def apply_boll(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> pd.DataFrame:
+    """
+    在已按 date 升序、且 close 已做好停牌平滑的 DataFrame 上写入布林三轨。
+    通达信对齐：MID/UPPER/LOWER 先算再 REF(...,1)；前 n 行置 NaN。
+
+    原地写入并返回同一 df：boll_mid / boll_upper / boll_lower / boll_width / boll_width_delta。
+    """
+    mid = df["close"].rolling(window=n, min_periods=n).mean()
+    vart1 = (df["close"] - mid) ** 2
+    vart2 = vart1.rolling(window=n, min_periods=n).mean()
+    vart3 = np.sqrt(vart2)
+    upper = mid + k * vart3
+    lower = mid - k * vart3
+
+    df["boll_mid"] = mid.shift(1)
+    df["boll_upper"] = upper.shift(1)
+    df["boll_lower"] = lower.shift(1)
+
+    df["boll_mid"] = np.where(df.index >= n, df["boll_mid"], np.nan)
+    df["boll_upper"] = np.where(df.index >= n, df["boll_upper"], np.nan)
+    df["boll_lower"] = np.where(df.index >= n, df["boll_lower"], np.nan)
+
+    df["boll_width"] = np.where(
+        df["boll_mid"] > 0.001,
+        (df["boll_upper"] - df["boll_lower"]) / df["boll_mid"],
+        np.nan,
+    )
+    df["boll_width_delta"] = df["boll_width"].diff()
+    return df
+
+
 def calculate_indicators(df_bars: pd.DataFrame) -> pd.DataFrame:
     """
     对单只股票的历史日K线 DataFrame 批量计算客观指标
@@ -41,47 +73,8 @@ def calculate_indicators(df_bars: pd.DataFrame) -> pd.DataFrame:
     df['ma60'] = df['close'].rolling(window=60, min_periods=60).mean()
     df['ma120'] = df['close'].rolling(window=120, min_periods=120).mean()
 
-    # 4. 布林带精准对齐计算 (BOLL)
-    # 严格对齐通达信公式：
-    #   N:=20;
-    #   MID:=MA(CLOSE,N);                                    -- 20日简单移动平均
-    #   VART1:=POW((CLOSE-MID),2); VART2:=MA(VART1,N);      -- 总体方差（除以N）
-    #   VART3:=SQRT(VART2);                                  -- 总体标准差
-    #   UPPER:=MID + 2*VART3; LOWER:=MID - 2*VART3;
-    #   BOLL:REF(MID,1); UB:REF(UPPER,1); LB:REF(LOWER,1);  -- 输出滞后1根K线
-
-    # 4.1 中轨：20日简单移动平均 (SMA)，非 EMA
-    mid = df['close'].rolling(window=20, min_periods=20).mean()
-
-    # 4.2 标准差：基于中轨的总体标准差（除以N，非样本标准差除以N-1）
-    vart1 = (df['close'] - mid) ** 2
-    vart2 = vart1.rolling(window=20, min_periods=20).mean()
-    vart3 = np.sqrt(vart2)
-
-    # 4.3 上轨 / 下轨
-    upper = mid + 2.0 * vart3
-    lower = mid - 2.0 * vart3
-
-    # 4.4 REF(MID,1) / REF(UPPER,1) / REF(LOWER,1) —— 滞后1根K线输出
-    # 与通达信一致：当日显示的BOLL值 = 前一日基于截至前一日收盘价计算的轨道
-    df['boll_mid'] = mid.shift(1)
-    df['boll_upper'] = upper.shift(1)
-    df['boll_lower'] = lower.shift(1)
-
-    # 截断暖机期：rolling需20日数据，shift再丢1行，故前20行无效
-    df['boll_mid'] = np.where(df.index >= 20, df['boll_mid'], np.nan)
-    df['boll_upper'] = np.where(df.index >= 20, df['boll_upper'], np.nan)
-    df['boll_lower'] = np.where(df.index >= 20, df['boll_lower'], np.nan)
-    
-    # 4.1 计算布林带宽度及带宽变化 Width = (Upper - Lower) / Middle
-    # 预防 middle 出现 0 导致零除异常
-    df['boll_width'] = np.where(
-        df['boll_mid'] > 0.001,
-        (df['boll_upper'] - df['boll_lower']) / df['boll_mid'],
-        np.nan
-    )
-    # 带宽 1 日变化率，表征通道是扩张（放量启动）还是收敛（横盘窄幅休整）
-    df['boll_width_delta'] = df['boll_width'].diff()
+    # 4. 布林带精准对齐计算 (BOLL) —— 统一出口 calculate_boll
+    apply_boll(df)
 
     # 5. 波动率 ATR14 计算
     # TR = max(high-low, abs(high-prev_close), abs(low-prev_close))

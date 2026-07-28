@@ -3,7 +3,7 @@
 // 职责：实现极速扫描大PK、起始点归零百分比重合 Kline 绘制、高斯事件悬浮气泡标注、滚动无偏回测图表、自适应反馈闭环
 // =============================================================================
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type CSSProperties } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
   TrendingUp,
@@ -144,6 +144,263 @@ interface BacktestResult {
   trade_details: any[];
 }
 
+type ZoneBounds = { m: number; h: number; u: number };
+
+function isZoneBoundsOrdered(b: ZoneBounds): boolean {
+  return (
+    Number.isFinite(b.m) &&
+    Number.isFinite(b.h) &&
+    Number.isFinite(b.u) &&
+    b.m < b.h &&
+    b.h < b.u
+  );
+}
+
+function formatZoneBound(n: number): string {
+  if (!Number.isFinite(n)) return '—';
+  // 去掉多余尾零，便于阅读
+  return String(Number(n.toFixed(4)));
+}
+
+const BOLL_ZONE_LABEL: Record<string, string> = {
+  L: '中轨下方',
+  M: '贴中轨',
+  H: '中上轨之间',
+  U: '触及/突破上轨',
+};
+
+type BollRegexDescribe = {
+  ok: boolean;
+  text: string;
+  kind: 'ok' | 'empty' | 'unsupported' | 'invalid';
+};
+
+function describeBollQuantifier(q: string): string {
+  if (!q) return '1日';
+  if (q === '+') return '持续1日以上';
+  if (q === '*') return '可有可无';
+  if (q === '?') return '可选1日';
+  let m = q.match(/^\{(\d+)\}$/);
+  if (m) return `${m[1]}日`;
+  m = q.match(/^\{(\d+),\}$/);
+  if (m) return `至少${m[1]}日`;
+  m = q.match(/^\{(\d+),(\d+)\}$/);
+  if (m) return `${m[1]}～${m[2]}日`;
+  return '未知量词';
+}
+
+/** 将简单 L/M/H/U 编排正则译为「→」阶段链；复杂写法不硬译。 */
+function describeBollRegex(regex: string): BollRegexDescribe {
+  const raw = (regex || '').trim();
+  if (!raw) return { ok: false, text: '请填写 regex', kind: 'empty' };
+
+  try {
+    // 与后端 re.compile 一致：先确认语法可编译
+    // eslint-disable-next-line no-new
+    new RegExp(raw);
+  } catch {
+    return { ok: false, text: '正则语法无效', kind: 'invalid' };
+  }
+
+  const compact = raw.replace(/\s+/g, '');
+  const simpleFull = /^([LMHU](\+|\*|\?|\{\d+,\d+\}|\{\d+,\}|\{\d+\})?)+$/;
+  if (!simpleFull.test(compact)) {
+    return {
+      ok: false,
+      text: '暂不支持该写法（仅支持 L/M/H/U + 简单量词连续串）',
+      kind: 'unsupported',
+    };
+  }
+
+  const stages: string[] = [];
+  const tokenRe = /([LMHU])(\+|\*|\?|\{\d+,\d+\}|\{\d+,\}|\{\d+\})?/g;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(compact)) !== null) {
+    const label = BOLL_ZONE_LABEL[m[1]] || m[1];
+    stages.push(`${label}（${describeBollQuantifier(m[2] || '')}）`);
+  }
+  if (stages.length === 0) {
+    return { ok: false, text: '暂不支持该写法（仅支持 L/M/H/U + 简单量词连续串）', kind: 'unsupported' };
+  }
+  return { ok: true, text: stages.join(' → '), kind: 'ok' };
+}
+
+function bollRegexDescribeColor(kind: BollRegexDescribe['kind']): string {
+  if (kind === 'ok') return 'var(--color-text-muted)';
+  if (kind === 'empty') return 'var(--color-text-muted)';
+  return '#fbbf24';
+}
+
+function ZoneBoundStepper({
+  value,
+  onChange,
+  invalid = false,
+  title,
+}: {
+  value: number;
+  onChange: (n: number) => void;
+  invalid?: boolean;
+  title?: string;
+}) {
+  const step = 0.01;
+  const bump = (dir: 1 | -1) => {
+    const next = Math.round((value + dir * step) * 10000) / 10000;
+    onChange(next);
+  };
+  const border = invalid ? '#ef4444' : 'rgba(96, 165, 250, 0.55)';
+  const btnStyle: CSSProperties = {
+    width: '1.7rem',
+    height: '1.7rem',
+    padding: 0,
+    border: `1px solid ${border}`,
+    borderRadius: '4px',
+    background: 'rgba(59, 130, 246, 0.28)',
+    color: '#e2e8f0',
+    fontSize: '1rem',
+    fontWeight: 700,
+    lineHeight: 1,
+    cursor: 'pointer',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  };
+
+  return (
+    <div className="zone-bound-stepper" style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }} title={title}>
+      <button type="button" aria-label="减小" className="zone-bound-stepper__btn" style={btnStyle} onClick={() => bump(-1)}>−</button>
+      <input
+        type="number"
+        step={step}
+        value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        className="zone-bound-stepper__input"
+        style={{
+          width: '4.2rem',
+          height: '1.7rem',
+          border: `1px solid ${border}`,
+          borderRadius: '4px',
+          padding: '0 0.3rem',
+          textAlign: 'center',
+          background: 'rgba(15, 23, 42, 0.85)',
+          color: '#f8fafc',
+          fontFamily: 'monospace',
+          fontSize: '0.82rem',
+        }}
+      />
+      <button type="button" aria-label="增大" className="zone-bound-stepper__btn" style={btnStyle} onClick={() => bump(1)}>+</button>
+    </div>
+  );
+}
+
+/** 四行分区编辑器：行上展示含义/区间/贴轨锚点；L/M/H 行编辑交界分界点 */
+function ZoneBoundsEditor({
+  bounds,
+  onChange,
+  showInvalid = false,
+}: {
+  bounds: ZoneBounds;
+  onChange: (next: ZoneBounds) => void;
+  showInvalid?: boolean;
+}) {
+  const invalid = showInvalid && !isZoneBoundsOrdered(bounds);
+
+  const rows: Array<{
+    key: 'L' | 'M' | 'H' | 'U';
+    title: string;
+    rangeText: string;
+    anchor: string;
+    editKey?: keyof ZoneBounds;
+    editHint?: string;
+  }> = [
+    {
+      key: 'L',
+      title: 'L · 中轨下方',
+      rangeText: `−∞ ≤ %B < ${formatZoneBound(bounds.m)}`,
+      anchor: '贴下轨 = 0',
+      editKey: 'm',
+      editHint: 'L↔M 分界',
+    },
+    {
+      key: 'M',
+      title: 'M · 贴中轨',
+      rangeText: `${formatZoneBound(bounds.m)} ≤ %B < ${formatZoneBound(bounds.h)}`,
+      anchor: '贴中轨 = 0.5',
+      editKey: 'h',
+      editHint: 'M↔H 分界',
+    },
+    {
+      key: 'H',
+      title: 'H · 中轨与上轨之间',
+      rangeText: `${formatZoneBound(bounds.h)} ≤ %B < ${formatZoneBound(bounds.u)}`,
+      anchor: '过渡区',
+      editKey: 'u',
+      editHint: 'H↔U 分界',
+    },
+    {
+      key: 'U',
+      title: 'U · 触及/突破上轨',
+      rangeText: `${formatZoneBound(bounds.u)} ≤ %B < +∞`,
+      anchor: '贴上轨 = 1',
+    },
+  ];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', maxWidth: '420px', width: '100%' }}>
+      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: 0, lineHeight: 1.45 }}>
+        %B = (close − lower) / (upper − lower)；左闭右开。跌破下轨 &lt;0，突破上轨 &gt;1。
+      </p>
+      {rows.map(row => (
+        <div
+          key={row.key}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '0.75rem',
+            padding: '0.5rem 0.65rem',
+            border: `1px solid ${invalid && row.editKey ? '#ef4444' : 'var(--border-color)'}`,
+            borderRadius: '6px',
+            background: 'rgba(148, 163, 184, 0.06)',
+          }}
+        >
+          <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+            <div style={{ fontSize: '0.78rem', color: 'var(--color-text-main)', fontWeight: 600 }}>
+              {row.title}
+            </div>
+            <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', fontFamily: 'monospace', marginTop: '0.12rem' }}>
+              {row.rangeText}
+            </div>
+            <div style={{ fontSize: '0.68rem', color: 'var(--color-text-muted)', marginTop: '0.1rem' }}>
+              {row.anchor}
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.2rem', flexShrink: 0 }}>
+            {row.editKey ? (
+              <>
+                <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)' }}>{row.editHint}</span>
+                <ZoneBoundStepper
+                  value={bounds[row.editKey]}
+                  invalid={invalid}
+                  title={row.editHint}
+                  onChange={n => onChange({ ...bounds, [row.editKey!]: n })}
+                />
+              </>
+            ) : (
+              <span style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', fontFamily: 'monospace' }}>+∞</span>
+            )}
+          </div>
+        </div>
+      ))}
+      {invalid && (
+        <p style={{ fontSize: '0.7rem', color: '#f87171', margin: 0 }}>
+          分界须满足 L↔M &lt; M↔H &lt; H↔U（即 m &lt; h &lt; u）
+        </p>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   // -----------------------------------------------------------------------------
   // 2. 状态管理 (State Management)
@@ -225,7 +482,13 @@ export default function App() {
   const [btConfigScoreThreshold, setBtConfigScoreThreshold] = useState(80.0);
 
   // 每日扫描
-  const [runDate, setRunDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [runDate, setRunDate] = useState(() => {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  });
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
   const [selectedStock, setSelectedStock] = useState<ScanResult | null>(null);
   const [compareData, setCompareData] = useState<ComparePayload | null>(null);
@@ -262,9 +525,15 @@ export default function App() {
     regex: '',
     min_total_days: 10,
     enabled: true,
+    override_zone: false,
+    override_denoise: false,
+    bounds: { m: 0.35, h: 0.65, u: 0.95 },
+    denoise: 0,
   });
   const [bollGlobalDenoise, setBollGlobalDenoise] = useState(0);
   const [bollGlobalBounds, setBollGlobalBounds] = useState({ m: 0.35, h: 0.65, u: 0.95 });
+  const [bollGlobalBoundsInvalid, setBollGlobalBoundsInvalid] = useState(false);
+  const [bollFormBoundsInvalid, setBollFormBoundsInvalid] = useState(false);
 
   // -----------------------------------------------------------------------------
   // 3. 通用辅助函数 (Helpers)
@@ -506,36 +775,99 @@ export default function App() {
     }
   };
 
+  const parseZoneBounds = (
+    zt?: Record<string, [string | number, string | number]> | null,
+  ) => {
+    const fallback = { m: bollGlobalBounds.m, h: bollGlobalBounds.h, u: bollGlobalBounds.u };
+    if (!zt) return fallback;
+    const num = (v: string | number | undefined, fb: number) => {
+      if (v === undefined || v === null) return fb;
+      if (v === '-inf' || v === 'inf') return fb;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fb;
+    };
+    return {
+      m: num(zt.M?.[0] ?? zt.L?.[1], fallback.m),
+      h: num(zt.H?.[0] ?? zt.M?.[1], fallback.h),
+      u: num(zt.U?.[0] ?? zt.H?.[1], fallback.u),
+    };
+  };
+
+  const buildZoneThresholds = (bounds: { m: number; h: number; u: number }) => ({
+    L: ['-inf', bounds.m],
+    M: [bounds.m, bounds.h],
+    H: [bounds.h, bounds.u],
+    U: [bounds.u, 'inf'],
+  });
+
   const openNewBollForm = () => {
     setBollEditId(null);
-    setBollForm({ id: '', name: '', regex: 'L+M{3,}H*U+H*M{3,}', min_total_days: 10, enabled: true });
+    setBollForm({
+      id: '',
+      name: '',
+      regex: 'L+M{3,}H*U+H*M{3,}',
+      min_total_days: 10,
+      enabled: true,
+      override_zone: false,
+      override_denoise: false,
+      bounds: { ...bollGlobalBounds },
+      denoise: bollGlobalDenoise,
+    });
     setBollShowManage(true);
+    setBollFormBoundsInvalid(false);
   };
 
   const openEditBollForm = (p: BollPatternMeta) => {
     setBollEditId(p.id);
+    const hasZoneOverride = p.zone_thresholds != null;
+    const hasDenoiseOverride = p.denoise_min_len != null;
     setBollForm({
       id: p.id,
       name: p.name,
       regex: p.regex || '',
       min_total_days: p.min_total_days ?? 0,
       enabled: p.enabled,
+      override_zone: hasZoneOverride,
+      override_denoise: hasDenoiseOverride,
+      bounds: parseZoneBounds(hasZoneOverride ? p.zone_thresholds : p.effective?.zone_thresholds),
+      denoise: hasDenoiseOverride
+        ? Number(p.denoise_min_len)
+        : Number(p.effective?.denoise_min_len ?? bollGlobalDenoise),
     });
     setBollShowManage(true);
+    setBollFormBoundsInvalid(false);
   };
 
   const handleSaveBollPattern = async () => {
     try {
+      if (bollForm.override_zone && !isZoneBoundsOrdered(bollForm.bounds)) {
+        setBollFormBoundsInvalid(true);
+        showToast('本编排分区边界须满足 m < h < u');
+        return;
+      }
+      setBollFormBoundsInvalid(false);
+
+      const zonePayload = bollForm.override_zone
+        ? buildZoneThresholds(bollForm.bounds)
+        : null;
+      const denoisePayload = bollForm.override_denoise ? bollForm.denoise : null;
+
       if (bollEditId) {
+        const body: Record<string, unknown> = {
+          name: bollForm.name,
+          regex: bollForm.regex,
+          min_total_days: bollForm.min_total_days,
+          enabled: bollForm.enabled,
+          clear_zone_override: !bollForm.override_zone,
+          clear_denoise_override: !bollForm.override_denoise,
+        };
+        if (bollForm.override_zone) body.zone_thresholds = zonePayload;
+        if (bollForm.override_denoise) body.denoise_min_len = denoisePayload;
+
         const res = await fetch(`${apiBase}/api/boll-patterns/${bollEditId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: bollForm.name,
-            regex: bollForm.regex,
-            min_total_days: bollForm.min_total_days,
-            enabled: bollForm.enabled,
-          }),
+          body: JSON.stringify(body),
         });
         const json = await res.json();
         if (!json.success) {
@@ -551,7 +883,15 @@ export default function App() {
         const res = await fetch(`${apiBase}/api/boll-patterns`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(bollForm),
+          body: JSON.stringify({
+            id: bollForm.id,
+            name: bollForm.name,
+            regex: bollForm.regex,
+            min_total_days: bollForm.min_total_days,
+            enabled: bollForm.enabled,
+            zone_thresholds: zonePayload,
+            denoise_min_len: denoisePayload,
+          }),
         });
         const json = await res.json();
         if (!json.success) {
@@ -602,12 +942,13 @@ export default function App() {
 
   const handleSaveBollSettings = async () => {
     try {
-      const zone_thresholds = {
-        L: ['-inf', bollGlobalBounds.m],
-        M: [bollGlobalBounds.m, bollGlobalBounds.h],
-        H: [bollGlobalBounds.h, bollGlobalBounds.u],
-        U: [bollGlobalBounds.u, 'inf'],
-      };
+      if (!isZoneBoundsOrdered(bollGlobalBounds)) {
+        setBollGlobalBoundsInvalid(true);
+        showToast('全局分区边界须满足 m < h < u');
+        return;
+      }
+      setBollGlobalBoundsInvalid(false);
+      const zone_thresholds = buildZoneThresholds(bollGlobalBounds);
       const res = await fetch(`${apiBase}/api/boll-pattern-settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -2679,20 +3020,40 @@ export default function App() {
                 </button>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem', marginBottom: '1rem' }}>
+              <div
+                className="boll-manage-grid"
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: bollShowManage
+                    ? 'repeat(2, minmax(300px, 1fr))'
+                    : 'minmax(300px, 440px)',
+                  gap: '1.25rem',
+                  marginBottom: '1rem',
+                  alignItems: 'start',
+                }}
+              >
                 <div>
                   <h3 style={{ fontSize: '0.85rem', marginBottom: '0.5rem', color: 'var(--color-text-main)' }}>全局尺子</h3>
                   <div className="form-group">
-                    <label>M 下界 / H 下界 / U 下界（L&lt;m&lt;h&lt;u）</label>
-                    <div style={{ display: 'flex', gap: '0.4rem' }}>
-                      <input type="number" step={0.01} value={bollGlobalBounds.m} onChange={e => setBollGlobalBounds(b => ({ ...b, m: Number(e.target.value) }))} />
-                      <input type="number" step={0.01} value={bollGlobalBounds.h} onChange={e => setBollGlobalBounds(b => ({ ...b, h: Number(e.target.value) }))} />
-                      <input type="number" step={0.01} value={bollGlobalBounds.u} onChange={e => setBollGlobalBounds(b => ({ ...b, u: Number(e.target.value) }))} />
-                    </div>
+                    <label>分区（按 L/M/H/U 行编辑交界）</label>
+                    <ZoneBoundsEditor
+                      bounds={bollGlobalBounds}
+                      showInvalid={bollGlobalBoundsInvalid}
+                      onChange={next => {
+                        setBollGlobalBounds(next);
+                        if (bollGlobalBoundsInvalid && isZoneBoundsOrdered(next)) {
+                          setBollGlobalBoundsInvalid(false);
+                        }
+                      }}
+                    />
                   </div>
                   <div className="form-group">
-                    <label>denoise_min_len（0=关闭）</label>
+                    <label>denoise_min_len（最短持续天数去抖，0=关闭）</label>
                     <input type="number" min={0} value={bollGlobalDenoise} onChange={e => setBollGlobalDenoise(Number(e.target.value))} />
+                    <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
+                      匹配正则前，把 zone 游程里短于该天数的段并入相邻段，用来抹掉单日误穿轨等噪声。
+                      例：设为 2 会吃掉只持续 1 天的尖刺；过大可能抹掉真实短促突破。不确定时保持 0。
+                    </p>
                   </div>
                   <button className="btn-primary" onClick={handleSaveBollSettings}>保存全局尺子</button>
                   {bollSettings && (
@@ -2703,7 +3064,7 @@ export default function App() {
                 </div>
 
                 {bollShowManage && (
-                  <div>
+                  <div style={{ minWidth: 0 }}>
                     <h3 style={{ fontSize: '0.85rem', marginBottom: '0.5rem' }}>
                       {bollEditId ? `编辑编排（id 不可改）` : '新建编排'}
                     </h3>
@@ -2720,6 +3081,14 @@ export default function App() {
                     <div className="form-group">
                       <label>regex（例 L+M{'{3,}'}H*U+H*M{'{3,}'}）</label>
                       <input value={bollForm.regex} onChange={e => setBollForm(f => ({ ...f, regex: e.target.value }))} style={{ fontFamily: 'monospace' }} />
+                      {(() => {
+                        const d = describeBollRegex(bollForm.regex);
+                        return (
+                          <p style={{ fontSize: '0.72rem', color: bollRegexDescribeColor(d.kind), margin: '0.4rem 0 0', lineHeight: 1.5 }}>
+                            <b style={{ color: 'var(--color-text-main)' }}>走势说明：</b>{d.text}
+                          </p>
+                        );
+                      })()}
                     </div>
                     <div className="form-group">
                       <label>min_total_days</label>
@@ -2729,6 +3098,88 @@ export default function App() {
                       <input type="checkbox" checked={bollForm.enabled} onChange={e => setBollForm(f => ({ ...f, enabled: e.target.checked }))} />
                       启用（参与扫描）
                     </label>
+
+                    <div
+                      style={{
+                        fontSize: '0.72rem',
+                        color: 'var(--color-text-muted)',
+                        borderTop: '1px solid var(--border-color)',
+                        paddingTop: '0.6rem',
+                        marginBottom: '0.5rem',
+                      }}
+                    >
+                      尺子覆盖（可选）：不勾选则沿用左侧全局尺子
+                    </div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.45rem' }}>
+                      <input
+                        type="checkbox"
+                        checked={bollForm.override_zone}
+                        onChange={e => {
+                          const checked = e.target.checked;
+                          setBollForm(f => ({
+                            ...f,
+                            override_zone: checked,
+                            bounds: checked ? f.bounds : { ...bollGlobalBounds },
+                          }));
+                          if (!checked) setBollFormBoundsInvalid(false);
+                        }}
+                      />
+                      单独定义分区阈值（覆盖全局）
+                    </label>
+                    {bollForm.override_zone ? (
+                      <div className="form-group">
+                        <label>本编排分区（覆盖全局）</label>
+                        <ZoneBoundsEditor
+                          bounds={bollForm.bounds}
+                          showInvalid={bollFormBoundsInvalid}
+                          onChange={next => {
+                            setBollForm(f => ({ ...f, bounds: next }));
+                            if (bollFormBoundsInvalid && isZoneBoundsOrdered(next)) {
+                              setBollFormBoundsInvalid(false);
+                            }
+                          }}
+                        />
+                      </div>
+                    ) : (
+                      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0 0 0.55rem', lineHeight: 1.45 }}>
+                        当前沿用全局：
+                        L&lt;{formatZoneBound(bollGlobalBounds.m)} ·
+                        M[{formatZoneBound(bollGlobalBounds.m)},{formatZoneBound(bollGlobalBounds.h)}) ·
+                        H[{formatZoneBound(bollGlobalBounds.h)},{formatZoneBound(bollGlobalBounds.u)}) ·
+                        U≥{formatZoneBound(bollGlobalBounds.u)}
+                      </p>
+                    )}
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.45rem' }}>
+                      <input
+                        type="checkbox"
+                        checked={bollForm.override_denoise}
+                        onChange={e => setBollForm(f => ({
+                          ...f,
+                          override_denoise: e.target.checked,
+                          denoise: e.target.checked ? f.denoise : bollGlobalDenoise,
+                        }))}
+                      />
+                      单独定义 denoise_min_len（最短持续天数去抖）
+                    </label>
+                    {bollForm.override_denoise ? (
+                      <div className="form-group">
+                        <label>本编排 denoise_min_len（0=关闭）</label>
+                        <input
+                          type="number"
+                          min={0}
+                          value={bollForm.denoise}
+                          onChange={e => setBollForm(f => ({ ...f, denoise: Number(e.target.value) }))}
+                        />
+                        <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
+                          仅本编排生效：短于该天数的 zone 段并入相邻段后再匹配；0=不去抖。
+                        </p>
+                      </div>
+                    ) : (
+                      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0 0 0.6rem' }}>
+                        当前沿用全局 denoise={bollGlobalDenoise}（0=关闭去抖）
+                      </p>
+                    )}
+
                     <div style={{ display: 'flex', gap: '0.5rem' }}>
                       <button className="btn-primary" onClick={handleSaveBollPattern}>保存</button>
                       <button
@@ -2750,7 +3201,8 @@ export default function App() {
                       <th>id</th>
                       <th>名称</th>
                       <th>启用</th>
-                      <th>regex</th>
+                      <th>尺子</th>
+                      <th>regex / 走势</th>
                       <th>操作</th>
                     </tr>
                   </thead>
@@ -2766,8 +3218,32 @@ export default function App() {
                             onChange={e => { void handleToggleBollEnabled(p, e.target.checked); }}
                           />
                         </td>
-                        <td style={{ fontFamily: 'monospace', fontSize: '0.7rem', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                          {p.regex}
+                        <td style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+                          {p.zone_thresholds != null || p.denoise_min_len != null ? '自定义' : '全局'}
+                        </td>
+                        <td style={{ fontSize: '0.7rem', maxWidth: 260 }}>
+                          <div style={{ fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {p.regex}
+                          </div>
+                          {(() => {
+                            const d = describeBollRegex(p.regex || '');
+                            return (
+                              <div
+                                style={{
+                                  marginTop: '0.2rem',
+                                  color: bollRegexDescribeColor(d.kind),
+                                  lineHeight: 1.35,
+                                  display: '-webkit-box',
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: 'vertical',
+                                  overflow: 'hidden',
+                                }}
+                                title={d.text}
+                              >
+                                {d.text}
+                              </div>
+                            );
+                          })()}
                         </td>
                         <td>
                           <button

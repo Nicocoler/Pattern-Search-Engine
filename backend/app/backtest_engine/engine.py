@@ -13,8 +13,7 @@ import logging
 
 from backend.app.core import db
 from backend.app.core.config import settings
-from backend.app.indicator_engine.engine import calculate_indicators
-from backend.app.feature_engine.engine import calculate_features
+from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, prepare_stock_frame, prepare_stock_history
 from backend.app.similarity_engine.engine import SimilarityEngine
 from backend.app.template_manager.manager import TemplateManager
 from backend.app.filters.boll_mid_filter import has_boll_mid_breach
@@ -27,31 +26,11 @@ class BacktestEngine:
         self.template_manager = TemplateManager()
 
     def load_stock_full_history(self, code: str, start_date: date, end_date: date) -> pd.DataFrame:
-        """
-        一次性预加载单股包含暖机期在内的全历史日 K，避免在交易日循环中重复查询数据库。
-        - 预拉取额外 250 天以支撑滚窗均线暖机
-        """
-        padded_start = start_date - timedelta(days=250)
-        with db.db_cursor(dict_cursor=True) as (conn, cursor):
-            query = """
-                SELECT date, open, high, low, close, volume, amount, factor
-                FROM daily_bars
-                WHERE code = %s AND date >= %s AND date <= %s
-                ORDER BY date ASC;
-            """
-            cursor.execute(query, (code, padded_start, end_date))
-            rows = cursor.fetchall()
-        if not rows:
-            return pd.DataFrame()
-            
-        df = pd.DataFrame(rows)
-        # 强制 Decimal 转 Float 消除计算干扰
-        for col in ['open', 'high', 'low', 'close', 'amount', 'factor']:
-            if col in df.columns:
-                df[col] = df[col].astype(float)
-        if 'volume' in df.columns:
-            df['volume'] = df['volume'].astype(int)
-        return df
+        """兼容入口：委托统一门面区间预载（仅 OHLCV，不含指标）。"""
+        from backend.app.market_pipeline import load_daily_bars
+        padded_start = start_date - timedelta(days=COMPARE_LOOKBACK_DAYS)
+        return load_daily_bars(code, padded_start, end_date)
+
 
     def run_backtest(self, template_id: int, start_date_str: str, end_date_str: str, score_threshold: float = 80.0) -> dict:
         """
@@ -92,34 +71,34 @@ class BacktestEngine:
         else:
             logger.info("ℹ️ [模板驱动] 该模板不需要 BOLL_MIDDLE_SUPPORT，跳过中轨硬过滤")
 
-        # 2. 编译模板母体经典形态特征矩阵
+        # 2. 编译模板母体经典形态特征矩阵（统一门面，与 compare/sentry 同源）
         source_symbol = config.get("source_symbol", "sz000002")
         source_end = datetime.strptime(config.get("source_end", "2026-05-01"), "%Y-%m-%d").date()
-        
-        df_temp_raw = self.load_stock_full_history(source_symbol, source_end - timedelta(days=60), source_end)
-        df_temp_ind = calculate_indicators(df_temp_raw)
-        df_temp_feat = calculate_features(df_temp_ind, source_symbol)
+
+        df_temp_feat = prepare_stock_frame(source_symbol, source_end, level="features")
+        if df_temp_feat.empty:
+            raise ValueError(f"无法加载模板母体 [{source_symbol}] 行情")
         df_temp_window = df_temp_feat.tail(window_size).copy()
-        
+        if len(df_temp_window) < window_size:
+            raise ValueError(f"模板母体特征序列不足 {window_size} 天")
+
         # 3. 预加载股票池并一次性算出全历史特征大表 (内存预加载性能大跃进)
         # 获取股票池
         with db.db_cursor(dict_cursor=True) as (conn, cursor):
             cursor.execute("SELECT code, name FROM stocks WHERE is_st = FALSE AND is_suspended = FALSE;")
             stocks = cursor.fetchall()
-        
+
         # 在内存中预存各股已经计算好全历史的 features 字典：{code: df_features}
         preloaded_features = {}
         # 为了回测中快速按日期定位收盘价，预存各股 {code: {date: close}} 字典
         price_maps = {}
-        
+
         logger.info("👉 正在预加载回测股票池量价底座并完成矢量计算...")
         for s in stocks:
             code = s["code"]
-            df_hist = self.load_stock_full_history(code, start_date, end_date)
-            if df_hist.empty or len(df_hist) < 100:
+            df_feat = prepare_stock_history(code, start_date, end_date, level="features")
+            if df_feat.empty or len(df_feat) < 100:
                 continue
-            df_ind = calculate_indicators(df_hist)
-            df_feat = calculate_features(df_ind, code)
 
             preloaded_features[code] = df_feat
             # 价格表用指标计算后（停牌日已 ffill）的 close 构建，与买入价 df_window_t['close'] 口径一致，

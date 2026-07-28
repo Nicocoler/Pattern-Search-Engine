@@ -21,6 +21,17 @@ _Avoid_: 形态模板、feature template、Template
 **%B**:
 收盘价在布林上轨与下轨之间的相对位置：`(close - lower) / (upper - lower)`。
 
+**Market Pipeline / 行情准备门面**:
+统一的「加载 + compare 同款 250 日历日暖机 + 分层计算」入口。
+点截止日用 `prepare_stock_frame`；区间预载（回测）用 `prepare_stock_history`（start 前再暖机 250）。
+`level` 为 `indicators` / `features` / `pattern`（后者含 pct_b、不含 zone）。
+取数底层为 `load_daily_bars` / `load_stock_bars`，sentry/backtest 不再各自拼 SQL 算指标。
+_Avoid_: 各模块自行选择短于 250 的计算回看来算布林
+
+**Beijing Time**:
+业务时刻一律按 `Asia/Shanghai`：连接池 `SET TIME ZONE`，Python 用 `now_beijing()` / `isoformat_beijing()`。
+_Avoid_: 无时区的 `datetime.now().isoformat()` 写入状态表；依赖客户端默认 UTC 展示
+
 **Pattern Match（编排命中）**:
 某只股票在某起止交易日区间上对某一 Pattern 的一次匹配结果；自然键为 `(code, pattern_id, start_date, end_date)`。
 _Avoid_: scan_results（那是 DTW 模板扫描落库）

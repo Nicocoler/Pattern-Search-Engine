@@ -19,6 +19,7 @@ import akshare as ak
 from psycopg2.extras import execute_values
 
 from backend.app.core import db
+from backend.app.core.timeutil import now_beijing, today_beijing
 
 # 日志：仅获取命名空间 logger，输出由 main.py root logger / sync_daemon 统一配置，
 # 不再调用 basicConfig 以免与主进程日志配置互相覆盖。
@@ -142,7 +143,7 @@ class DataCenterSync:
             
             # 由于 spot 接口无法拿到行业和上市日期，我们后续增量拉K线时如有必要可单独补齐，在此提供默认值
             stocks_to_insert.append((
-                code, name, None, board, "综合", is_st, is_suspended, datetime.now()
+                code, name, None, board, "综合", is_st, is_suspended, now_beijing()
             ))
 
         # 批量 UPSERT 入库
@@ -200,7 +201,7 @@ class DataCenterSync:
         # 2.5 极致智能秒传自愈拦截：如果本地 max_date 已经是今天，或者今天是周末且 max_date 已经是上周五
         # 证明该个股今日数据已经绝对落库，100% 连网络请求都不要发，免去网络IO和随机休眠，秒速跳转下一只！
         if max_date and not force_rebuild:
-            today_dt = date.today()
+            today_dt = today_beijing()
             weekday = today_dt.weekday() # 0=周一, 5=周六, 6=周日
             is_already_latest = False
             
@@ -231,7 +232,7 @@ class DataCenterSync:
         try:
             # 转换开始日期格式 (从 YYYYMMDD 转为 YYYY-MM-DD，腾讯接口格式要求)
             tx_start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
-            tx_end = datetime.now().strftime("%Y-%m-%d")
+            tx_end = now_beijing().strftime("%Y-%m-%d")
 
             df_tx = self.fetch_with_retry(
                 ak.stock_zh_a_hist_tx,
@@ -315,7 +316,7 @@ class DataCenterSync:
                             cursor_dirty = conn_dirty.cursor()
                             cursor_dirty.execute(
                                 "INSERT INTO dirty_factors (code, dirty_date, is_processed) VALUES (%s, %s, FALSE) ON CONFLICT (code, dirty_date) DO NOTHING;",
-                                (code, date.today())
+                                (code, today_beijing())
                             )
                             conn_dirty.commit()
                             cursor_dirty.close()
@@ -328,7 +329,7 @@ class DataCenterSync:
                                 cur_mark = conn_mark.cursor()
                                 cur_mark.execute(
                                     "UPDATE dirty_factors SET is_processed = TRUE, updated_at = NOW() WHERE code = %s AND dirty_date = %s;",
-                                    (code, date.today())
+                                    (code, today_beijing())
                                 )
                                 conn_mark.commit()
                                 cur_mark.close()
@@ -465,7 +466,7 @@ class DataCenterSync:
     def sync_today_data(self, max_workers=8):
         """同步当日最新股票行情数据。预查询已落库当日数据的股票，仅对缺失的个股执行增量抓取。"""
         logger.info("开始同步当日最新股票行情数据...")
-        today = date.today()
+        today = today_beijing()
         codes = self.sync_stock_list()
         if not codes:
             with db.db_cursor() as (conn, cursor):

@@ -9,10 +9,11 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 DEFAULT_ZONE_THRESHOLDS: dict[str, tuple[float, float]] = {
-    "L": (-float("inf"), 0.35),
-    "M": (0.35, 0.65),
-    "H": (0.65, 0.95),
-    "U": (0.95, float("inf")),
+    # 贴轨时 %B：下轨=0，中轨=0.5，上轨=1；跌破下轨<0，突破上轨>1
+    "L": (-float("inf"), 0.35),   # 中轨下方（%B < 0.35；贴下轨=0）
+    "M": (0.35, 0.65),            # 贴中轨（0.35 ≤ %B < 0.65；贴中轨=0.5）
+    "H": (0.65, 0.95),            # 中轨与上轨之间过渡态（0.65 ≤ %B < 0.95）
+    "U": (0.95, float("inf")),    # 触及/突破上轨（%B ≥ 0.95；贴上轨=1）
 }
 
 # 分区遍历顺序（由低到高），保证边界归左闭右开

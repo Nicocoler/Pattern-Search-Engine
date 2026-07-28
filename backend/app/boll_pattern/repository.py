@@ -19,6 +19,7 @@ from backend.app.boll_pattern.loader import (
 )
 from backend.app.boll_pattern.zone import DEFAULT_ZONE_THRESHOLDS
 from backend.app.core import db
+from backend.app.core.timeutil import isoformat_beijing
 
 logger = logging.getLogger("BollPatternRepo")
 
@@ -335,16 +336,8 @@ def serialize_pattern_for_api(pattern: dict[str, Any], settings: dict[str, Any] 
             "zone_thresholds": thresholds_to_jsonable(eff["zone_thresholds"]),
             "denoise_min_len": eff["denoise_min_len"],
         },
-        "created_at": (
-            pattern["created_at"].isoformat()
-            if hasattr(pattern.get("created_at"), "isoformat")
-            else pattern.get("created_at")
-        ),
-        "updated_at": (
-            pattern["updated_at"].isoformat()
-            if hasattr(pattern.get("updated_at"), "isoformat")
-            else pattern.get("updated_at")
-        ),
+        "created_at": isoformat_beijing(pattern.get("created_at")),
+        "updated_at": isoformat_beijing(pattern.get("updated_at")),
     }
 
 
