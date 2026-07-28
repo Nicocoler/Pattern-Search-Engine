@@ -10,10 +10,17 @@ import numpy as np
 
 def apply_boll(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> pd.DataFrame:
     """
-    在已按 date 升序、且 close 已做好停牌平滑的 DataFrame 上写入布林三轨。
-    通达信对齐：MID/UPPER/LOWER 先算再 REF(...,1)；前 n 行置 NaN。
+    布林三轨：对齐通达信主图「BOLL-M 布林线-传统版」（非 STD 版标准 BOLL）。
 
-    原地写入并返回同一 df：boll_mid / boll_upper / boll_lower / boll_width / boll_width_delta。
+    复刻式：
+      MID   = MA(CLOSE, N)
+      σ     = √ MA((CLOSE − MID)², N)   # 总体标准差语义（÷N），非样本 STD
+      UPPER = MID + k·σ
+      LOWER = MID − k·σ
+      输出  = REF(MID/UPPER/LOWER, 1)   # 三轨统一滞后 1 根
+
+    默认 N=20、k=2。前 n 行置 NaN。原地写入 boll_mid / boll_upper / boll_lower /
+    boll_width / boll_width_delta。
     """
     mid = df["close"].rolling(window=n, min_periods=n).mean()
     vart1 = (df["close"] - mid) ** 2
@@ -22,6 +29,7 @@ def apply_boll(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> pd.DataFrame:
     upper = mid + k * vart3
     lower = mid - k * vart3
 
+    # REF(..., 1)：与 BOLL-M 传统版画图一致
     df["boll_mid"] = mid.shift(1)
     df["boll_upper"] = upper.shift(1)
     df["boll_lower"] = lower.shift(1)
@@ -73,7 +81,7 @@ def calculate_indicators(df_bars: pd.DataFrame) -> pd.DataFrame:
     df['ma60'] = df['close'].rolling(window=60, min_periods=60).mean()
     df['ma120'] = df['close'].rolling(window=120, min_periods=120).mean()
 
-    # 4. 布林带精准对齐计算 (BOLL) —— 统一出口 calculate_boll
+    # 4. 布林带：BOLL-M 传统版（手写总体标准差 + REF 1）
     apply_boll(df)
 
     # 5. 波动率 ATR14 计算

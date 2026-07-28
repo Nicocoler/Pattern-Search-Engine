@@ -94,6 +94,26 @@ interface BollPatternMeta {
   };
 }
 
+interface BollScanProgress {
+  running: boolean;
+  phase: 'idle' | 'preparing' | 'scanning' | 'done' | 'failed' | string;
+  current: number;
+  total: number;
+  scanned: number;
+  skipped: number;
+  errors: number;
+  matches: number;
+  percent: number;
+  window_days: number | null;
+  scan_date: string | null;
+  current_code: string | null;
+  message: string;
+  started_at: string | null;
+  finished_at: string | null;
+  summary: Record<string, unknown> | null;
+  error: string | null;
+}
+
 interface MatchedEvent {
   event_type: string;
   date: string;
@@ -509,6 +529,7 @@ export default function App() {
   const [bollEndWithinDays, setBollEndWithinDays] = useState(3);
   const [bollWindowDays, setBollWindowDays] = useState(60);
   const [bollScanning, setBollScanning] = useState(false);
+  const [bollScanProgress, setBollScanProgress] = useState<BollScanProgress | null>(null);
   const [bollLoading, setBollLoading] = useState(false);
   const [selectedBollMatch, setSelectedBollMatch] = useState<BollPatternMatch | null>(null);
   const [bollBars, setBollBars] = useState<Bar[]>([]);
@@ -1001,8 +1022,42 @@ export default function App() {
     }
   };
 
+  const fetchBollScanStatus = async (): Promise<BollScanProgress | null> => {
+    try {
+      const res = await fetch(`${apiBase}/api/jobs/scan-boll-patterns/status`);
+      const json = await res.json();
+      if (json.success && json.data) {
+        const prog = json.data as BollScanProgress;
+        setBollScanProgress(prog);
+        return prog;
+      }
+    } catch {
+      /* 轮询失败不打断 UI */
+    }
+    return null;
+  };
+
   const handleTriggerBollScan = async () => {
     setBollScanning(true);
+    setBollScanProgress({
+      running: true,
+      phase: 'preparing',
+      current: 0,
+      total: 0,
+      scanned: 0,
+      skipped: 0,
+      errors: 0,
+      matches: 0,
+      percent: 0,
+      window_days: bollWindowDays,
+      scan_date: null,
+      current_code: null,
+      message: '正在启动扫描…',
+      started_at: null,
+      finished_at: null,
+      summary: null,
+      error: null,
+    });
     showToast(`布林编排扫描已启动（window_days=${bollWindowDays}）...`);
     try {
       const res = await fetch(`${apiBase}/api/jobs/scan-boll-patterns`, {
@@ -1012,15 +1067,17 @@ export default function App() {
       });
       const json = await res.json();
       if (json.success) {
-        showToast(json.message || '扫描已在后台运行，稍后刷新列表');
-        setTimeout(() => { void fetchBollMatches(); }, 8000);
+        showToast(json.message || '扫描已在后台运行');
+        // 保持 bollScanning=true，由进度轮询在结束后关闭
       } else {
         showToast('启动编排扫描失败：' + (json.error || ''));
+        setBollScanning(false);
+        setBollScanProgress(null);
       }
     } catch {
       showToast('无法连接后端启动编排扫描');
-    } finally {
       setBollScanning(false);
+      setBollScanProgress(null);
     }
   };
 
@@ -1678,8 +1735,65 @@ export default function App() {
     if (activeTab !== 'boll_pattern') return;
     void fetchBollPatterns();
     void fetchBollMatches();
+    // 进入页时若后台已在扫，恢复进度展示
+    void (async () => {
+      const prog = await fetchBollScanStatus();
+      if (prog?.running || prog?.phase === 'preparing' || prog?.phase === 'scanning') {
+        setBollScanning(true);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, apiBase, bollEndWithinDays, bollPatternFilter]);
+
+  // 布林编排扫描进度轮询
+  useEffect(() => {
+    if (!bollScanning) return;
+    let cancelled = false;
+    let seenActive = false;
+
+    const tick = async () => {
+      const prog = await fetchBollScanStatus();
+      if (cancelled || !prog) return;
+
+      const active = prog.running || prog.phase === 'preparing' || prog.phase === 'scanning';
+      if (active) {
+        seenActive = true;
+        return;
+      }
+
+      // 未确认过 active 前，忽略残留的 done/failed（避免误判结束）
+      if (!seenActive) return;
+
+      if (prog.phase === 'done') {
+        setBollScanning(false);
+        const matched = prog.matches ?? (prog.summary as { match_rows_upserted?: number } | null)?.match_rows_upserted;
+        showToast(
+          prog.message ||
+            `编排扫描完成${matched != null ? `，命中 ${matched} 条` : ''}`,
+        );
+        void fetchBollMatches();
+        return;
+      }
+
+      if (prog.phase === 'failed') {
+        setBollScanning(false);
+        showToast('编排扫描失败：' + (prog.error || prog.message || '未知错误'));
+        return;
+      }
+
+      if (prog.phase === 'idle') {
+        setBollScanning(false);
+      }
+    };
+
+    void tick();
+    const interval = setInterval(() => { void tick(); }, 1200);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bollScanning, apiBase]);
 
   // 4.10 渲染高可扩展系统设置 Tab 面板
   const renderSettingsTab = () => {
@@ -2951,7 +3065,7 @@ export default function App() {
                 </div>
                 <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.8rem' }}>
                   <button className="btn-primary" onClick={handleTriggerBollScan} disabled={bollScanning}>
-                    <Play size={14} /> {bollScanning ? '扫描启动中...' : '触发编排扫描'}
+                    <Play size={14} /> {bollScanning ? '扫描进行中...' : '触发编排扫描'}
                   </button>
                   <button
                     className="btn-primary"
@@ -2962,6 +3076,47 @@ export default function App() {
                     <RotateCcw size={14} /> 刷新列表
                   </button>
                 </div>
+                {(bollScanning || (bollScanProgress && bollScanProgress.phase !== 'idle')) && bollScanProgress && (
+                  <div className="boll-scan-progress" style={{ marginBottom: '0.8rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '0.5rem', marginBottom: '0.35rem' }}>
+                      <span style={{ fontSize: '0.78rem', color: 'var(--color-text-muted)' }}>
+                        {bollScanProgress.message || '扫描中…'}
+                        {bollScanProgress.current_code ? ` · ${bollScanProgress.current_code.toUpperCase()}` : ''}
+                      </span>
+                      <span style={{ fontSize: '0.78rem', color: 'var(--color-primary)', fontVariantNumeric: 'tabular-nums' }}>
+                        {bollScanProgress.total > 0
+                          ? `${bollScanProgress.current}/${bollScanProgress.total}（${bollScanProgress.percent}%）`
+                          : bollScanProgress.phase === 'preparing'
+                            ? '准备中'
+                            : bollScanProgress.phase === 'done'
+                              ? '完成'
+                              : ''}
+                      </span>
+                    </div>
+                    <div className="boll-scan-progress-track">
+                      <div
+                        className={`boll-scan-progress-fill${bollScanProgress.phase === 'failed' ? ' failed' : ''}${bollScanning && bollScanProgress.total === 0 ? ' indeterminate' : ''}`}
+                        style={{
+                          width: bollScanProgress.total > 0
+                            ? `${Math.min(100, Math.max(bollScanProgress.percent, bollScanning ? 1 : 0))}%`
+                            : bollScanProgress.phase === 'done'
+                              ? '100%'
+                              : bollScanning
+                                ? '30%'
+                                : '0%',
+                        }}
+                      />
+                    </div>
+                    {(bollScanProgress.scanned > 0 || bollScanProgress.matches > 0 || bollScanProgress.errors > 0) && (
+                      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '0.35rem' }}>
+                        已扫 {bollScanProgress.scanned}
+                        {bollScanProgress.skipped > 0 ? ` · 跳过 ${bollScanProgress.skipped}` : ''}
+                        {` · 命中 ${bollScanProgress.matches}`}
+                        {bollScanProgress.errors > 0 ? ` · 失败 ${bollScanProgress.errors}` : ''}
+                      </p>
+                    )}
+                  </div>
+                )}
                 <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '0.6rem' }}>
                   共 {bollMatchTotal} 条 · 按 score 降序
                 </p>

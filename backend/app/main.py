@@ -1087,6 +1087,23 @@ def put_boll_pattern_settings(payload: BollPatternSettingsPayload):
         return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
 
 
+@app.get("/api/jobs/scan-boll-patterns/status")
+def get_boll_pattern_scan_status():
+    """查询布林编排扫描进度（供前端轮询）。"""
+    try:
+        from backend.app.boll_pattern.scanner import get_scan_progress
+        progress = get_scan_progress()
+        # 与进程锁对齐：锁占用时也视为 running
+        with _BOLL_PATTERN_SCAN_LOCK:
+            locked = IS_BOLL_PATTERN_SCANNING
+        if locked and not progress.get("running"):
+            progress = {**progress, "running": True, "phase": progress.get("phase") or "preparing"}
+        return {"success": True, "data": progress, "error": None}
+    except Exception as e:
+        logger.error(f"查询布林编排扫描状态异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
 @app.post("/api/jobs/scan-boll-patterns")
 def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks: BackgroundTasks):
     """异步触发布林编排扫描（BackgroundTasks），写入 stock_state_daily / pattern_match_result。"""
@@ -1102,6 +1119,13 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
                 "error": "布林编排扫描任务正在运行中，请稍后再试。",
             }
         IS_BOLL_PATTERN_SCANNING = True
+
+    # 立即写入 preparing，避免前端轮询读到上一次 done
+    try:
+        from backend.app.boll_pattern.scanner import begin_scan_progress
+        begin_scan_progress(window_days=payload.window_days, scan_date=payload.scan_date)
+    except Exception as ex:
+        logger.warning("初始化编排扫描进度失败: %s", ex)
 
     def _scan_wrapper():
         global IS_BOLL_PATTERN_SCANNING
@@ -1120,6 +1144,20 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
             logger.info("布林编排后台扫描结束: %s", summary)
         except Exception as ex:
             logger.error(f"布林编排后台扫描异常: {ex}")
+            try:
+                from backend.app.boll_pattern.scanner import get_scan_progress, _update_scan_progress
+                from backend.app.core.timeutil import isoformat_beijing, now_beijing
+                prog = get_scan_progress()
+                if prog.get("running") or prog.get("phase") in ("preparing", "scanning"):
+                    _update_scan_progress(
+                        running=False,
+                        phase="failed",
+                        message=f"扫描失败: {ex}",
+                        finished_at=isoformat_beijing(now_beijing()),
+                        error=str(ex)[:500],
+                    )
+            except Exception:
+                pass
         finally:
             with _BOLL_PATTERN_SCAN_LOCK:
                 IS_BOLL_PATTERN_SCANNING = False
@@ -1128,6 +1166,7 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
     return {
         "success": True,
         "message": f"布林编排扫描已启动（window_days={payload.window_days}）",
+        "data": {"window_days": payload.window_days},
         "error": None,
     }
 

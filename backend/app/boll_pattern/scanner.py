@@ -7,8 +7,9 @@ daily_bars → indicators → %B/zone → stock_state_daily → regex 匹配 →
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import pandas as pd
 from psycopg2.extras import execute_values
@@ -27,6 +28,67 @@ from backend.app.core.timeutil import today_beijing
 from backend.app.market_pipeline import prepare_stock_frame
 
 logger = logging.getLogger("BollPatternScanner")
+
+# 进程内扫描进度（供前端轮询；与 FastAPI BackgroundTasks 同进程）
+_PROGRESS_LOCK = threading.Lock()
+_SCAN_PROGRESS: dict[str, Any] = {
+    "running": False,
+    "phase": "idle",  # idle | preparing | scanning | done | failed
+    "current": 0,
+    "total": 0,
+    "scanned": 0,
+    "skipped": 0,
+    "errors": 0,
+    "matches": 0,
+    "window_days": None,
+    "scan_date": None,
+    "current_code": None,
+    "message": "",
+    "started_at": None,
+    "finished_at": None,
+    "summary": None,
+    "error": None,
+}
+
+
+def get_scan_progress() -> dict[str, Any]:
+    """返回当前编排扫描进度快照。"""
+    with _PROGRESS_LOCK:
+        snap = dict(_SCAN_PROGRESS)
+    total = int(snap.get("total") or 0)
+    current = int(snap.get("current") or 0)
+    snap["percent"] = round(100.0 * current / total, 1) if total > 0 else 0.0
+    return snap
+
+
+def _update_scan_progress(**kwargs: Any) -> None:
+    with _PROGRESS_LOCK:
+        _SCAN_PROGRESS.update(kwargs)
+
+
+def begin_scan_progress(*, window_days: int, scan_date: str | None = None, message: str = "任务已入队，准备扫描…") -> dict[str, Any]:
+    """触发扫描时立即置为 preparing，避免前端读到上一次 done。"""
+    from backend.app.core.timeutil import isoformat_beijing, now_beijing
+
+    _update_scan_progress(
+        running=True,
+        phase="preparing",
+        current=0,
+        total=0,
+        scanned=0,
+        skipped=0,
+        errors=0,
+        matches=0,
+        window_days=window_days,
+        scan_date=scan_date,
+        current_code=None,
+        message=message,
+        started_at=isoformat_beijing(now_beijing()),
+        finished_at=None,
+        summary=None,
+        error=None,
+    )
+    return get_scan_progress()
 
 ENSURE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS stock_state_daily (
@@ -328,12 +390,40 @@ class BollPatternScanner:
         window_days: int = 60,
         codes: Sequence[str] | None = None,
         scan_date: date | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        from backend.app.core.timeutil import isoformat_beijing, now_beijing
+
+        def _emit(**kwargs: Any) -> None:
+            _update_scan_progress(**kwargs)
+            if on_progress is not None:
+                on_progress(get_scan_progress())
+
         self.ensure_tables()
         self.reload_config()
         # 计划默认 60，至少支持 120；其它正整数亦允许便于调试
         if window_days <= 0:
             raise ValueError("window_days 必须 > 0")
+
+        started = isoformat_beijing(now_beijing())
+        _emit(
+            running=True,
+            phase="preparing",
+            current=0,
+            total=0,
+            scanned=0,
+            skipped=0,
+            errors=0,
+            matches=0,
+            window_days=window_days,
+            scan_date=None,
+            current_code=None,
+            message="准备扫描池与编排配置…",
+            started_at=started,
+            finished_at=None,
+            summary=None,
+            error=None,
+        )
 
         end = self.resolve_scan_date(scan_date)
         pool = self.list_candidate_codes(codes)
@@ -352,36 +442,82 @@ class BollPatternScanner:
         scanned = 0
         skipped = 0
         errors = 0
+        n_pool = len(pool)
 
-        for i, code in enumerate(pool, start=1):
-            try:
-                result = self.process_one(code, end, window_days=window_days)
-                if result.get("skipped"):
-                    skipped += 1
-                else:
-                    scanned += 1
-                    total_states += int(result.get("states") or 0)
-                    total_matches += int(result.get("matches") or 0)
-            except Exception as ex:
-                errors += 1
-                logger.error("布林编排扫描失败 code=%s: %s", code, ex)
-            if i % 200 == 0:
-                logger.info("布林编排扫描进度 %d/%d", i, len(pool))
+        _emit(
+            phase="scanning",
+            total=n_pool,
+            scan_date=end.isoformat(),
+            message=f"扫描中 0/{n_pool}",
+        )
 
-        summary = {
-            "scan_date": end.isoformat(),
-            "window_days": window_days,
-            "universe": len(pool),
-            "scanned": scanned,
-            "skipped": skipped,
-            "errors": errors,
-            "state_rows_upserted": total_states,
-            "match_rows_upserted": total_matches,
-            "match_rows_cleared": cleared,
-            "patterns": pattern_ids,
-        }
-        logger.info("布林编排扫描完成: %s", summary)
-        return summary
+        try:
+            for i, code in enumerate(pool, start=1):
+                try:
+                    result = self.process_one(code, end, window_days=window_days)
+                    if result.get("skipped"):
+                        skipped += 1
+                    else:
+                        scanned += 1
+                        total_states += int(result.get("states") or 0)
+                        total_matches += int(result.get("matches") or 0)
+                except Exception as ex:
+                    errors += 1
+                    logger.error("布林编排扫描失败 code=%s: %s", code, ex)
+
+                # 每只更新内存进度；日志仍按 200 节流
+                if i % 200 == 0 or i == n_pool or i == 1:
+                    logger.info("布林编排扫描进度 %d/%d", i, n_pool)
+                if i % 5 == 0 or i == n_pool or i == 1:
+                    _emit(
+                        current=i,
+                        scanned=scanned,
+                        skipped=skipped,
+                        errors=errors,
+                        matches=total_matches,
+                        current_code=code,
+                        message=f"扫描中 {i}/{n_pool}",
+                    )
+
+            summary = {
+                "scan_date": end.isoformat(),
+                "window_days": window_days,
+                "universe": n_pool,
+                "scanned": scanned,
+                "skipped": skipped,
+                "errors": errors,
+                "state_rows_upserted": total_states,
+                "match_rows_upserted": total_matches,
+                "match_rows_cleared": cleared,
+                "patterns": pattern_ids,
+            }
+            finished = isoformat_beijing(now_beijing())
+            _emit(
+                running=False,
+                phase="done",
+                current=n_pool,
+                scanned=scanned,
+                skipped=skipped,
+                errors=errors,
+                matches=total_matches,
+                current_code=None,
+                message=f"扫描完成 {scanned}/{n_pool}，命中 {total_matches} 条",
+                finished_at=finished,
+                summary=summary,
+                error=None,
+            )
+            logger.info("布林编排扫描完成: %s", summary)
+            return summary
+        except Exception as ex:
+            finished = isoformat_beijing(now_beijing())
+            _emit(
+                running=False,
+                phase="failed",
+                message=f"扫描失败: {ex}",
+                finished_at=finished,
+                error=str(ex)[:500],
+            )
+            raise
 
 
 def get_stock_boll_states(code: str, limit: int = 60) -> list[dict]:

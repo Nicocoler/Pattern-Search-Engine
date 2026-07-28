@@ -936,3 +936,32 @@ body {
   word-break: break-all;
   white-space: pre-wrap;
 }
+
+/* 布林编排扫描进度条 */
+.boll-scan-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.18);
+  overflow: hidden;
+}
+
+.boll-scan-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--color-primary), #34d399);
+  transition: width 0.35s ease;
+}
+
+.boll-scan-progress-fill.failed {
+  background: linear-gradient(90deg, #ef4444, #f59e0b);
+}
+
+.boll-scan-progress-fill.indeterminate {
+  animation: boll-scan-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes boll-scan-indeterminate {
+  0% { transform: translateX(-40%); opacity: 0.7; }
+  50% { opacity: 1; }
+  100% { transform: translateX(180%); opacity: 0.7; }
+}
