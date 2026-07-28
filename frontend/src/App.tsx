@@ -66,6 +66,34 @@ interface Bar {
   boll_lower?: number;
 }
 
+interface BollPatternMatch {
+  id: number;
+  code: string;
+  name?: string;
+  pattern_id: string;
+  pattern_name: string;
+  start_date: string;
+  end_date: string;
+  matched_states: string;
+  score: number | null;
+  scan_date: string | null;
+  window_days: number;
+}
+
+interface BollPatternMeta {
+  id: string;
+  name: string;
+  enabled: boolean;
+  regex?: string;
+  min_total_days?: number;
+  zone_thresholds?: Record<string, [string | number, string | number]> | null;
+  denoise_min_len?: number | null;
+  effective?: {
+    zone_thresholds: Record<string, [string | number, string | number]>;
+    denoise_min_len: number;
+  };
+}
+
 interface MatchedEvent {
   event_type: string;
   date: string;
@@ -121,7 +149,7 @@ export default function App() {
   // 2. 状态管理 (State Management)
   // -----------------------------------------------------------------------------
   const [apiBase, setApiBase] = useState('http://localhost:8000');
-  const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings'>('scan');
+  const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern'>('scan');
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -209,6 +237,34 @@ export default function App() {
   const [btEndDate, setBtEndDate] = useState('2026-07-19');
   const [btScoreThreshold, setBtScoreThreshold] = useState(80);
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
+
+  // 布林编排（Pattern）独立页
+  const [bollPatterns, setBollPatterns] = useState<BollPatternMeta[]>([]);
+  const [bollMatches, setBollMatches] = useState<BollPatternMatch[]>([]);
+  const [bollMatchTotal, setBollMatchTotal] = useState(0);
+  const [bollPatternFilter, setBollPatternFilter] = useState('');
+  const [bollEndWithinDays, setBollEndWithinDays] = useState(3);
+  const [bollWindowDays, setBollWindowDays] = useState(60);
+  const [bollScanning, setBollScanning] = useState(false);
+  const [bollLoading, setBollLoading] = useState(false);
+  const [selectedBollMatch, setSelectedBollMatch] = useState<BollPatternMatch | null>(null);
+  const [bollBars, setBollBars] = useState<Bar[]>([]);
+  const [bollStateString, setBollStateString] = useState('');
+  const [bollSettings, setBollSettings] = useState<{
+    zone_thresholds: Record<string, [string | number, string | number]>;
+    denoise_min_len: number;
+  } | null>(null);
+  const [bollShowManage, setBollShowManage] = useState(false);
+  const [bollEditId, setBollEditId] = useState<string | null>(null);
+  const [bollForm, setBollForm] = useState({
+    id: '',
+    name: '',
+    regex: '',
+    min_total_days: 10,
+    enabled: true,
+  });
+  const [bollGlobalDenoise, setBollGlobalDenoise] = useState(0);
+  const [bollGlobalBounds, setBollGlobalBounds] = useState({ m: 0.35, h: 0.65, u: 0.95 });
 
   // -----------------------------------------------------------------------------
   // 3. 通用辅助函数 (Helpers)
@@ -424,6 +480,233 @@ export default function App() {
       showToast('加载扫描记录异常。');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 4.4b 布林编排：列表 / 扫描 / 选中画图
+  const fetchBollPatterns = async () => {
+    try {
+      const res = await fetch(`${apiBase}/api/boll-patterns?include_disabled=true`);
+      const json = await res.json();
+      if (json.success) {
+        setBollPatterns(json.data.patterns || []);
+        if (json.data.settings) {
+          setBollSettings(json.data.settings);
+          const zt = json.data.settings.zone_thresholds || {};
+          setBollGlobalDenoise(Number(json.data.settings.denoise_min_len || 0));
+          setBollGlobalBounds({
+            m: Number(zt.M?.[0] ?? 0.35),
+            h: Number(zt.H?.[0] ?? 0.65),
+            u: Number(zt.U?.[0] ?? 0.95),
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const openNewBollForm = () => {
+    setBollEditId(null);
+    setBollForm({ id: '', name: '', regex: 'L+M{3,}H*U+H*M{3,}', min_total_days: 10, enabled: true });
+    setBollShowManage(true);
+  };
+
+  const openEditBollForm = (p: BollPatternMeta) => {
+    setBollEditId(p.id);
+    setBollForm({
+      id: p.id,
+      name: p.name,
+      regex: p.regex || '',
+      min_total_days: p.min_total_days ?? 0,
+      enabled: p.enabled,
+    });
+    setBollShowManage(true);
+  };
+
+  const handleSaveBollPattern = async () => {
+    try {
+      if (bollEditId) {
+        const res = await fetch(`${apiBase}/api/boll-patterns/${bollEditId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: bollForm.name,
+            regex: bollForm.regex,
+            min_total_days: bollForm.min_total_days,
+            enabled: bollForm.enabled,
+          }),
+        });
+        const json = await res.json();
+        if (!json.success) {
+          showToast('更新编排失败：' + (json.error || ''));
+          return;
+        }
+        showToast('编排已更新');
+      } else {
+        if (!bollForm.id.trim()) {
+          showToast('请填写编排 id');
+          return;
+        }
+        const res = await fetch(`${apiBase}/api/boll-patterns`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bollForm),
+        });
+        const json = await res.json();
+        if (!json.success) {
+          showToast('创建编排失败：' + (json.error || ''));
+          return;
+        }
+        showToast('编排已创建');
+      }
+      setBollShowManage(false);
+      void fetchBollPatterns();
+    } catch {
+      showToast('保存编排失败');
+    }
+  };
+
+  const handleDisableBollPattern = async (id: string) => {
+    try {
+      const res = await fetch(`${apiBase}/api/boll-patterns/${id}/disable`, { method: 'POST' });
+      const json = await res.json();
+      if (!json.success) {
+        showToast('禁用失败：' + (json.error || ''));
+        return;
+      }
+      showToast('已软禁用编排（历史命中保留）');
+      void fetchBollPatterns();
+    } catch {
+      showToast('禁用编排异常');
+    }
+  };
+
+  const handleToggleBollEnabled = async (p: BollPatternMeta, enabled: boolean) => {
+    try {
+      const res = await fetch(`${apiBase}/api/boll-patterns/${p.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const json = await res.json();
+      if (!json.success) {
+        showToast('更新启用状态失败：' + (json.error || ''));
+        return;
+      }
+      void fetchBollPatterns();
+    } catch {
+      showToast('更新启用状态异常');
+    }
+  };
+
+  const handleSaveBollSettings = async () => {
+    try {
+      const zone_thresholds = {
+        L: ['-inf', bollGlobalBounds.m],
+        M: [bollGlobalBounds.m, bollGlobalBounds.h],
+        H: [bollGlobalBounds.h, bollGlobalBounds.u],
+        U: [bollGlobalBounds.u, 'inf'],
+      };
+      const res = await fetch(`${apiBase}/api/boll-pattern-settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          zone_thresholds,
+          denoise_min_len: bollGlobalDenoise,
+        }),
+      });
+      const json = await res.json();
+      if (!json.success) {
+        showToast('保存全局尺子失败：' + (json.error || ''));
+        return;
+      }
+      showToast('全局尺子已保存（下次扫描生效）');
+      void fetchBollPatterns();
+    } catch {
+      showToast('保存全局尺子异常');
+    }
+  };
+
+  const fetchBollMatches = async () => {
+    setBollLoading(true);
+    try {
+      const qs = new URLSearchParams({
+        end_within_days: String(bollEndWithinDays),
+        order_by: 'score',
+        limit: '100',
+      });
+      if (bollPatternFilter) qs.set('pattern_id', bollPatternFilter);
+      const res = await fetch(`${apiBase}/api/boll-pattern-matches?${qs}`);
+      const json = await res.json();
+      if (json.success) {
+        const items: BollPatternMatch[] = json.data.items || [];
+        setBollMatches(items);
+        setBollMatchTotal(json.data.total || 0);
+        if (items.length > 0) {
+          void handleSelectBollMatch(items[0]);
+        } else {
+          setSelectedBollMatch(null);
+          setBollBars([]);
+          setBollStateString('');
+        }
+      } else {
+        showToast('拉取编排命中失败：' + (json.error || ''));
+      }
+    } catch {
+      showToast('拉取编排命中异常，请检查后端。');
+    } finally {
+      setBollLoading(false);
+    }
+  };
+
+  const handleTriggerBollScan = async () => {
+    setBollScanning(true);
+    showToast(`布林编排扫描已启动（window_days=${bollWindowDays}）...`);
+    try {
+      const res = await fetch(`${apiBase}/api/jobs/scan-boll-patterns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ window_days: bollWindowDays }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        showToast(json.message || '扫描已在后台运行，稍后刷新列表');
+        setTimeout(() => { void fetchBollMatches(); }, 8000);
+      } else {
+        showToast('启动编排扫描失败：' + (json.error || ''));
+      }
+    } catch {
+      showToast('无法连接后端启动编排扫描');
+    } finally {
+      setBollScanning(false);
+    }
+  };
+
+  const handleSelectBollMatch = async (m: BollPatternMatch) => {
+    setSelectedBollMatch(m);
+    setBollLoading(true);
+    try {
+      const [barsRes, stateRes] = await Promise.all([
+        fetch(`${apiBase}/api/stocks/${m.code}/bars?end_date=${m.end_date}&lookback_days=120`),
+        fetch(`${apiBase}/api/stocks/${m.code}/boll-states?limit=60`),
+      ]);
+      const barsJson = await barsRes.json();
+      const stateJson = await stateRes.json();
+      if (barsJson.success) {
+        setBollBars(barsJson.data.bars || []);
+      } else {
+        setBollBars([]);
+        showToast('加载 K 线失败：' + (barsJson.error || ''));
+      }
+      if (stateJson.success) {
+        setBollStateString(stateJson.data.state_string || '');
+      }
+    } catch {
+      showToast('加载编排个股图表异常');
+      setBollBars([]);
+    } finally {
+      setBollLoading(false);
     }
   };
 
@@ -1050,6 +1333,13 @@ export default function App() {
     return () => clearInterval(interval);
   }, [activeTab, syncing, syncingToday, apiBase]);
 
+  useEffect(() => {
+    if (activeTab !== 'boll_pattern') return;
+    void fetchBollPatterns();
+    void fetchBollMatches();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, apiBase, bollEndWithinDays, bollPatternFilter]);
+
   // 4.10 渲染高可扩展系统设置 Tab 面板
   const renderSettingsTab = () => {
     return (
@@ -1359,6 +1649,97 @@ export default function App() {
           lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.8 }
         }
       ]
+    };
+  };
+
+  // 5.0b 布林编排页：单股 K 线 + 布林 + 命中区间 markArea
+  const getBollPatternChartOption = () => {
+    if (!bollBars.length || !selectedBollMatch) return {};
+    const xAxisDates = bollBars.map(b => b.date);
+    const klineData = bollBars.map(b => [b.open, b.close, b.low, b.high]);
+    const bollMid = bollBars.map(b => b.boll_mid ?? null);
+    const bollUpper = bollBars.map(b => b.boll_upper ?? null);
+    const bollLower = bollBars.map(b => b.boll_lower ?? null);
+    const start = selectedBollMatch.start_date;
+    const end = selectedBollMatch.end_date;
+
+    return {
+      title: {
+        text: `布林编排 · ${selectedBollMatch.code.toUpperCase()} ${selectedBollMatch.name || ''}`,
+        subtext: `${selectedBollMatch.pattern_name} | ${start} ~ ${end} | score ${selectedBollMatch.score ?? '—'}`,
+        textStyle: { color: '#f1f5f9', fontSize: 13, fontWeight: 'bold' },
+        subtextStyle: { color: '#94a3b8', fontSize: 11 },
+        left: 'left',
+        top: 0,
+      },
+      backgroundColor: 'transparent',
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'cross' },
+        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+        borderColor: 'rgba(255,255,255,0.12)',
+        textStyle: { color: '#e2e8f0', fontSize: 11 },
+      },
+      legend: {
+        data: ['日K', 'BOLL-M', 'UB', 'LB'],
+        textStyle: { color: '#94a3b8', fontSize: 10 },
+        bottom: 5,
+        left: 'center',
+      },
+      grid: { left: '5%', right: '5%', top: '18%', bottom: '15%' },
+      xAxis: {
+        type: 'category',
+        data: xAxisDates,
+        axisLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.1)' } },
+        axisLabel: { color: '#94a3b8', fontSize: 10 },
+      },
+      yAxis: {
+        type: 'value',
+        scale: true,
+        axisLabel: { color: '#94a3b8', fontSize: 10, formatter: '￥{value}' },
+        splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } },
+      },
+      series: [
+        {
+          name: '日K',
+          type: 'candlestick',
+          data: klineData,
+          itemStyle: {
+            color: '#ef4444',
+            color0: '#10b981',
+            borderColor: '#ef4444',
+            borderColor0: '#10b981',
+          },
+          markArea: {
+            itemStyle: { color: 'rgba(56, 189, 248, 0.12)' },
+            data: [[{ xAxis: start }, { xAxis: end }]],
+          },
+        },
+        {
+          name: 'BOLL-M',
+          type: 'line',
+          data: bollMid,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#e2e8f0', width: 1.5, opacity: 0.8 },
+        },
+        {
+          name: 'UB',
+          type: 'line',
+          data: bollUpper,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#f59e0b', width: 1.5, opacity: 0.8 },
+        },
+        {
+          name: 'LB',
+          type: 'line',
+          data: bollLower,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.8 },
+        },
+      ],
     };
   };
 
@@ -1703,6 +2084,12 @@ export default function App() {
           <BarChart2 size={16} /> 历史形态滚动仿真回测
         </button>
         <button
+          className={`tab-btn ${activeTab === 'boll_pattern' ? 'active' : ''}`}
+          onClick={() => setActiveTab('boll_pattern')}
+        >
+          <Sparkles size={16} /> 布林编排
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'templates' ? 'active' : ''}`}
           onClick={() => setActiveTab('templates')}
         >
@@ -1717,10 +2104,10 @@ export default function App() {
       </nav>
 
       {/* 6.4 内容主体布局 */}
-      <main className={(activeTab === 'templates' || activeTab === 'settings') ? 'full-width-grid' : 'dashboard-grid'}>
+      <main className={(activeTab === 'templates' || activeTab === 'settings' || activeTab === 'boll_pattern') ? 'full-width-grid' : 'dashboard-grid'}>
 
-        {/* 左侧控制栏 (除模板管理、系统设置外) */}
-        {(activeTab !== 'templates' && activeTab !== 'settings') && (
+        {/* 左侧控制栏 (除模板管理、系统设置、布林编排外) */}
+        {(activeTab !== 'templates' && activeTab !== 'settings' && activeTab !== 'boll_pattern') && (
           <aside className="panel-card">
             <h2 className="panel-title">研盘控制核心</h2>
 
@@ -2153,6 +2540,260 @@ export default function App() {
                 </div>
               )}
             </>
+          )}
+
+          {/* ==================== 2b. 布林编排 Tab ==================== */}
+          {activeTab === 'boll_pattern' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', width: '100%' }}>
+            <div className="boll-pattern-layout" style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 1fr) minmax(420px, 1.4fr)', gap: '1rem', width: '100%' }}>
+              <div className="data-card" style={{ padding: '1rem' }}>
+                <h2 className="panel-title" style={{ marginBottom: '0.8rem' }}>布林编排命中</h2>
+                <div className="form-group">
+                  <label>编排筛选</label>
+                  <select
+                    value={bollPatternFilter}
+                    onChange={(e) => setBollPatternFilter(e.target.value)}
+                  >
+                    <option value="">全部 enabled 编排</option>
+                    {bollPatterns.filter(p => p.enabled).map(p => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>end_within_days（0=全量）</label>
+                  <select
+                    value={bollEndWithinDays}
+                    onChange={(e) => setBollEndWithinDays(Number(e.target.value))}
+                  >
+                    <option value={3}>近 3 个交易日结束</option>
+                    <option value={1}>仅当日结束</option>
+                    <option value={0}>全量历史命中</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>扫描窗口 window_days</label>
+                  <select
+                    value={bollWindowDays}
+                    onChange={(e) => setBollWindowDays(Number(e.target.value))}
+                  >
+                    <option value={60}>60</option>
+                    <option value={120}>120</option>
+                  </select>
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.8rem' }}>
+                  <button className="btn-primary" onClick={handleTriggerBollScan} disabled={bollScanning}>
+                    <Play size={14} /> {bollScanning ? '扫描启动中...' : '触发编排扫描'}
+                  </button>
+                  <button
+                    className="btn-primary"
+                    style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
+                    onClick={() => { void fetchBollMatches(); }}
+                    disabled={bollLoading}
+                  >
+                    <RotateCcw size={14} /> 刷新列表
+                  </button>
+                </div>
+                <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '0.6rem' }}>
+                  共 {bollMatchTotal} 条 · 按 score 降序
+                </p>
+                {bollLoading && bollMatches.length === 0 ? (
+                  <div className="loading-wrapper"><div className="spinner" /></div>
+                ) : bollMatches.length === 0 ? (
+                  <div className="empty-wrapper" style={{ padding: '1.5rem 0' }}>
+                    <AlertTriangle size={24} color="#f59e0b" />
+                    <p style={{ fontSize: '0.85rem' }}>暂无命中。可先触发编排扫描，或将 end_within_days 设为 0。</p>
+                  </div>
+                ) : (
+                  <div className="table-wrapper" style={{ maxHeight: '42vh', overflow: 'auto' }}>
+                    <table className="scan-table">
+                      <thead>
+                        <tr>
+                          <th>代码</th>
+                          <th>编排</th>
+                          <th>区间</th>
+                          <th>分</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {bollMatches.map(m => (
+                          <tr
+                            key={m.id}
+                            className={selectedBollMatch?.id === m.id ? 'active-row' : ''}
+                            onClick={() => { void handleSelectBollMatch(m); }}
+                            style={{ cursor: 'pointer' }}
+                          >
+                            <td>
+                              <div style={{ fontWeight: 700, fontFamily: 'monospace' }}>{m.code.toUpperCase()}</div>
+                              <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{m.name || ''}</div>
+                            </td>
+                            <td style={{ fontSize: '0.75rem' }}>{m.pattern_name}</td>
+                            <td style={{ fontSize: '0.72rem', fontFamily: 'monospace' }}>
+                              {m.start_date}<br />~ {m.end_date}
+                            </td>
+                            <td>
+                              <span className="score-badge">
+                                {m.score != null ? m.score.toFixed(1) : '—'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              <div className="data-card" style={{ padding: '1rem', minHeight: '480px' }}>
+                {!selectedBollMatch ? (
+                  <div className="empty-wrapper">
+                    <Info size={28} color="#94a3b8" />
+                    <p>选择左侧命中行，查看布林 K 线与高亮区间。</p>
+                  </div>
+                ) : (
+                  <>
+                    <ReactECharts
+                      option={getBollPatternChartOption()}
+                      style={{ height: '420px', width: '100%' }}
+                      notMerge
+                    />
+                    <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                      <div><b>命中状态串</b>：<code style={{ color: '#e2e8f0' }}>{selectedBollMatch.matched_states}</code></div>
+                      {bollStateString && (
+                        <div style={{ marginTop: '0.4rem', wordBreak: 'break-all' }}>
+                          <b>近 60 日 zone</b>：<code style={{ color: '#94a3b8' }}>{bollStateString}</code>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* 编排管理：全局尺子 + CRUD */}
+            <div className="data-card" style={{ padding: '1rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.8rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <h2 className="panel-title" style={{ margin: 0 }}>编排管理（自定义）</h2>
+                <button className="btn-primary" onClick={openNewBollForm}>
+                  <Sparkles size={14} /> 新建编排
+                </button>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem', marginBottom: '1rem' }}>
+                <div>
+                  <h3 style={{ fontSize: '0.85rem', marginBottom: '0.5rem', color: 'var(--color-text-main)' }}>全局尺子</h3>
+                  <div className="form-group">
+                    <label>M 下界 / H 下界 / U 下界（L&lt;m&lt;h&lt;u）</label>
+                    <div style={{ display: 'flex', gap: '0.4rem' }}>
+                      <input type="number" step={0.01} value={bollGlobalBounds.m} onChange={e => setBollGlobalBounds(b => ({ ...b, m: Number(e.target.value) }))} />
+                      <input type="number" step={0.01} value={bollGlobalBounds.h} onChange={e => setBollGlobalBounds(b => ({ ...b, h: Number(e.target.value) }))} />
+                      <input type="number" step={0.01} value={bollGlobalBounds.u} onChange={e => setBollGlobalBounds(b => ({ ...b, u: Number(e.target.value) }))} />
+                    </div>
+                  </div>
+                  <div className="form-group">
+                    <label>denoise_min_len（0=关闭）</label>
+                    <input type="number" min={0} value={bollGlobalDenoise} onChange={e => setBollGlobalDenoise(Number(e.target.value))} />
+                  </div>
+                  <button className="btn-primary" onClick={handleSaveBollSettings}>保存全局尺子</button>
+                  {bollSettings && (
+                    <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '0.4rem' }}>
+                      当前 denoise={bollSettings.denoise_min_len}
+                    </p>
+                  )}
+                </div>
+
+                {bollShowManage && (
+                  <div>
+                    <h3 style={{ fontSize: '0.85rem', marginBottom: '0.5rem' }}>
+                      {bollEditId ? `编辑编排（id 不可改）` : '新建编排'}
+                    </h3>
+                    {!bollEditId && (
+                      <div className="form-group">
+                        <label>id</label>
+                        <input value={bollForm.id} onChange={e => setBollForm(f => ({ ...f, id: e.target.value.trim() }))} placeholder="my_pattern_id" />
+                      </div>
+                    )}
+                    <div className="form-group">
+                      <label>名称</label>
+                      <input value={bollForm.name} onChange={e => setBollForm(f => ({ ...f, name: e.target.value }))} />
+                    </div>
+                    <div className="form-group">
+                      <label>regex（例 L+M{'{3,}'}H*U+H*M{'{3,}'}）</label>
+                      <input value={bollForm.regex} onChange={e => setBollForm(f => ({ ...f, regex: e.target.value }))} style={{ fontFamily: 'monospace' }} />
+                    </div>
+                    <div className="form-group">
+                      <label>min_total_days</label>
+                      <input type="number" value={bollForm.min_total_days} onChange={e => setBollForm(f => ({ ...f, min_total_days: Number(e.target.value) }))} />
+                    </div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.6rem' }}>
+                      <input type="checkbox" checked={bollForm.enabled} onChange={e => setBollForm(f => ({ ...f, enabled: e.target.checked }))} />
+                      启用（参与扫描）
+                    </label>
+                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                      <button className="btn-primary" onClick={handleSaveBollPattern}>保存</button>
+                      <button
+                        className="btn-primary"
+                        style={{ background: 'transparent', border: '1px solid var(--border-color)', boxShadow: 'none' }}
+                        onClick={() => setBollShowManage(false)}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="table-wrapper" style={{ maxHeight: '240px', overflow: 'auto' }}>
+                <table className="scan-table">
+                  <thead>
+                    <tr>
+                      <th>id</th>
+                      <th>名称</th>
+                      <th>启用</th>
+                      <th>regex</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bollPatterns.map(p => (
+                      <tr key={p.id}>
+                        <td style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{p.id}</td>
+                        <td>{p.name}</td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={p.enabled}
+                            onChange={e => { void handleToggleBollEnabled(p, e.target.checked); }}
+                          />
+                        </td>
+                        <td style={{ fontFamily: 'monospace', fontSize: '0.7rem', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {p.regex}
+                        </td>
+                        <td>
+                          <button
+                            className="btn-primary"
+                            style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', marginRight: '0.3rem' }}
+                            onClick={() => openEditBollForm(p)}
+                          >
+                            编辑
+                          </button>
+                          {p.enabled && (
+                            <button
+                              className="btn-primary"
+                              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', background: 'rgba(239,68,68,0.2)', boxShadow: 'none' }}
+                              onClick={() => { void handleDisableBollPattern(p.id); }}
+                            >
+                              禁用
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            </div>
           )}
 
           {/* ==================== 3. 形态模板自学习自更新 Tab ==================== */}

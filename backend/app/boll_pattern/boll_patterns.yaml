@@ -1,0 +1,20 @@
+zone_thresholds:
+  L: ["-inf", 0.35]
+  M: [0.35, 0.65]
+  H: [0.65, 0.95]
+  U: [0.95, "inf"]
+
+denoise_min_len: 0
+
+patterns:
+  - id: breakout_upper_pullback_mid
+    name: "中轨突破-上轨突破-回落中轨横盘"
+    regex: "L+M{3,}H*U+H*M{3,}"
+    min_total_days: 10
+    enabled: true
+
+  - id: lower_rebound_mid_flat_retest
+    name: "下轨反弹-中轨横盘-再次探底"
+    regex: "U*H*M{3,}L+M{2,}L+"
+    min_total_days: 8
+    enabled: true

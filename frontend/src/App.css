@@ -882,3 +882,13 @@ body {
   color: var(--color-text-muted);
   line-height: 1.4;
 }
+
+.boll-pattern-layout {
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .boll-pattern-layout {
+    grid-template-columns: 1fr !important;
+  }
+}

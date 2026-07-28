@@ -220,7 +220,7 @@ def list_scheduler_status(task_name="PSE_DailyDataSync"):
     print(os.popen(cmd).read())
 
 
-def run_sync(full=False, max_workers=8):
+def run_sync(full=False, max_workers=8, skip_boll_scan=False):
     lock = DaemonLock(PID_FILE)
     if not lock.acquire():
         return 1
@@ -263,10 +263,24 @@ def run_sync(full=False, max_workers=8):
         logger.info("=" * 60)
         logger.info(f"✅ 同步完成 | 耗时: {elapsed:.1f}s")
         logger.info("=" * 60)
+
+        boll_summary = None
+        if skip_boll_scan:
+            logger.info("已跳过同步下游布林编排扫描（--skip-boll-scan）")
+        else:
+            try:
+                from backend.app.boll_pattern.scanner import run_post_sync_boll_scan
+                logger.info("开始同步下游布林编排扫描 window_days=60 ...")
+                boll_summary = run_post_sync_boll_scan(window_days=60)
+            except Exception as boll_ex:
+                logger.error(f"同步下游布林编排扫描异常（不影响同步成功）: {boll_ex}")
+
         summary = {
             "success": True, "pid": os.getpid(),
             "mode": "full" if full else "incremental",
             "duration_sec": round(elapsed, 2),
+            "boll_pattern_scan": boll_summary,
+            "boll_pattern_scan_skipped": skip_boll_scan,
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
@@ -289,6 +303,11 @@ def main():
     parser.add_argument("--uninstall-scheduler", action="store_true", help="卸载 Windows 计划任务")
     parser.add_argument("--query-scheduler", action="store_true", help="查询计划任务状态")
     parser.add_argument("--scheduler-time", type=str, default="16:00", help="计划任务执行时间 HH:MM")
+    parser.add_argument(
+        "--skip-boll-scan",
+        action="store_true",
+        help="同步成功后跳过布林编排扫描（首次全量拉数时可使用）",
+    )
     args = parser.parse_args()
 
     if args.status:
@@ -304,7 +323,11 @@ def main():
     if args.query_scheduler:
         list_scheduler_status()
         return
-    exit_code = run_sync(full=args.full, max_workers=args.max_workers)
+    exit_code = run_sync(
+        full=args.full,
+        max_workers=args.max_workers,
+        skip_boll_scan=args.skip_boll_scan,
+    )
     sys.exit(exit_code)
 
 

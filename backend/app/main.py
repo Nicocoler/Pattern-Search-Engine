@@ -74,6 +74,12 @@ async def lifespan(app: FastAPI):
     logger.info("⚡ PSE API 接口微服务正在启动，启动预先初始化检查...")
     tpl_manager = TemplateManager()
     tpl_manager.init_default_templates()
+    try:
+        from backend.app.boll_pattern.repository import seed_from_yaml
+        seed_info = seed_from_yaml()
+        logger.info("⚡ 布林编排种子补缺完成: %s", seed_info)
+    except Exception as ex:
+        logger.warning("布林编排种子补缺跳过（库可能未就绪）: %s", ex)
     logger.info("⚡ 预设特征模板状态检查通过，准备对外倾泄行情计算服务！")
     yield
     db.closeall()
@@ -131,6 +137,40 @@ class SyncMarketDataPayload(BaseModel):
     retry_limit: int = Field(default=3, example=3)
     delay_min: int = Field(default=100, example=100)
     delay_max: int = Field(default=300, example=300)
+
+class BollPatternScanPayload(BaseModel):
+    window_days: int = Field(default=60, example=60, description="匹配窗口交易日数，默认60，常用60/120")
+    codes: list[str] | None = Field(default=None, example=None, description="可选股票子集；为空则扫非ST非停牌全市场")
+    scan_date: str | None = Field(default=None, example=None, description="扫描截止日 YYYY-MM-DD；默认取 daily_bars 最大日期")
+
+class BollPatternCreatePayload(BaseModel):
+    id: str = Field(..., description="编排唯一 id，创建后不可改")
+    name: str = Field(...)
+    regex: str = Field(...)
+    min_total_days: int = Field(default=0)
+    enabled: bool = Field(default=True)
+    zone_thresholds: dict | None = Field(default=None, description="稀疏覆盖；null 用全局")
+    denoise_min_len: int | None = Field(default=None, description="稀疏覆盖；null 用全局")
+
+class BollPatternUpdatePayload(BaseModel):
+    name: str | None = None
+    regex: str | None = None
+    min_total_days: int | None = None
+    enabled: bool | None = None
+    zone_thresholds: dict | None = Field(
+        default=None,
+        description="传入 dict 覆盖；显式 JSON null 可清空覆盖（用全局）",
+    )
+    denoise_min_len: int | None = Field(
+        default=None,
+        description="传入 int 覆盖；需清空时配合 clear_denoise_override",
+    )
+    clear_zone_override: bool = Field(default=False, description="为 true 时清空 zone 覆盖")
+    clear_denoise_override: bool = Field(default=False, description="为 true 时清空 denoise 覆盖")
+
+class BollPatternSettingsPayload(BaseModel):
+    zone_thresholds: dict | None = None
+    denoise_min_len: int | None = None
 
 # 辅助数据库连接（走统一连接池，返回字典游标）
 def get_db_connection():
@@ -510,6 +550,7 @@ def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: B
         def sync_task_wrapper():
             global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
             logger.info(f"🔒 [Sync Guard Gen {current_task_gen_id}] 新世代同步实例已安全落锁起飞。")
+            sync_ok = False
             try:
                 sync_engine = DataCenterSync(
                     max_concurrent=payload.max_workers,
@@ -518,6 +559,7 @@ def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: B
                     delay_max=payload.delay_max
                 )
                 sync_engine.sync_all_daily_bars(max_workers=payload.max_workers)
+                sync_ok = True
             except Exception as ex:
                 logger.error(f"❌ 后台行情拉取异步任务执行发生未捕获异常: {ex}")
             finally:
@@ -527,6 +569,8 @@ def trigger_market_data_sync(payload: SyncMarketDataPayload, background_tasks: B
                         IS_SYNCING_LOCKED = False
                         LAST_ACTIVE_PAYLOAD = None
                         logger.info(f"🔓 [Sync Guard Gen {current_task_gen_id}] 全局行情增量同步运行锁已安全释放。")
+            if sync_ok:
+                _trigger_post_sync_boll_scan()
 
         background_tasks.add_task(sync_task_wrapper)
 
@@ -585,6 +629,7 @@ def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: Ba
         def sync_task_wrapper():
             global IS_SYNCING_LOCKED, LAST_ACTIVE_PAYLOAD
             logger.info(f"[Sync Guard Gen {current_task_gen_id}] 当日数据同步实例已安全落锁起飞。")
+            sync_ok = False
             try:
                 sync_engine = DataCenterSync(
                     max_concurrent=payload.max_workers,
@@ -593,6 +638,7 @@ def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: Ba
                     delay_max=payload.delay_max
                 )
                 sync_engine.sync_today_data(max_workers=payload.max_workers)
+                sync_ok = True
             except Exception as ex:
                 logger.error(f"后台当日数据同步任务执行发生未捕获异常: {ex}")
             finally:
@@ -601,6 +647,8 @@ def trigger_today_data_sync(payload: SyncMarketDataPayload, background_tasks: Ba
                         IS_SYNCING_LOCKED = False
                         LAST_ACTIVE_PAYLOAD = None
                         logger.info(f"[Sync Guard Gen {current_task_gen_id}] 全局当日数据同步运行锁已安全释放。")
+            if sync_ok:
+                _trigger_post_sync_boll_scan()
 
         background_tasks.add_task(sync_task_wrapper)
 
@@ -863,6 +911,409 @@ def get_server_logs(lines: int = Query(20, description="读取的尾部日志行
         return {"success": True, "data": {"logs": tail_lines}, "error": None}
     except Exception as e:
         logger.error(f"读取服务端日志异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+# -------------------------------------------------------------------------
+# 5. 布林编排（Pattern）独立 API — 与 DTW 模板扫描并行，不改 search-runs
+# -------------------------------------------------------------------------
+IS_BOLL_PATTERN_SCANNING = False
+_BOLL_PATTERN_SCAN_LOCK = threading.Lock()
+
+
+def _trigger_post_sync_boll_scan(window_days: int = 60) -> None:
+    """行情同步成功后触发编排扫描；与手动 scan job 共用锁，失败仅记日志。"""
+    global IS_BOLL_PATTERN_SCANNING
+    with _BOLL_PATTERN_SCAN_LOCK:
+        if IS_BOLL_PATTERN_SCANNING:
+            logger.info("布林编排扫描已在运行，跳过同步下游触发。")
+            return
+        IS_BOLL_PATTERN_SCANNING = True
+    try:
+        from backend.app.boll_pattern.scanner import run_post_sync_boll_scan
+        logger.info("同步成功，启动下游布林编排扫描 window_days=%s", window_days)
+        run_post_sync_boll_scan(window_days=window_days)
+    except Exception as ex:
+        logger.error("同步下游布林编排扫描异常: %s", ex)
+    finally:
+        with _BOLL_PATTERN_SCAN_LOCK:
+            IS_BOLL_PATTERN_SCANNING = False
+
+
+@app.get("/api/boll-patterns")
+def list_boll_patterns(include_disabled: bool = Query(True, description="是否包含已禁用编排")):
+    """列出库中布林编排（权威源）；附带 effective 合并结果。"""
+    try:
+        from backend.app.boll_pattern.loader import thresholds_to_jsonable
+        from backend.app.boll_pattern.repository import (
+            get_settings,
+            list_patterns,
+            seed_from_yaml,
+            serialize_pattern_for_api,
+        )
+        seed_from_yaml()
+        settings = get_settings()
+        patterns = list_patterns(include_disabled=include_disabled)
+        return {
+            "success": True,
+            "data": {
+                "patterns": [serialize_pattern_for_api(p, settings) for p in patterns],
+                "enabled_count": sum(1 for p in patterns if p.get("enabled")),
+                "settings": {
+                    "zone_thresholds": thresholds_to_jsonable(settings["zone_thresholds"]),
+                    "denoise_min_len": settings["denoise_min_len"],
+                },
+            },
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"列出布林编排异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.post("/api/boll-patterns")
+def create_boll_pattern(payload: BollPatternCreatePayload):
+    """新建编排（id 唯一且此后不可改）。"""
+    try:
+        from backend.app.boll_pattern.repository import create_pattern, get_settings, serialize_pattern_for_api
+        row = create_pattern(payload.model_dump())
+        return {
+            "success": True,
+            "data": serialize_pattern_for_api(row, get_settings()),
+            "error": None,
+        }
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"创建布林编排异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.put("/api/boll-patterns/{pattern_id}")
+def update_boll_pattern(pattern_id: str, payload: BollPatternUpdatePayload):
+    """更新编排；不可改 id。无物理删除，用 enabled=false 软禁用。"""
+    try:
+        from backend.app.boll_pattern.repository import (
+            get_settings,
+            serialize_pattern_for_api,
+            update_pattern,
+        )
+        data = payload.model_dump(exclude_unset=True)
+        clear_zone = data.pop("clear_zone_override", False)
+        clear_denoise = data.pop("clear_denoise_override", False)
+        if clear_zone:
+            data["zone_thresholds"] = None
+        if clear_denoise:
+            data["denoise_min_len"] = None
+        # 未传且未 clear 的覆盖字段不要误写成 None
+        if "zone_thresholds" not in data and not clear_zone:
+            data.pop("zone_thresholds", None)
+        if "denoise_min_len" not in data and not clear_denoise:
+            data.pop("denoise_min_len", None)
+        row = update_pattern(pattern_id, data)
+        return {
+            "success": True,
+            "data": serialize_pattern_for_api(row, get_settings()),
+            "error": None,
+        }
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"更新布林编排异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.post("/api/boll-patterns/{pattern_id}/disable")
+def disable_boll_pattern(pattern_id: str):
+    """软禁用编排（不物理删除，历史命中保留）。"""
+    try:
+        from backend.app.boll_pattern.repository import (
+            disable_pattern,
+            get_settings,
+            serialize_pattern_for_api,
+        )
+        row = disable_pattern(pattern_id)
+        return {
+            "success": True,
+            "data": serialize_pattern_for_api(row, get_settings()),
+            "error": None,
+        }
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"禁用布林编排异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.get("/api/boll-pattern-settings")
+def get_boll_pattern_settings():
+    """全局分区尺子。"""
+    try:
+        from backend.app.boll_pattern.loader import thresholds_to_jsonable
+        from backend.app.boll_pattern.repository import get_settings, seed_from_yaml
+        seed_from_yaml()
+        s = get_settings()
+        return {
+            "success": True,
+            "data": {
+                "zone_thresholds": thresholds_to_jsonable(s["zone_thresholds"]),
+                "denoise_min_len": s["denoise_min_len"],
+            },
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"读取编排全局设置异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.put("/api/boll-pattern-settings")
+def put_boll_pattern_settings(payload: BollPatternSettingsPayload):
+    """更新全局分区尺子；下次扫描生效。"""
+    try:
+        from backend.app.boll_pattern.loader import thresholds_to_jsonable
+        from backend.app.boll_pattern.repository import update_settings
+        s = update_settings(payload.zone_thresholds, payload.denoise_min_len)
+        return {
+            "success": True,
+            "data": {
+                "zone_thresholds": thresholds_to_jsonable(s["zone_thresholds"]),
+                "denoise_min_len": s["denoise_min_len"],
+            },
+            "error": None,
+        }
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"更新编排全局设置异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.post("/api/jobs/scan-boll-patterns")
+def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks: BackgroundTasks):
+    """异步触发布林编排扫描（BackgroundTasks），写入 stock_state_daily / pattern_match_result。"""
+    global IS_BOLL_PATTERN_SCANNING
+    if payload.window_days <= 0:
+        return {"success": False, "data": None, "error": "window_days 必须 > 0"}
+
+    with _BOLL_PATTERN_SCAN_LOCK:
+        if IS_BOLL_PATTERN_SCANNING:
+            return {
+                "success": False,
+                "data": None,
+                "error": "布林编排扫描任务正在运行中，请稍后再试。",
+            }
+        IS_BOLL_PATTERN_SCANNING = True
+
+    def _scan_wrapper():
+        global IS_BOLL_PATTERN_SCANNING
+        try:
+            from datetime import datetime as _dt
+            from backend.app.boll_pattern.scanner import BollPatternScanner
+            scan_day = None
+            if payload.scan_date:
+                scan_day = _dt.strptime(payload.scan_date, "%Y-%m-%d").date()
+            scanner = BollPatternScanner()
+            summary = scanner.run_scan(
+                window_days=payload.window_days,
+                codes=payload.codes,
+                scan_date=scan_day,
+            )
+            logger.info("布林编排后台扫描结束: %s", summary)
+        except Exception as ex:
+            logger.error(f"布林编排后台扫描异常: {ex}")
+        finally:
+            with _BOLL_PATTERN_SCAN_LOCK:
+                IS_BOLL_PATTERN_SCANNING = False
+
+    background_tasks.add_task(_scan_wrapper)
+    return {
+        "success": True,
+        "message": f"布林编排扫描已启动（window_days={payload.window_days}）",
+        "error": None,
+    }
+
+
+@app.get("/api/boll-pattern-matches")
+def get_boll_pattern_matches(
+    pattern_id: str | None = Query(None, description="编排 id 过滤"),
+    end_within_days: int | None = Query(
+        3,
+        description="仅保留 end_date 落在最近 N 个交易日内；传 0 表示不过滤（全量）",
+    ),
+    scan_date: str | None = Query(None, description="按 scan_date 过滤 YYYY-MM-DD"),
+    order_by: str = Query("score", description="排序：score（默认）或 end_date"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """查询编排命中；默认 end_within_days=3（进行中/刚完成）。"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # 幂等建表，避免未跑过扫描时查询失败
+        from backend.app.boll_pattern.scanner import BollPatternScanner
+        BollPatternScanner().ensure_tables()
+
+        clauses = ["1=1"]
+        params: list = []
+        if pattern_id:
+            clauses.append("m.pattern_id = %s")
+            params.append(pattern_id)
+        if scan_date:
+            clauses.append("m.scan_date = %s")
+            params.append(scan_date)
+
+        # end_within_days: None 或 >0 过滤；0 不过滤
+        if end_within_days is not None and end_within_days > 0:
+            cursor.execute(
+                """
+                SELECT DISTINCT date FROM daily_bars
+                ORDER BY date DESC LIMIT %s;
+                """,
+                (end_within_days,),
+            )
+            day_rows = cursor.fetchall()
+            if not day_rows:
+                return {"success": True, "data": {"items": [], "total": 0}, "error": None}
+            cutoff_dates = [r["date"] for r in day_rows]
+            clauses.append("m.end_date = ANY(%s)")
+            params.append(cutoff_dates)
+
+        where_sql = " AND ".join(clauses)
+        if order_by == "end_date":
+            order_sql = "m.end_date DESC, m.code ASC"
+        else:
+            # 默认按 score 降序，空分靠后，同分再按 end_date
+            order_sql = "m.score DESC NULLS LAST, m.end_date DESC, m.code ASC"
+
+        cursor.execute(
+            f"SELECT COUNT(*) AS cnt FROM pattern_match_result m WHERE {where_sql};",
+            params,
+        )
+        total = int(cursor.fetchone()["cnt"])
+
+        cursor.execute(
+            f"""
+            SELECT m.id, m.code, s.name, m.pattern_id, m.pattern_name,
+                   m.start_date, m.end_date, m.matched_states, m.score,
+                   m.scan_date, m.window_days, m.updated_at
+            FROM pattern_match_result m
+            LEFT JOIN stocks s ON s.code = m.code
+            WHERE {where_sql}
+            ORDER BY {order_sql}
+            LIMIT %s OFFSET %s;
+            """,
+            params + [limit, offset],
+        )
+        rows = cursor.fetchall()
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "code": r["code"],
+                "name": r.get("name"),
+                "pattern_id": r["pattern_id"],
+                "pattern_name": r["pattern_name"],
+                "start_date": r["start_date"].isoformat() if r["start_date"] else None,
+                "end_date": r["end_date"].isoformat() if r["end_date"] else None,
+                "matched_states": r["matched_states"],
+                "score": float(r["score"]) if r["score"] is not None else None,
+                "scan_date": r["scan_date"].isoformat() if r["scan_date"] else None,
+                "window_days": r["window_days"],
+                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+            })
+        return {
+            "success": True,
+            "data": {"items": items, "total": total, "limit": limit, "offset": offset, "order_by": order_by},
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"查询布林编排命中异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+    finally:
+        cursor.close()
+        db.release(conn)
+
+
+@app.get("/api/stocks/{symbol}/bars")
+def get_stock_bars_with_boll(
+    symbol: str = Path(..., description="股票代码 (如 sz000002)"),
+    end_date: str | None = Query(None, description="截止日 YYYY-MM-DD，默认取最新交易日"),
+    lookback_days: int = Query(120, ge=30, le=500, description="返回窗口的日历回溯天数（计算暖机另取至少250天，与 compare 对齐）"),
+):
+    """
+    返回个股 OHLCV + 布林三轨，供布林编排页画图。
+    布林计算链路与 /api/compare/template/.../stock/... 一致：
+    load(lookback>=250) → calculate_indicators → calculate_features，再截取展示窗口。
+    """
+    try:
+        sentry = ScannerSentry()
+        code = symbol.lower().strip()
+        if end_date:
+            target = datetime.strptime(end_date, "%Y-%m-%d").date()
+        else:
+            with db.db_cursor(dict_cursor=True) as (conn, cur):
+                cur.execute("SELECT MAX(date) AS d FROM daily_bars WHERE code = %s;", (code,))
+                row = cur.fetchone()
+            if not row or not row.get("d"):
+                return {"success": False, "data": None, "error": "该股票暂无行情数据"}
+            target = row["d"] if isinstance(row["d"], date) else datetime.strptime(str(row["d"]), "%Y-%m-%d").date()
+
+        # 与 compare 相同：至少 250 日历日暖机，避免短回看导致布林与 compare 不一致
+        calc_lookback = max(int(lookback_days), 250)
+        df_raw = sentry.load_stock_bars(code, target, lookback_days=calc_lookback)
+        if df_raw.empty:
+            return {"success": False, "data": None, "error": "行情数据不足"}
+
+        df_ind = calculate_indicators(df_raw)
+        df_feat = calculate_features(df_ind, code)
+        if df_feat.empty:
+            return {"success": False, "data": None, "error": "指标计算失败"}
+
+        # 展示窗口按请求的 lookback_days 截取；布林值已在长序列上算好，与 compare 同日对齐
+        display_start = target - timedelta(days=int(lookback_days))
+        dates = pd.to_datetime(df_feat["date"]).dt.date
+        df_out = df_feat.loc[dates >= display_start].copy()
+        if df_out.empty:
+            df_out = df_feat.tail(60).copy()
+
+        bars = _window_to_bars(df_out)
+        return {
+            "success": True,
+            "data": {
+                "code": code,
+                "end_date": target.isoformat(),
+                "bars": bars,
+                "calc_lookback_days": calc_lookback,
+            },
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"查询个股 bars 异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.get("/api/stocks/{symbol}/boll-states")
+def get_stock_boll_states_api(
+    symbol: str = Path(..., description="股票代码 (如 sz000002)"),
+    limit: int = Query(60, ge=1, le=500, description="返回最近多少个交易日状态"),
+):
+    """单股 %B/zone 状态序列（验真用）。"""
+    try:
+        from backend.app.boll_pattern.scanner import BollPatternScanner, get_stock_boll_states
+        BollPatternScanner().ensure_tables()
+        states = get_stock_boll_states(symbol, limit=limit)
+        zones = "".join(s["zone"] for s in states)
+        return {
+            "success": True,
+            "data": {
+                "code": symbol.lower().strip(),
+                "states": states,
+                "state_string": zones,
+            },
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"查询个股布林状态异常: {e}")
         return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 

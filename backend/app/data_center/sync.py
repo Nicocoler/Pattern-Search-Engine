@@ -207,11 +207,9 @@ class DataCenterSync:
             if max_date == today_dt:
                 is_already_latest = True
             elif weekday == 5: # 周六，最大日期只要是周五(昨天)就说明已满
-                from datetime import timedelta
                 if max_date == today_dt - timedelta(days=1):
                     is_already_latest = True
             elif weekday == 6: # 周日，最大日期只要是周五(前天)就说明已满
-                from datetime import timedelta
                 if max_date == today_dt - timedelta(days=2):
                     is_already_latest = True
                     

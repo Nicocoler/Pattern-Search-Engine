@@ -99,5 +99,58 @@ CREATE TABLE IF NOT EXISTS user_feedback (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- 10. 布林编排逐日状态表（%B + Zone，与 DTW 特征链路隔离）
+CREATE TABLE IF NOT EXISTS stock_state_daily (
+    code VARCHAR(12) NOT NULL,                          -- 股票代码
+    date DATE NOT NULL,                                 -- 交易日
+    pct_b NUMERIC(12, 6),                               -- %B = (close-lower)/(upper-lower)，带宽为0时为 NULL
+    zone VARCHAR(2) NOT NULL,                           -- 离散状态 L/M/H/U/NA
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (code, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_state_daily_date ON stock_state_daily (date DESC);
+
+-- 11. 布林编排命中结果表（自然键幂等 upsert）
+CREATE TABLE IF NOT EXISTS pattern_match_result (
+    id BIGSERIAL PRIMARY KEY,
+    code VARCHAR(12) NOT NULL,                          -- 股票代码
+    pattern_id VARCHAR(64) NOT NULL,                    -- 编排 YAML id
+    pattern_name VARCHAR(128) NOT NULL,                 -- 编排可读名称
+    start_date DATE NOT NULL,                           -- 匹配区间起
+    end_date DATE NOT NULL,                             -- 匹配区间止
+    matched_states TEXT NOT NULL,                       -- 命中的状态字符串（人工复核）
+    score NUMERIC(10, 4),                               -- 二次打分（第一期预留，可为 NULL）
+    scan_date DATE NOT NULL,                            -- 最近一次写入/更新的扫描日
+    window_days INT NOT NULL,                           -- 本次扫描使用的窗口长度
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE (code, pattern_id, start_date, end_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_match_scan_date ON pattern_match_result (scan_date DESC);
+CREATE INDEX IF NOT EXISTS idx_pattern_match_end_pattern ON pattern_match_result (end_date DESC, pattern_id);
+
+-- 12. 布林编排全局尺子（单行）
+CREATE TABLE IF NOT EXISTS boll_pattern_settings (
+    id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    zone_thresholds JSONB NOT NULL,
+    denoise_min_len INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 13. 布林编排定义表（权威源；YAML 仅补缺种子）
+CREATE TABLE IF NOT EXISTS boll_patterns (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    regex TEXT NOT NULL,
+    min_total_days INT NOT NULL DEFAULT 0,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    zone_thresholds JSONB,                              -- 稀疏覆盖，NULL=用全局
+    denoise_min_len INT,                                -- 稀疏覆盖，NULL=用全局
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- 如果是普通 PostgreSQL 降级环境，创建日K线的极致检索联合索引以加速 DTW 切片提取
 CREATE INDEX IF NOT EXISTS idx_daily_bars_date_code ON daily_bars (date DESC, code);
