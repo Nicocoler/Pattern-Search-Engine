@@ -921,3 +921,18 @@ body {
 .zone-bound-stepper__btn:active {
   transform: scale(0.96);
 }
+
+/* 布林编排状态串：暗底浅字，避免全局 code 浅色底看不清 */
+.boll-zone-string {
+  margin-top: 0.3rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(15, 23, 42, 0.92);
+  color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  word-break: break-all;
+  white-space: pre-wrap;
+}

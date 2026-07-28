@@ -2003,41 +2003,67 @@ export default function App() {
     const bollLower = bollBars.map(b => b.boll_lower ?? null);
     const start = selectedBollMatch.start_date;
     const end = selectedBollMatch.end_date;
+    const fmtPx = (v: number | null | undefined, digits = 2) =>
+      v == null || Number.isNaN(Number(v)) ? 'N/A' : `￥${Number(v).toFixed(digits)}`;
 
     return {
-      title: {
-        text: `布林编排 · ${selectedBollMatch.code.toUpperCase()} ${selectedBollMatch.name || ''}`,
-        subtext: `${selectedBollMatch.pattern_name} | ${start} ~ ${end} | score ${selectedBollMatch.score ?? '—'}`,
-        textStyle: { color: '#f1f5f9', fontSize: 13, fontWeight: 'bold' },
-        subtextStyle: { color: '#94a3b8', fontSize: 11 },
-        left: 'left',
-        top: 0,
-      },
+      // 标题改到图表外渲染，避免矮图内与坐标系/图例重叠
       backgroundColor: 'transparent',
       tooltip: {
         trigger: 'axis',
-        axisPointer: { type: 'cross' },
+        axisPointer: {
+          type: 'line',
+          lineStyle: { color: 'rgba(148,163,184,0.45)' },
+          label: { show: false },
+        },
         backgroundColor: 'rgba(15, 23, 42, 0.95)',
         borderColor: 'rgba(255,255,255,0.12)',
         textStyle: { color: '#e2e8f0', fontSize: 11 },
+        formatter: (params: any) => {
+          const kParam = (params || []).find((p: any) => p.seriesName === '日K');
+          if (!kParam) return '';
+          const b = bollBars[kParam.dataIndex];
+          if (!b) return '';
+          let html = `<div style="padding:4px 8px;line-height:1.6;">`;
+          html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
+          html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
+          html += `低 ${fmtPx(b.low)}　高 ${fmtPx(b.high)}<br/>`;
+          html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
+          html += `BOLL-M: <b style="color:#e2e8f0;font-family:monospace;">${fmtPx(b.boll_mid, 3)}</b><br/>`;
+          html += `UB: <b style="color:#f59e0b;font-family:monospace;">${fmtPx(b.boll_upper, 3)}</b><br/>`;
+          html += `LB: <b style="color:#d946ef;font-family:monospace;">${fmtPx(b.boll_lower, 3)}</b>`;
+          html += `</div></div>`;
+          return html;
+        },
       },
       legend: {
         data: ['日K', 'BOLL-M', 'UB', 'LB'],
-        textStyle: { color: '#94a3b8', fontSize: 10 },
-        bottom: 5,
+        top: 0,
         left: 'center',
+        itemGap: 18,
+        itemWidth: 16,
+        itemHeight: 8,
+        icon: 'roundRect',
+        textStyle: { color: '#94a3b8', fontSize: 11, padding: [0, 0, 0, 4] },
       },
-      grid: { left: '5%', right: '5%', top: '18%', bottom: '15%' },
+      grid: { left: 48, right: 16, top: 32, bottom: 28, containLabel: false },
       xAxis: {
         type: 'category',
         data: xAxisDates,
+        boundaryGap: true,
         axisLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.1)' } },
-        axisLabel: { color: '#94a3b8', fontSize: 10 },
+        axisLabel: {
+          color: '#94a3b8',
+          fontSize: 9,
+          hideOverlap: true,
+          showMaxLabel: true,
+        },
+        axisTick: { alignWithLabel: true },
       },
       yAxis: {
         type: 'value',
         scale: true,
-        axisLabel: { color: '#94a3b8', fontSize: 10, formatter: '￥{value}' },
+        axisLabel: { color: '#94a3b8', fontSize: 9, formatter: '￥{value}' },
         splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } },
       },
       series: [
@@ -2052,7 +2078,8 @@ export default function App() {
             borderColor0: '#10b981',
           },
           markArea: {
-            itemStyle: { color: 'rgba(56, 189, 248, 0.12)' },
+            silent: true,
+            itemStyle: { color: 'rgba(56, 189, 248, 0.08)' },
             data: [[{ xAxis: start }, { xAxis: end }]],
           },
         },
@@ -2062,7 +2089,7 @@ export default function App() {
           data: bollMid,
           smooth: true,
           showSymbol: false,
-          lineStyle: { color: '#e2e8f0', width: 1.5, opacity: 0.8 },
+          lineStyle: { color: '#e2e8f0', width: 1.5, opacity: 0.85 },
         },
         {
           name: 'UB',
@@ -2070,7 +2097,7 @@ export default function App() {
           data: bollUpper,
           smooth: true,
           showSymbol: false,
-          lineStyle: { color: '#f59e0b', width: 1.5, opacity: 0.8 },
+          lineStyle: { color: '#f59e0b', width: 1.5, opacity: 0.85 },
         },
         {
           name: 'LB',
@@ -2078,7 +2105,7 @@ export default function App() {
           data: bollLower,
           smooth: true,
           showSymbol: false,
-          lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.8 },
+          lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.85 },
         },
       ],
     };
@@ -2985,7 +3012,7 @@ export default function App() {
                 )}
               </div>
 
-              <div className="data-card" style={{ padding: '1rem', minHeight: '480px' }}>
+              <div className="data-card" style={{ padding: '1rem', minHeight: '280px' }}>
                 {!selectedBollMatch ? (
                   <div className="empty-wrapper">
                     <Info size={28} color="#94a3b8" />
@@ -2993,16 +3020,30 @@ export default function App() {
                   </div>
                 ) : (
                   <>
+                    <div style={{ marginBottom: '0.45rem' }}>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
+                        布林编排 · {selectedBollMatch.code.toUpperCase()} {selectedBollMatch.name || ''}
+                      </div>
+                      <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem', lineHeight: 1.35 }}>
+                        {selectedBollMatch.pattern_name} | {selectedBollMatch.start_date} ~ {selectedBollMatch.end_date}
+                        {' | score '}
+                        {selectedBollMatch.score != null ? Number(selectedBollMatch.score).toFixed(2) : '—'}
+                      </div>
+                    </div>
                     <ReactECharts
                       option={getBollPatternChartOption()}
-                      style={{ height: '420px', width: '100%' }}
+                      style={{ height: '220px', width: '100%' }}
                       notMerge
                     />
                     <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                      <div><b>命中状态串</b>：<code style={{ color: '#e2e8f0' }}>{selectedBollMatch.matched_states}</code></div>
+                      <div style={{ marginBottom: '0.45rem' }}>
+                        <b style={{ color: '#cbd5e1' }}>命中状态串</b>
+                        <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
+                      </div>
                       {bollStateString && (
-                        <div style={{ marginTop: '0.4rem', wordBreak: 'break-all' }}>
-                          <b>近 60 日 zone</b>：<code style={{ color: '#94a3b8' }}>{bollStateString}</code>
+                        <div>
+                          <b style={{ color: '#cbd5e1' }}>近 60 日 zone</b>
+                          <div className="boll-zone-string">{bollStateString}</div>
                         </div>
                       )}
                     </div>
