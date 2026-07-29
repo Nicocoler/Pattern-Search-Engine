@@ -3,7 +3,7 @@
 // 职责：实现极速扫描大PK、起始点归零百分比重合 Kline 绘制、高斯事件悬浮气泡标注、滚动无偏回测图表、自适应反馈闭环
 // =============================================================================
 
-import { useState, useEffect, type CSSProperties } from 'react';
+import { useState, useEffect, useRef, type CSSProperties } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
   TrendingUp,
@@ -20,7 +20,10 @@ import {
   Sparkles,
   Server,
   Database,
-  Info
+  Info,
+  Search,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 import './App.css';
 
@@ -64,6 +67,14 @@ interface Bar {
   boll_mid?: number;
   boll_upper?: number;
   boll_lower?: number;
+  pct_b?: number | null;
+}
+
+interface StockSearchItem {
+  code: string;
+  name: string;
+  board?: string;
+  industry?: string;
 }
 
 interface BollPatternMatch {
@@ -426,7 +437,7 @@ export default function App() {
   // 2. 状态管理 (State Management)
   // -----------------------------------------------------------------------------
   const [apiBase, setApiBase] = useState('http://localhost:8000');
-  const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern'>('scan');
+  const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern' | 'stock_view'>('scan');
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -538,6 +549,22 @@ export default function App() {
     zone_thresholds: Record<string, [string | number, string | number]>;
     denoise_min_len: number;
   } | null>(null);
+
+  // 个股走势（独立看盘页）
+  const [stockSearchQuery, setStockSearchQuery] = useState('');
+  const [stockSearchItems, setStockSearchItems] = useState<StockSearchItem[]>([]);
+  const [stockSearchOpen, setStockSearchOpen] = useState(false);
+  const [stockSearchLoading, setStockSearchLoading] = useState(false);
+  const [selectedStockView, setSelectedStockView] = useState<StockSearchItem | null>(null);
+  const [stockViewEndDate, setStockViewEndDate] = useState('');
+  const [stockViewLookback, setStockViewLookback] = useState(120);
+  const [stockViewBars, setStockViewBars] = useState<Bar[]>([]);
+  const [stockViewLoading, setStockViewLoading] = useState(false);
+  const [stockViewZoneOpen, setStockViewZoneOpen] = useState(false);
+  const [stockViewZoneString, setStockViewZoneString] = useState('');
+  const [stockViewZoneLoading, setStockViewZoneLoading] = useState(false);
+  const stockViewReqKeyRef = useRef('');
+  const stockSearchWrapRef = useRef<HTMLDivElement | null>(null);
   const [bollShowManage, setBollShowManage] = useState(false);
   const [bollEditId, setBollEditId] = useState<string | null>(null);
   const [bollForm, setBollForm] = useState({
@@ -1106,6 +1133,52 @@ export default function App() {
     } finally {
       setBollLoading(false);
     }
+  };
+
+  const loadStockViewBars = async (
+    code: string,
+    endDate: string | undefined,
+    lookback: number,
+  ) => {
+    const lb = Math.min(500, Math.max(30, lookback || 120));
+    const key = `${code}|${endDate || 'latest'}|${lb}`;
+    if (stockViewReqKeyRef.current === key) return;
+    stockViewReqKeyRef.current = key;
+    setStockViewLoading(true);
+    try {
+      const qs = new URLSearchParams();
+      qs.set('lookback_days', String(lb));
+      if (endDate) qs.set('end_date', endDate);
+      const res = await fetch(`${apiBase}/api/stocks/${code}/bars?${qs.toString()}`);
+      const json = await res.json();
+      if (json.success) {
+        const resolvedEnd = json.data?.end_date || endDate || '';
+        if (!endDate && resolvedEnd) {
+          stockViewReqKeyRef.current = `${code}|${resolvedEnd}|${lb}`;
+          setStockViewEndDate(resolvedEnd);
+        }
+        setStockViewBars(json.data.bars || []);
+      } else {
+        setStockViewBars([]);
+        showToast('加载 K 线失败：' + (json.error || ''));
+      }
+    } catch {
+      setStockViewBars([]);
+      showToast('加载个股走势异常');
+    } finally {
+      setStockViewLoading(false);
+    }
+  };
+
+  const handleSelectStockView = (item: StockSearchItem) => {
+    setSelectedStockView(item);
+    setStockSearchQuery(`${item.code.toUpperCase()} ${item.name || ''}`.trim());
+    setStockSearchOpen(false);
+    setStockSearchItems([]);
+    setStockViewZoneOpen(false);
+    setStockViewZoneString('');
+    stockViewReqKeyRef.current = '';
+    setStockViewEndDate('');
   };
 
   // 4.5 点击股票拉取核心同屏对齐比对数据
@@ -1745,6 +1818,110 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, apiBase, bollEndWithinDays, bollPatternFilter]);
 
+  // 个股走势：模糊搜索联想
+  useEffect(() => {
+    if (activeTab !== 'stock_view') return;
+    const q = stockSearchQuery.trim();
+    if (q.length < 1) {
+      setStockSearchItems([]);
+      setStockSearchOpen(false);
+      return;
+    }
+    // 已选中且输入框仍是「代码 名称」展示时，不重复搜
+    if (
+      selectedStockView &&
+      q === `${selectedStockView.code.toUpperCase()} ${selectedStockView.name || ''}`.trim()
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      setStockSearchLoading(true);
+      try {
+        const res = await fetch(
+          `${apiBase}/api/stocks/search?q=${encodeURIComponent(q)}&limit=10`,
+        );
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.success) {
+          setStockSearchItems(json.data?.items || []);
+          setStockSearchOpen(true);
+        } else {
+          setStockSearchItems([]);
+        }
+      } catch {
+        if (!cancelled) setStockSearchItems([]);
+      } finally {
+        if (!cancelled) setStockSearchLoading(false);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [activeTab, apiBase, stockSearchQuery, selectedStockView]);
+
+  // 个股走势：窗口参数变更防抖拉图
+  useEffect(() => {
+    if (activeTab !== 'stock_view') return;
+    if (!selectedStockView) return;
+    if (stockViewLookback < 30 || stockViewLookback > 500) return;
+    const t = setTimeout(() => {
+      void loadStockViewBars(
+        selectedStockView.code,
+        stockViewEndDate || undefined,
+        stockViewLookback,
+      );
+    }, 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedStockView?.code, stockViewEndDate, stockViewLookback, apiBase]);
+
+  // 个股走势：展开 zone 时再请求
+  useEffect(() => {
+    if (activeTab !== 'stock_view' || !stockViewZoneOpen || !selectedStockView) return;
+    let cancelled = false;
+    setStockViewZoneLoading(true);
+    void (async () => {
+      try {
+        const res = await fetch(
+          `${apiBase}/api/stocks/${selectedStockView.code}/boll-states?limit=60`,
+        );
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.success) {
+          setStockViewZoneString(json.data?.state_string || '');
+        } else {
+          setStockViewZoneString('');
+          showToast('加载 zone 失败：' + (json.error || ''));
+        }
+      } catch {
+        if (!cancelled) {
+          setStockViewZoneString('');
+          showToast('加载 zone 异常');
+        }
+      } finally {
+        if (!cancelled) setStockViewZoneLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, stockViewZoneOpen, selectedStockView?.code, apiBase]);
+
+  // 点击外部关闭搜索下拉
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (!stockSearchWrapRef.current) return;
+      if (!stockSearchWrapRef.current.contains(e.target as Node)) {
+        setStockSearchOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
   // 布林编排扫描进度轮询
   useEffect(() => {
     if (!bollScanning) return;
@@ -2145,7 +2322,12 @@ export default function App() {
           html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
           html += `BOLL-M: <b style="color:#e2e8f0;font-family:monospace;">${fmtPx(b.boll_mid, 3)}</b><br/>`;
           html += `UB: <b style="color:#f59e0b;font-family:monospace;">${fmtPx(b.boll_upper, 3)}</b><br/>`;
-          html += `LB: <b style="color:#d946ef;font-family:monospace;">${fmtPx(b.boll_lower, 3)}</b>`;
+          html += `LB: <b style="color:#d946ef;font-family:monospace;">${fmtPx(b.boll_lower, 3)}</b><br/>`;
+          const pctB =
+            b.pct_b == null || Number.isNaN(Number(b.pct_b))
+              ? 'N/A'
+              : Number(b.pct_b).toFixed(3);
+          html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
           html += `</div></div>`;
           return html;
         },
@@ -2195,6 +2377,121 @@ export default function App() {
             silent: true,
             itemStyle: { color: 'rgba(56, 189, 248, 0.08)' },
             data: [[{ xAxis: start }, { xAxis: end }]],
+          },
+        },
+        {
+          name: 'BOLL-M',
+          type: 'line',
+          data: bollMid,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#e2e8f0', width: 1.5, opacity: 0.85 },
+        },
+        {
+          name: 'UB',
+          type: 'line',
+          data: bollUpper,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#f59e0b', width: 1.5, opacity: 0.85 },
+        },
+        {
+          name: 'LB',
+          type: 'line',
+          data: bollLower,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.85 },
+        },
+      ],
+    };
+  };
+
+  // 5.0c 个股走势页：单股 K 线 + 布林（无命中 markArea）
+  const getStockViewChartOption = () => {
+    if (!stockViewBars.length || !selectedStockView) return {};
+    const xAxisDates = stockViewBars.map(b => b.date);
+    const klineData = stockViewBars.map(b => [b.open, b.close, b.low, b.high]);
+    const bollMid = stockViewBars.map(b => b.boll_mid ?? null);
+    const bollUpper = stockViewBars.map(b => b.boll_upper ?? null);
+    const bollLower = stockViewBars.map(b => b.boll_lower ?? null);
+    const fmtPx = (v: number | null | undefined, digits = 2) =>
+      v == null || Number.isNaN(Number(v)) ? 'N/A' : `￥${Number(v).toFixed(digits)}`;
+
+    return {
+      backgroundColor: 'transparent',
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: {
+          type: 'line',
+          lineStyle: { color: 'rgba(148,163,184,0.45)' },
+          label: { show: false },
+        },
+        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+        borderColor: 'rgba(255,255,255,0.12)',
+        textStyle: { color: '#e2e8f0', fontSize: 11 },
+        formatter: (params: any) => {
+          const kParam = (params || []).find((p: any) => p.seriesName === '日K');
+          if (!kParam) return '';
+          const b = stockViewBars[kParam.dataIndex];
+          if (!b) return '';
+          let html = `<div style="padding:4px 8px;line-height:1.6;">`;
+          html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
+          html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
+          html += `低 ${fmtPx(b.low)}　高 ${fmtPx(b.high)}<br/>`;
+          html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
+          html += `BOLL-M: <b style="color:#e2e8f0;font-family:monospace;">${fmtPx(b.boll_mid, 3)}</b><br/>`;
+          html += `UB: <b style="color:#f59e0b;font-family:monospace;">${fmtPx(b.boll_upper, 3)}</b><br/>`;
+          html += `LB: <b style="color:#d946ef;font-family:monospace;">${fmtPx(b.boll_lower, 3)}</b><br/>`;
+          const pctB =
+            b.pct_b == null || Number.isNaN(Number(b.pct_b))
+              ? 'N/A'
+              : Number(b.pct_b).toFixed(3);
+          html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
+          html += `</div></div>`;
+          return html;
+        },
+      },
+      legend: {
+        data: ['日K', 'BOLL-M', 'UB', 'LB'],
+        top: 0,
+        left: 'center',
+        itemGap: 18,
+        itemWidth: 16,
+        itemHeight: 8,
+        icon: 'roundRect',
+        textStyle: { color: '#94a3b8', fontSize: 11, padding: [0, 0, 0, 4] },
+      },
+      grid: { left: 48, right: 16, top: 32, bottom: 28, containLabel: false },
+      xAxis: {
+        type: 'category',
+        data: xAxisDates,
+        boundaryGap: true,
+        axisLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.1)' } },
+        axisLabel: {
+          color: '#94a3b8',
+          fontSize: 9,
+          hideOverlap: true,
+          showMaxLabel: true,
+        },
+        axisTick: { alignWithLabel: true },
+      },
+      yAxis: {
+        type: 'value',
+        scale: true,
+        axisLabel: { color: '#94a3b8', fontSize: 9, formatter: '￥{value}' },
+        splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } },
+      },
+      series: [
+        {
+          name: '日K',
+          type: 'candlestick',
+          data: klineData,
+          itemStyle: {
+            color: '#ef4444',
+            color0: '#10b981',
+            borderColor: '#ef4444',
+            borderColor0: '#10b981',
           },
         },
         {
@@ -2572,6 +2869,12 @@ export default function App() {
           <Sparkles size={16} /> 布林编排
         </button>
         <button
+          className={`tab-btn ${activeTab === 'stock_view' ? 'active' : ''}`}
+          onClick={() => setActiveTab('stock_view')}
+        >
+          <Search size={16} /> 个股走势
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'templates' ? 'active' : ''}`}
           onClick={() => setActiveTab('templates')}
         >
@@ -2586,10 +2889,10 @@ export default function App() {
       </nav>
 
       {/* 6.4 内容主体布局 */}
-      <main className={(activeTab === 'templates' || activeTab === 'settings' || activeTab === 'boll_pattern') ? 'full-width-grid' : 'dashboard-grid'}>
+      <main className={(activeTab === 'templates' || activeTab === 'settings' || activeTab === 'boll_pattern' || activeTab === 'stock_view') ? 'full-width-grid' : 'dashboard-grid'}>
 
-        {/* 左侧控制栏 (除模板管理、系统设置、布林编排外) */}
-        {(activeTab !== 'templates' && activeTab !== 'settings' && activeTab !== 'boll_pattern') && (
+        {/* 左侧控制栏 (除模板管理、系统设置、布林编排、个股走势外) */}
+        {(activeTab !== 'templates' && activeTab !== 'settings' && activeTab !== 'boll_pattern' && activeTab !== 'stock_view') && (
           <aside className="panel-card">
             <h2 className="panel-title">研盘控制核心</h2>
 
@@ -3465,6 +3768,144 @@ export default function App() {
                 </table>
               </div>
             </div>
+            </div>
+          )}
+
+          {/* ==================== 2c. 个股走势 Tab ==================== */}
+          {activeTab === 'stock_view' && (
+            <div className="data-card stock-view-panel" style={{ padding: '1rem', width: '100%' }}>
+              <h2 className="panel-title" style={{ marginBottom: '0.9rem' }}>个股走势</h2>
+              <div className="stock-view-toolbar">
+                <div className="form-group stock-view-search" ref={stockSearchWrapRef}>
+                  <label>搜索股票（名称 / 代码）</label>
+                  <div className="stock-search-input-wrap">
+                    <Search size={14} className="stock-search-icon" />
+                    <input
+                      type="text"
+                      value={stockSearchQuery}
+                      placeholder="如 茅台、600519、sh600519"
+                      onChange={(e) => {
+                        setStockSearchQuery(e.target.value);
+                        setStockSearchOpen(true);
+                      }}
+                      onFocus={() => {
+                        if (stockSearchItems.length > 0) setStockSearchOpen(true);
+                      }}
+                      autoComplete="off"
+                    />
+                    {stockSearchLoading && <span className="stock-search-hint">搜索中…</span>}
+                  </div>
+                  {stockSearchOpen && stockSearchItems.length > 0 && (
+                    <ul className="stock-search-dropdown">
+                      {stockSearchItems.map((item) => (
+                        <li key={item.code}>
+                          <button
+                            type="button"
+                            onClick={() => handleSelectStockView(item)}
+                          >
+                            <span className="stock-search-code">{item.code.toUpperCase()}</span>
+                            <span className="stock-search-name">{item.name}</span>
+                            {item.board ? (
+                              <span className="stock-search-board">{item.board}</span>
+                            ) : null}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {stockSearchOpen &&
+                    !stockSearchLoading &&
+                    stockSearchQuery.trim().length > 0 &&
+                    stockSearchItems.length === 0 &&
+                    !(
+                      selectedStockView &&
+                      stockSearchQuery.trim() ===
+                        `${selectedStockView.code.toUpperCase()} ${selectedStockView.name || ''}`.trim()
+                    ) && (
+                      <div className="stock-search-empty">无匹配股票</div>
+                    )}
+                </div>
+                <div className="form-group">
+                  <label>截止日</label>
+                  <input
+                    type="date"
+                    value={stockViewEndDate}
+                    disabled={!selectedStockView}
+                    onChange={(e) => setStockViewEndDate(e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>回看日历日</label>
+                  <input
+                    type="number"
+                    min={30}
+                    max={500}
+                    value={stockViewLookback}
+                    disabled={!selectedStockView}
+                    onChange={(e) => setStockViewLookback(Number(e.target.value) || 0)}
+                    onBlur={() => {
+                      setStockViewLookback((v) => Math.min(500, Math.max(30, v || 120)));
+                    }}
+                  />
+                </div>
+              </div>
+
+              {!selectedStockView ? (
+                <div className="empty-wrapper" style={{ padding: '2.5rem 0' }}>
+                  <Info size={28} color="#94a3b8" />
+                  <p>输入名称或代码搜索股票，查看日 K + 布林走势。</p>
+                </div>
+              ) : stockViewLoading && stockViewBars.length === 0 ? (
+                <div className="loading-wrapper" style={{ padding: '2rem 0' }}>
+                  <div className="spinner" />
+                </div>
+              ) : stockViewBars.length === 0 ? (
+                <div className="empty-wrapper" style={{ padding: '2rem 0' }}>
+                  <AlertTriangle size={24} color="#f59e0b" />
+                  <p>暂无行情数据，请换截止日或确认该股已同步。</p>
+                </div>
+              ) : (
+                <>
+                  <div style={{ marginBottom: '0.45rem' }}>
+                    <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
+                      {selectedStockView.code.toUpperCase()} {selectedStockView.name || ''}
+                      {stockViewLoading ? (
+                        <span style={{ marginLeft: '0.5rem', fontSize: '0.72rem', color: '#94a3b8', fontWeight: 400 }}>
+                          刷新中…
+                        </span>
+                      ) : null}
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem' }}>
+                      截止 {stockViewEndDate || '—'} · 回看 {stockViewLookback} 日历日 · BOLL(20,2)
+                    </div>
+                  </div>
+                  <ReactECharts
+                    option={getStockViewChartOption()}
+                    style={{ height: '400px', width: '100%' }}
+                    notMerge
+                  />
+                  <div style={{ marginTop: '0.75rem' }}>
+                    <button
+                      type="button"
+                      className="stock-zone-toggle"
+                      onClick={() => setStockViewZoneOpen((v) => !v)}
+                    >
+                      {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                      {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
+                    </button>
+                    {stockViewZoneOpen && (
+                      <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                        <b style={{ color: '#cbd5e1' }}>近 60 日 zone</b>
+                        {stockViewZoneLoading ? (
+                          <div style={{ marginTop: '0.35rem' }}>加载中…</div>
+                        ) : (
+                          <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
 

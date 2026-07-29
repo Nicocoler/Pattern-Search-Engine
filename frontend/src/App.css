@@ -965,3 +965,131 @@ body {
   50% { opacity: 1; }
   100% { transform: translateX(180%); opacity: 0.7; }
 }
+
+/* 个股走势 */
+.stock-view-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) minmax(140px, 1fr) minmax(120px, 0.8fr);
+  gap: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  align-items: end;
+}
+
+@media (max-width: 900px) {
+  .stock-view-toolbar {
+    grid-template-columns: 1fr;
+  }
+}
+
+.stock-view-search {
+  position: relative;
+}
+
+.stock-search-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.stock-search-icon {
+  position: absolute;
+  left: 0.65rem;
+  color: #94a3b8;
+  pointer-events: none;
+}
+
+.stock-search-input-wrap input {
+  width: 100%;
+  padding-left: 2rem;
+}
+
+.stock-search-hint {
+  position: absolute;
+  right: 0.65rem;
+  font-size: 0.7rem;
+  color: #94a3b8;
+}
+
+.stock-search-dropdown {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 0.25rem 0;
+  list-style: none;
+  max-height: 260px;
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(15, 23, 42, 0.98);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+}
+
+.stock-search-dropdown button {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  padding: 0.45rem 0.7rem;
+  border: none;
+  background: transparent;
+  color: #e2e8f0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.stock-search-dropdown button:hover {
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.stock-search-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+  font-size: 0.8rem;
+  min-width: 5.5rem;
+}
+
+.stock-search-name {
+  font-size: 0.8rem;
+  flex: 1;
+}
+
+.stock-search-board {
+  font-size: 0.68rem;
+  color: #94a3b8;
+}
+
+.stock-search-empty {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(15, 23, 42, 0.98);
+  font-size: 0.78rem;
+  color: #94a3b8;
+}
+
+.stock-zone-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(255, 255, 255, 0.03);
+  color: #cbd5e1;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.stock-zone-toggle:hover {
+  border-color: rgba(56, 189, 248, 0.45);
+  color: #e2e8f0;
+}
+

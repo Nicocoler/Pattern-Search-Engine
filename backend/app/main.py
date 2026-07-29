@@ -743,8 +743,20 @@ def get_sync_status():
 # -------------------------------------------------------------------------
 def _window_to_bars(df_window: pd.DataFrame) -> list:
     """将特征窗口 DataFrame 序列化为前端 K 线契约所需的 bar 字典列表。"""
+    from backend.app.boll_pattern.pct_b import calc_pct_b
+
+    df = df_window
+    if (
+        not df.empty
+        and "pct_b" not in df.columns
+        and "boll_upper" in df.columns
+        and "boll_lower" in df.columns
+    ):
+        df = df.copy()
+        df["pct_b"] = calc_pct_b(df["close"], df["boll_upper"], df["boll_lower"])
+
     bars = []
-    for _, row in df_window.iterrows():
+    for _, row in df.iterrows():
         bars.append({
             "date": row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"]),
             "open": float(row["open"]),
@@ -755,6 +767,7 @@ def _window_to_bars(df_window: pd.DataFrame) -> list:
             "boll_mid": float(row["boll_mid"]) if "boll_mid" in row and not pd.isna(row["boll_mid"]) else None,
             "boll_upper": float(row["boll_upper"]) if "boll_upper" in row and not pd.isna(row["boll_upper"]) else None,
             "boll_lower": float(row["boll_lower"]) if "boll_lower" in row and not pd.isna(row["boll_lower"]) else None,
+            "pct_b": float(row["pct_b"]) if "pct_b" in row and not pd.isna(row["pct_b"]) else None,
         })
     return bars
 
@@ -1345,7 +1358,74 @@ def get_stock_boll_states_api(
 
 
 # -------------------------------------------------------------------------
-# 4.7 单个股基本面字典极速查询接口
+# 4.7 股票模糊搜索（须注册在 /api/stocks/{symbol} 之前，避免 search 被当成代码）
+# -------------------------------------------------------------------------
+@app.get("/api/stocks/search")
+def search_stocks(
+    q: str = Query(..., min_length=1, description="名称或代码关键词"),
+    limit: int = Query(10, ge=1, le=50, description="返回条数上限"),
+):
+    """按 code / name 模糊匹配股票池，供个股走势联想搜索。"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        raw = (q or "").strip()
+        if not raw:
+            return {"success": True, "data": {"items": []}, "error": None}
+
+        needle = raw.lower()
+        like = f"%{needle}%"
+        name_like = f"%{raw}%"
+        digits = "".join(ch for ch in needle if ch.isdigit())
+        six = digits if len(digits) == 6 else None
+
+        # 名称精确/前缀优先，再代码精确/含匹配
+        cursor.execute(
+            """
+            SELECT code, name, board, industry
+            FROM stocks
+            WHERE code ILIKE %s
+               OR name ILIKE %s
+               OR (%s IS NOT NULL AND RIGHT(code, 6) = %s)
+            ORDER BY
+              CASE
+                WHEN name = %s THEN 0
+                WHEN name ILIKE %s THEN 1
+                WHEN code = %s THEN 2
+                WHEN %s IS NOT NULL AND RIGHT(code, 6) = %s THEN 3
+                WHEN code ILIKE %s THEN 4
+                ELSE 5
+              END,
+              code ASC
+            LIMIT %s;
+            """,
+            (
+                like,
+                name_like,
+                six,
+                six,
+                raw,
+                f"{raw}%",
+                needle,
+                six,
+                six,
+                like,
+                int(limit),
+            ),
+        )
+        rows = cursor.fetchall() or []
+        items = [dict(r) for r in rows]
+        return {"success": True, "data": {"items": items, "q": raw}, "error": None}
+    except Exception as e:
+        logger.error(f"股票模糊搜索异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+    finally:
+        cursor.close()
+        db.release(conn)
+
+
+# -------------------------------------------------------------------------
+# 4.8 单个股基本面字典极速查询接口
 # -------------------------------------------------------------------------
 @app.get("/api/stocks/{symbol}")
 def get_stock_fundamental_details(symbol: str = Path(..., description="股票代码 (如 sz000002)")):
