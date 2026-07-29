@@ -922,6 +922,66 @@ body {
   transform: scale(0.96);
 }
 
+/* 个股走势 · 回看天数：显式 +/-，对齐表单高度 */
+.lookback-stepper__btn {
+  width: 2.2rem;
+  height: 2.35rem;
+  padding: 0;
+  border: 1px solid #60a5fa;
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(59, 130, 246, 0.55) 0%, rgba(37, 99, 235, 0.45) 100%);
+  color: #ffffff;
+  font-size: 1.2rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.2);
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s, box-shadow 0.15s;
+}
+.lookback-stepper__btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(96, 165, 250, 0.7) 0%, rgba(59, 130, 246, 0.6) 100%) !important;
+  border-color: #93c5fd !important;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.28);
+}
+.lookback-stepper__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.form-group .lookback-stepper__input {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+  height: 2.35rem !important;
+  padding: 0.45rem 0.5rem !important;
+  font-size: 0.9rem !important;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 个股走势 · 截止日：隐藏原生微弱日历图标，改用显式按钮 */
+.date-picker-field {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.date-picker-field__input {
+  flex: 1;
+  min-width: 0;
+  height: 2.35rem;
+  color-scheme: dark;
+}
+.date-picker-field__input::-webkit-calendar-picker-indicator {
+  opacity: 0;
+  display: none;
+}
+.date-picker-field__btn {
+  flex-shrink: 0;
+}
+
 /* 布林编排状态串：暗底浅字，避免全局 code 浅色底看不清 */
 .boll-zone-string {
   margin-top: 0.3rem;

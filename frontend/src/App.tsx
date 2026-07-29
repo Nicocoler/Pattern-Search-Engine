@@ -565,6 +565,11 @@ export default function App() {
   const [stockViewZoneLoading, setStockViewZoneLoading] = useState(false);
   const stockViewReqKeyRef = useRef('');
   const stockSearchWrapRef = useRef<HTMLDivElement | null>(null);
+  const stockViewEndDateRef = useRef<HTMLInputElement | null>(null);
+  const bollAxisTooltipCacheRef = useRef<{ key: string; index: number; html: string } | null>(null);
+  const stockViewAxisTooltipCacheRef = useRef<{ key: string; index: number; html: string } | null>(null);
+  const bollAxisTooltipPosRef = useRef<{ key: string; index: number; pos: [number, number] } | null>(null);
+  const stockViewAxisTooltipPosRef = useRef<{ key: string; index: number; pos: [number, number] } | null>(null);
   const [bollShowManage, setBollShowManage] = useState(false);
   const [bollEditId, setBollEditId] = useState<string | null>(null);
   const [bollForm, setBollForm] = useState({
@@ -2302,6 +2307,9 @@ export default function App() {
       backgroundColor: 'transparent',
       tooltip: {
         trigger: 'axis',
+        triggerOn: 'mousemove',
+        alwaysShowContent: true,
+        transitionDuration: 0,
         axisPointer: {
           type: 'line',
           lineStyle: { color: 'rgba(148,163,184,0.45)' },
@@ -2312,9 +2320,15 @@ export default function App() {
         textStyle: { color: '#e2e8f0', fontSize: 11 },
         formatter: (params: any) => {
           const kParam = (params || []).find((p: any) => p.seriesName === '日K');
-          if (!kParam) return '';
-          const b = bollBars[kParam.dataIndex];
-          if (!b) return '';
+          const cached = bollAxisTooltipCacheRef.current;
+          if (!kParam) return cached?.html ?? '';
+          const idx = kParam.dataIndex as number;
+          const cacheKey = String(selectedBollMatch.id);
+          if (cached && cached.key === cacheKey && cached.index === idx) {
+            return cached.html;
+          }
+          const b = bollBars[idx];
+          if (!b) return cached?.html ?? '';
           let html = `<div style="padding:4px 8px;line-height:1.6;">`;
           html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
           html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
@@ -2329,7 +2343,27 @@ export default function App() {
               : Number(b.pct_b).toFixed(3);
           html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
           html += `</div></div>`;
+          bollAxisTooltipCacheRef.current = { key: cacheKey, index: idx, html };
           return html;
+        },
+        position: (point: number[], params: any, _dom: HTMLElement, _rect: any, size: { contentSize: number[]; viewSize: number[] }) => {
+          const list = Array.isArray(params) ? params : params ? [params] : [];
+          const kParam = list.find((p: any) => p?.seriesName === '日K');
+          const idx = typeof kParam?.dataIndex === 'number'
+            ? kParam.dataIndex
+            : bollAxisTooltipCacheRef.current?.index;
+          const cacheKey = String(selectedBollMatch.id);
+          const posCache = bollAxisTooltipPosRef.current;
+          if (posCache && posCache.key === cacheKey && posCache.index === idx && idx != null) {
+            return posCache.pos;
+          }
+          const x = Math.min(point[0], size.viewSize[0] - size.contentSize[0] - 8);
+          const y = Math.max(8, point[1] - size.contentSize[1] - 12);
+          const pos: [number, number] = [Math.max(8, x), y];
+          if (idx != null) {
+            bollAxisTooltipPosRef.current = { key: cacheKey, index: idx, pos };
+          }
+          return pos;
         },
       },
       legend: {
@@ -2422,6 +2456,9 @@ export default function App() {
       backgroundColor: 'transparent',
       tooltip: {
         trigger: 'axis',
+        triggerOn: 'mousemove',
+        alwaysShowContent: true,
+        transitionDuration: 0,
         axisPointer: {
           type: 'line',
           lineStyle: { color: 'rgba(148,163,184,0.45)' },
@@ -2432,9 +2469,15 @@ export default function App() {
         textStyle: { color: '#e2e8f0', fontSize: 11 },
         formatter: (params: any) => {
           const kParam = (params || []).find((p: any) => p.seriesName === '日K');
-          if (!kParam) return '';
-          const b = stockViewBars[kParam.dataIndex];
-          if (!b) return '';
+          const cached = stockViewAxisTooltipCacheRef.current;
+          if (!kParam) return cached?.html ?? '';
+          const idx = kParam.dataIndex as number;
+          const cacheKey = selectedStockView.code;
+          if (cached && cached.key === cacheKey && cached.index === idx) {
+            return cached.html;
+          }
+          const b = stockViewBars[idx];
+          if (!b) return cached?.html ?? '';
           let html = `<div style="padding:4px 8px;line-height:1.6;">`;
           html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
           html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
@@ -2449,7 +2492,27 @@ export default function App() {
               : Number(b.pct_b).toFixed(3);
           html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
           html += `</div></div>`;
+          stockViewAxisTooltipCacheRef.current = { key: cacheKey, index: idx, html };
           return html;
+        },
+        position: (point: number[], params: any, _dom: HTMLElement, _rect: any, size: { contentSize: number[]; viewSize: number[] }) => {
+          const list = Array.isArray(params) ? params : params ? [params] : [];
+          const kParam = list.find((p: any) => p?.seriesName === '日K');
+          const idx = typeof kParam?.dataIndex === 'number'
+            ? kParam.dataIndex
+            : stockViewAxisTooltipCacheRef.current?.index;
+          const cacheKey = selectedStockView.code;
+          const posCache = stockViewAxisTooltipPosRef.current;
+          if (posCache && posCache.key === cacheKey && posCache.index === idx && idx != null) {
+            return posCache.pos;
+          }
+          const x = Math.min(point[0], size.viewSize[0] - size.contentSize[0] - 8);
+          const y = Math.max(8, point[1] - size.contentSize[1] - 12);
+          const pos: [number, number] = [Math.max(8, x), y];
+          if (idx != null) {
+            stockViewAxisTooltipPosRef.current = { key: cacheKey, index: idx, pos };
+          }
+          return pos;
         },
       },
       legend: {
@@ -3827,26 +3890,82 @@ export default function App() {
                 </div>
                 <div className="form-group">
                   <label>截止日</label>
-                  <input
-                    type="date"
-                    value={stockViewEndDate}
-                    disabled={!selectedStockView}
-                    onChange={(e) => setStockViewEndDate(e.target.value)}
-                  />
+                  <div className="date-picker-field">
+                    <input
+                      ref={stockViewEndDateRef}
+                      type="date"
+                      className="date-picker-field__input"
+                      value={stockViewEndDate}
+                      disabled={!selectedStockView}
+                      onChange={(e) => setStockViewEndDate(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="lookback-stepper__btn date-picker-field__btn"
+                      disabled={!selectedStockView}
+                      aria-label="打开日期选择"
+                      title="选择截止日"
+                      onClick={() => {
+                        const el = stockViewEndDateRef.current;
+                        if (!el || el.disabled) return;
+                        try {
+                          if (typeof el.showPicker === 'function') {
+                            el.showPicker();
+                          } else {
+                            el.focus();
+                            el.click();
+                          }
+                        } catch {
+                          el.focus();
+                        }
+                      }}
+                    >
+                      <Calendar size={16} strokeWidth={2.25} />
+                    </button>
+                  </div>
                 </div>
                 <div className="form-group">
                   <label>回看日历日</label>
-                  <input
-                    type="number"
-                    min={30}
-                    max={500}
-                    value={stockViewLookback}
-                    disabled={!selectedStockView}
-                    onChange={(e) => setStockViewLookback(Number(e.target.value) || 0)}
-                    onBlur={() => {
-                      setStockViewLookback((v) => Math.min(500, Math.max(30, v || 120)));
-                    }}
-                  />
+                  <div
+                    className="zone-bound-stepper lookback-stepper"
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                  >
+                    <button
+                      type="button"
+                      aria-label="减少回看天数"
+                      className="zone-bound-stepper__btn lookback-stepper__btn"
+                      disabled={!selectedStockView || stockViewLookback <= 30}
+                      onClick={() => {
+                        setStockViewLookback((v) => Math.min(500, Math.max(30, (v || 120) - 10)));
+                      }}
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      min={30}
+                      max={500}
+                      step={10}
+                      value={stockViewLookback}
+                      disabled={!selectedStockView}
+                      className="zone-bound-stepper__input lookback-stepper__input"
+                      onChange={(e) => setStockViewLookback(Number(e.target.value) || 0)}
+                      onBlur={() => {
+                        setStockViewLookback((v) => Math.min(500, Math.max(30, v || 120)));
+                      }}
+                    />
+                    <button
+                      type="button"
+                      aria-label="增加回看天数"
+                      className="zone-bound-stepper__btn lookback-stepper__btn"
+                      disabled={!selectedStockView || stockViewLookback >= 500}
+                      onClick={() => {
+                        setStockViewLookback((v) => Math.min(500, Math.max(30, (v || 120) + 10)));
+                      }}
+                    >
+                      +
+                    </button>
+                  </div>
                 </div>
               </div>
 
