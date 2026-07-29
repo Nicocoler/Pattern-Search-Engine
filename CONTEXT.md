@@ -36,6 +36,13 @@ _Avoid_: 无时区的 `datetime.now().isoformat()` 写入状态表；依赖客�
 某只股票在某起止交易日区间上对某一 Pattern 的一次匹配结果；自然键为 `(code, pattern_id, start_date, end_date)`。
 _Avoid_: scan_results（那是 DTW 模板扫描落库）
 
+**Pattern Edge（转移边条件）**:
+编排上可选的硬过滤：在命中区间内要求原始日 zone 出现相邻 `from→to`，且 Arrival 日满足 `when`（v1 仅 `limit_up`）。配置为 `edges` 数组；空=不启用。
+_Avoid_: 把边条件编进 zone 字母表；把边条件当成打分加权
+
+**Edge Hit（边命中证据）**:
+一次 Pattern Match 上满足某条边条件的 Arrival 日记录（`from/to/when/date`），存于 `pattern_match_result.edge_hits`。
+
 **Scan Result**:
 DTW 模板全市场扫描写入 `scan_results` 的相似度推荐记录。
 _Avoid_: 与 Pattern Match 混称

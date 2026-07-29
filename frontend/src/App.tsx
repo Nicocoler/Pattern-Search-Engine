@@ -85,6 +85,20 @@ interface StockSearchItem {
   industry?: string;
 }
 
+interface BollEdgeHit {
+  from: string;
+  to: string;
+  when: string;
+  date: string;
+  idx?: number;
+}
+
+interface BollPatternEdge {
+  from: string;
+  to: string;
+  when: string;
+}
+
 interface BollPatternMatch {
   id: number;
   code: string;
@@ -95,6 +109,7 @@ interface BollPatternMatch {
   end_date: string;
   matched_states: string;
   score: number | null;
+  edge_hits?: BollEdgeHit[];
   scan_date: string | null;
   window_days: number;
 }
@@ -107,6 +122,7 @@ interface BollPatternMeta {
   min_total_days?: number;
   zone_thresholds?: Record<string, [string | number, string | number]> | null;
   denoise_min_len?: number | null;
+  edges?: BollPatternEdge[];
   effective?: {
     zone_thresholds: Record<string, [string | number, string | number]>;
     denoise_min_len: number;
@@ -594,6 +610,7 @@ export default function App() {
     override_denoise: false,
     bounds: { m: 0.35, h: 0.65, u: 0.95 },
     denoise: 0,
+    edges: [] as BollPatternEdge[],
   });
   const [bollGlobalDenoise, setBollGlobalDenoise] = useState(0);
   const [bollGlobalBounds, setBollGlobalBounds] = useState({ m: 0.35, h: 0.65, u: 0.95 });
@@ -894,6 +911,7 @@ export default function App() {
       override_denoise: false,
       bounds: { ...bollGlobalBounds },
       denoise: bollGlobalDenoise,
+      edges: [],
     });
     setBollShowManage(true);
     setBollFormBoundsInvalid(false);
@@ -915,6 +933,7 @@ export default function App() {
       denoise: hasDenoiseOverride
         ? Number(p.denoise_min_len)
         : Number(p.effective?.denoise_min_len ?? bollGlobalDenoise),
+      edges: Array.isArray(p.edges) ? p.edges.map(e => ({ ...e })) : [],
     });
     setBollShowManage(true);
     setBollFormBoundsInvalid(false);
@@ -940,6 +959,7 @@ export default function App() {
           regex: bollForm.regex,
           min_total_days: bollForm.min_total_days,
           enabled: bollForm.enabled,
+          edges: bollForm.edges,
           clear_zone_override: !bollForm.override_zone,
           clear_denoise_override: !bollForm.override_denoise,
         };
@@ -973,6 +993,7 @@ export default function App() {
             enabled: bollForm.enabled,
             zone_thresholds: zonePayload,
             denoise_min_len: denoisePayload,
+            edges: bollForm.edges,
           }),
         });
         const json = await res.json();
@@ -1253,6 +1274,7 @@ export default function App() {
         min_total_days: bollForm.min_total_days,
         zone_thresholds,
         denoise_min_len,
+        edges: bollForm.edges,
       };
       if (bollTryAsOf.trim()) body.as_of = bollTryAsOf.trim();
 
@@ -1281,6 +1303,7 @@ export default function App() {
         end_date: string;
         matched_states: string;
         score: number | null;
+        edge_hits?: BollEdgeHit[];
       }, i: number) => ({
         id: -(i + 1),
         code: data.code || code,
@@ -1291,6 +1314,7 @@ export default function App() {
         end_date: m.end_date,
         matched_states: m.matched_states,
         score: m.score,
+        edge_hits: m.edge_hits || [],
         scan_date: asOf || null,
         window_days: data.window_days ?? bollWindowDays,
       }));
@@ -2550,6 +2574,7 @@ export default function App() {
     highlightStart?: string;
     highlightEnd?: string;
     hasHighlight?: boolean;
+    edgeHits?: BollEdgeHit[];
   }) => {
     const {
       bars,
@@ -2559,6 +2584,7 @@ export default function App() {
       highlightStart,
       highlightEnd,
       hasHighlight = false,
+      edgeHits = [],
     } = args;
     if (!bars.length) return {};
 
@@ -2578,6 +2604,25 @@ export default function App() {
       v == null || Number.isNaN(Number(v)) ? 'N/A' : `￥${Number(v).toFixed(digits)}`;
     const fmtNum = (v: number | null | undefined, digits = 2) =>
       v == null || Number.isNaN(Number(v)) ? 'N/A' : Number(v).toFixed(digits);
+
+    const edgeMarkPoints = (edgeHits || [])
+      .filter(h => h?.date)
+      .map(h => {
+        const bar = bars.find(b => b.date === h.date);
+        return {
+          name: `${h.from}→${h.to}`,
+          coord: [h.date, bar?.high ?? bar?.close ?? 0],
+          value: h.when,
+          itemStyle: { color: '#f97316' },
+          label: {
+            show: true,
+            formatter: `${h.from}→${h.to}\n${h.when}`,
+            color: '#fdba74',
+            fontSize: 9,
+            position: 'top',
+          },
+        };
+      });
 
     const axisCommon = {
       type: 'category' as const,
@@ -2777,6 +2822,15 @@ export default function App() {
                 },
               }
             : {}),
+          ...(edgeMarkPoints.length
+            ? {
+                markPoint: {
+                  symbol: 'pin',
+                  symbolSize: 42,
+                  data: edgeMarkPoints,
+                },
+              }
+            : {}),
         },
         {
           name: 'BOLL-M',
@@ -2893,6 +2947,7 @@ export default function App() {
       highlightStart,
       highlightEnd,
       hasHighlight,
+      edgeHits: selectedBollMatch?.edge_hits || [],
     });
   };
 
@@ -3913,6 +3968,18 @@ export default function App() {
                           <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
                         </div>
                       ) : null}
+                      {selectedBollMatch?.edge_hits && selectedBollMatch.edge_hits.length > 0 ? (
+                        <div style={{ marginBottom: '0.45rem' }}>
+                          <b style={{ color: '#fdba74' }}>边条件命中</b>
+                          <div style={{ fontFamily: 'monospace', marginTop: '0.2rem', lineHeight: 1.5 }}>
+                            {selectedBollMatch.edge_hits.map((h, i) => (
+                              <div key={`${h.date}-${i}`}>
+                                {h.date} · {h.from}→{h.to} · {h.when}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
                       {bollStateString && (
                         <div>
                           <b style={{ color: '#cbd5e1' }}>
@@ -4009,6 +4076,94 @@ export default function App() {
                     <div className="form-group">
                       <label>min_total_days</label>
                       <input type="number" value={bollForm.min_total_days} onChange={e => setBollForm(f => ({ ...f, min_total_days: Number(e.target.value) }))} />
+                    </div>
+                    <div className="form-group">
+                      <label>转移边条件（可选）</label>
+                      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0 0 0.45rem', lineHeight: 1.45 }}>
+                        硬过滤：命中区间内须出现相邻 from→to，且 Arrival 日满足 when。v1 仅 limit_up；from/to 须在 regex 中相邻（不可夹 H*）。
+                      </p>
+                      {bollForm.edges.map((edge, idx) => (
+                        <div
+                          key={idx}
+                          style={{
+                            display: 'flex',
+                            flexWrap: 'wrap',
+                            gap: '0.35rem',
+                            alignItems: 'center',
+                            marginBottom: '0.35rem',
+                          }}
+                        >
+                          <select
+                            value={edge.from}
+                            onChange={e => {
+                              const from = e.target.value;
+                              setBollForm(f => {
+                                const edges = f.edges.slice();
+                                edges[idx] = { ...edges[idx], from };
+                                return { ...f, edges };
+                              });
+                            }}
+                            style={{ width: '3.6rem' }}
+                          >
+                            {['L', 'M', 'H', 'U'].map(z => (
+                              <option key={z} value={z}>{z}</option>
+                            ))}
+                          </select>
+                          <span style={{ color: 'var(--color-text-muted)', fontSize: '0.75rem' }}>→</span>
+                          <select
+                            value={edge.to}
+                            onChange={e => {
+                              const to = e.target.value;
+                              setBollForm(f => {
+                                const edges = f.edges.slice();
+                                edges[idx] = { ...edges[idx], to };
+                                return { ...f, edges };
+                              });
+                            }}
+                            style={{ width: '3.6rem' }}
+                          >
+                            {['L', 'M', 'H', 'U'].map(z => (
+                              <option key={z} value={z}>{z}</option>
+                            ))}
+                          </select>
+                          <select
+                            value={edge.when}
+                            onChange={e => {
+                              const when = e.target.value;
+                              setBollForm(f => {
+                                const edges = f.edges.slice();
+                                edges[idx] = { ...edges[idx], when };
+                                return { ...f, edges };
+                              });
+                            }}
+                            style={{ minWidth: '6.5rem' }}
+                          >
+                            <option value="limit_up">limit_up</option>
+                          </select>
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            style={{ padding: '0.15rem 0.45rem', fontSize: '0.72rem' }}
+                            onClick={() => setBollForm(f => ({
+                              ...f,
+                              edges: f.edges.filter((_, i) => i !== idx),
+                            }))}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.75rem' }}
+                        onClick={() => setBollForm(f => ({
+                          ...f,
+                          edges: [...f.edges, { from: 'L', to: 'M', when: 'limit_up' }],
+                        }))}
+                      >
+                        + 添加边条件
+                      </button>
                     </div>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.6rem' }}>
                       <input type="checkbox" checked={bollForm.enabled} onChange={e => setBollForm(f => ({ ...f, enabled: e.target.checked }))} />

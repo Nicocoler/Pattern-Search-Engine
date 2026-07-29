@@ -12,6 +12,7 @@ from typing import Any
 
 from psycopg2.extras import Json
 
+from backend.app.boll_pattern.edges import normalize_edges, validate_pattern_edges
 from backend.app.boll_pattern.loader import (
     load_boll_patterns,
     normalize_zone_thresholds,
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS boll_patterns (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     zone_thresholds JSONB,
     denoise_min_len INT,
+    edges JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -48,6 +50,13 @@ CREATE TABLE IF NOT EXISTS boll_patterns (
 def ensure_pattern_tables() -> None:
     with db.db_cursor(dict_cursor=False) as (conn, cur):
         cur.execute(ENSURE_PATTERN_TABLES_SQL)
+        # 旧库补列（CREATE IF NOT EXISTS 不会加新列）
+        cur.execute(
+            """
+            ALTER TABLE boll_patterns
+            ADD COLUMN IF NOT EXISTS edges JSONB NOT NULL DEFAULT '[]'::jsonb;
+            """
+        )
         conn.commit()
 
 
@@ -57,6 +66,14 @@ def _row_thresholds(raw: Any) -> dict[str, tuple[float, float]] | None:
     if isinstance(raw, str):
         raw = json.loads(raw)
     return normalize_zone_thresholds(raw)
+
+
+def _row_edges(raw: Any) -> list[dict[str, str]]:
+    """读路径只做轻量规范化；写路径才与 regex 交叉校验。"""
+    try:
+        return normalize_edges(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
 
 
 def _pattern_from_row(row: dict) -> dict[str, Any]:
@@ -71,6 +88,7 @@ def _pattern_from_row(row: dict) -> dict[str, Any]:
         "denoise_min_len": (
             int(row["denoise_min_len"]) if row.get("denoise_min_len") is not None else None
         ),
+        "edges": _row_edges(row.get("edges")),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -146,7 +164,7 @@ def list_patterns(include_disabled: bool = True) -> list[dict[str, Any]]:
     ensure_pattern_tables()
     sql = """
         SELECT id, name, regex, min_total_days, enabled,
-               zone_thresholds, denoise_min_len, created_at, updated_at
+               zone_thresholds, denoise_min_len, edges, created_at, updated_at
         FROM boll_patterns
     """
     if not include_disabled:
@@ -164,7 +182,7 @@ def get_pattern(pattern_id: str) -> dict[str, Any] | None:
         cur.execute(
             """
             SELECT id, name, regex, min_total_days, enabled,
-                   zone_thresholds, denoise_min_len, created_at, updated_at
+                   zone_thresholds, denoise_min_len, edges, created_at, updated_at
             FROM boll_patterns WHERE id = %s;
             """,
             (pattern_id,),
@@ -192,6 +210,7 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or pid).strip()
     regex = str(payload.get("regex") or "").strip()
     validate_regex(regex)
+    edges = validate_pattern_edges(regex, payload.get("edges"))
     min_days = int(payload.get("min_total_days") or 0)
     enabled = bool(payload.get("enabled", True))
     zt_raw = payload.get("zone_thresholds")
@@ -204,8 +223,8 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO boll_patterns (
                 id, name, regex, min_total_days, enabled,
-                zone_thresholds, denoise_min_len, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
+                zone_thresholds, denoise_min_len, edges, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
             """,
             (
                 pid,
@@ -215,6 +234,7 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
                 enabled,
                 Json(thresholds_to_jsonable(zt)) if zt is not None else None,
                 dnl_val,
+                Json(edges),
             ),
         )
         conn.commit()
@@ -232,6 +252,11 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload["name"]).strip() if "name" in payload else existing["name"]
     regex = str(payload["regex"]).strip() if "regex" in payload else existing["regex"]
     validate_regex(regex)
+    if "edges" in payload:
+        edges = validate_pattern_edges(regex, payload.get("edges"))
+    else:
+        # regex 变更时仍须与既有 edges 交叉校验
+        edges = validate_pattern_edges(regex, existing.get("edges") or [])
     min_days = (
         int(payload["min_total_days"])
         if "min_total_days" in payload
@@ -261,6 +286,7 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 enabled = %s,
                 zone_thresholds = %s,
                 denoise_min_len = %s,
+                edges = %s,
                 updated_at = NOW()
             WHERE id = %s;
             """,
@@ -271,6 +297,7 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 enabled,
                 Json(thresholds_to_jsonable(zt)) if zt is not None else None,
                 dnl_val,
+                Json(edges),
                 pattern_id,
             ),
         )
@@ -351,6 +378,7 @@ def effective_config(pattern: dict[str, Any], settings: dict[str, Any] | None = 
         "enabled": bool(pattern.get("enabled", True)),
         "zone_thresholds": zt,
         "denoise_min_len": dnl,
+        "edges": list(pattern.get("edges") or []),
     }
 
 
@@ -380,6 +408,7 @@ def serialize_pattern_for_api(pattern: dict[str, Any], settings: dict[str, Any] 
             else None
         ),
         "denoise_min_len": pattern.get("denoise_min_len"),
+        "edges": list(pattern.get("edges") or []),
         "effective": {
             "zone_thresholds": thresholds_to_jsonable(eff["zone_thresholds"]),
             "denoise_min_len": eff["denoise_min_len"],

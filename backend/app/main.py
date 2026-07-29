@@ -163,6 +163,10 @@ class BollPatternPreviewPayload(BaseModel):
     min_total_days: int = Field(default=0, ge=0)
     zone_thresholds: dict = Field(..., description="effective 分区阈值（含页面未保存的全局草稿合并结果）")
     denoise_min_len: int = Field(default=0, ge=0, description="effective 去抖最短持续天数")
+    edges: list[dict] | None = Field(
+        default=None,
+        description="可选转移边条件，如 [{from:L,to:M,when:limit_up}]；空/省略=不启用",
+    )
 
 class BollPatternCreatePayload(BaseModel):
     id: str = Field(..., description="编排唯一 id，创建后不可改")
@@ -172,6 +176,7 @@ class BollPatternCreatePayload(BaseModel):
     enabled: bool = Field(default=True)
     zone_thresholds: dict | None = Field(default=None, description="稀疏覆盖；null 用全局")
     denoise_min_len: int | None = Field(default=None, description="稀疏覆盖；null 用全局")
+    edges: list[dict] | None = Field(default=None, description="转移边条件；null/[]=无")
 
 class BollPatternUpdatePayload(BaseModel):
     name: str | None = None
@@ -185,6 +190,10 @@ class BollPatternUpdatePayload(BaseModel):
     denoise_min_len: int | None = Field(
         default=None,
         description="传入 int 覆盖；需清空时配合 clear_denoise_override",
+    )
+    edges: list[dict] | None = Field(
+        default=None,
+        description="传入则整体替换；省略则保留原 edges（仍会与新 regex 交叉校验）",
     )
     clear_zone_override: bool = Field(default=False, description="为 true 时清空 zone 覆盖")
     clear_denoise_override: bool = Field(default=False, description="为 true 时清空 denoise 覆盖")
@@ -1060,6 +1069,7 @@ def preview_boll_pattern(payload: BollPatternPreviewPayload):
             "min_total_days": int(payload.min_total_days or 0),
             "zone_thresholds": zt,
             "denoise_min_len": int(payload.denoise_min_len or 0),
+            "edges": payload.edges or [],
         }
         data = BollPatternScanner().preview_one(
             code,
@@ -1339,7 +1349,7 @@ def get_boll_pattern_matches(
             SELECT m.id, m.code, s.name, m.pattern_id,
                    COALESCE(bp.name, m.pattern_name) AS pattern_name,
                    m.start_date, m.end_date, m.matched_states, m.score,
-                   m.scan_date, m.window_days, m.updated_at
+                   m.edge_hits, m.scan_date, m.window_days, m.updated_at
             FROM pattern_match_result m
             LEFT JOIN stocks s ON s.code = m.code
             LEFT JOIN boll_patterns bp ON bp.id = m.pattern_id
@@ -1352,6 +1362,15 @@ def get_boll_pattern_matches(
         rows = cursor.fetchall()
         items = []
         for r in rows:
+            edge_hits = r.get("edge_hits")
+            if isinstance(edge_hits, str):
+                import json as _json
+                try:
+                    edge_hits = _json.loads(edge_hits)
+                except Exception:
+                    edge_hits = []
+            if edge_hits is None:
+                edge_hits = []
             items.append({
                 "id": r["id"],
                 "code": r["code"],
@@ -1362,6 +1381,7 @@ def get_boll_pattern_matches(
                 "end_date": r["end_date"].isoformat() if r["end_date"] else None,
                 "matched_states": r["matched_states"],
                 "score": float(r["score"]) if r["score"] is not None else None,
+                "edge_hits": edge_hits,
                 "scan_date": r["scan_date"].isoformat() if r["scan_date"] else None,
                 "window_days": r["window_days"],
                 "updated_at": isoformat_beijing(r.get("updated_at")),

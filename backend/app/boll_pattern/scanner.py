@@ -12,8 +12,9 @@ from datetime import date, datetime, timedelta
 from typing import Any, Callable, Sequence
 
 import pandas as pd
-from psycopg2.extras import execute_values
+from psycopg2.extras import Json, execute_values
 
+from backend.app.boll_pattern.edges import apply_edge_filter_to_matches, validate_pattern_edges
 from backend.app.boll_pattern.loader import normalize_zone_thresholds
 from backend.app.boll_pattern.matcher import find_patterns_with_dates
 from backend.app.boll_pattern.repository import (
@@ -111,6 +112,7 @@ CREATE TABLE IF NOT EXISTS pattern_match_result (
     end_date DATE NOT NULL,
     matched_states TEXT NOT NULL,
     score NUMERIC(10, 4),
+    edge_hits JSONB NOT NULL DEFAULT '[]'::jsonb,
     scan_date DATE NOT NULL,
     window_days INT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -120,6 +122,15 @@ CREATE TABLE IF NOT EXISTS pattern_match_result (
 CREATE INDEX IF NOT EXISTS idx_pattern_match_scan_date ON pattern_match_result (scan_date DESC);
 CREATE INDEX IF NOT EXISTS idx_pattern_match_end_pattern ON pattern_match_result (end_date DESC, pattern_id);
 """ + "\n" + ENSURE_PATTERN_TABLES_SQL
+
+
+def _ensure_edge_hits_column(cur) -> None:
+    cur.execute(
+        """
+        ALTER TABLE pattern_match_result
+        ADD COLUMN IF NOT EXISTS edge_hits JSONB NOT NULL DEFAULT '[]'::jsonb;
+        """
+    )
 
 
 class BollPatternScanner:
@@ -141,6 +152,7 @@ class BollPatternScanner:
     def ensure_tables(self) -> None:
         with db.db_cursor(dict_cursor=False) as (conn, cur):
             cur.execute(ENSURE_TABLES_SQL)
+            _ensure_edge_hits_column(cur)
             conn.commit()
         seed_from_yaml(self.yaml_path)
         self.reload_config()
@@ -306,6 +318,7 @@ class BollPatternScanner:
         rows = []
         for m in matches:
             score = m.get("score")
+            edge_hits = m.get("edge_hits") or []
             rows.append((
                 code,
                 m["pattern_id"],
@@ -314,19 +327,21 @@ class BollPatternScanner:
                 m["end_date"],
                 m["matched_states"],
                 float(score) if score is not None else None,
+                Json(edge_hits),
                 scan_date,
                 window_days,
             ))
         sql = """
             INSERT INTO pattern_match_result (
                 code, pattern_id, pattern_name, start_date, end_date,
-                matched_states, score, scan_date, window_days, created_at, updated_at
+                matched_states, score, edge_hits, scan_date, window_days, created_at, updated_at
             )
             VALUES %s
             ON CONFLICT (code, pattern_id, start_date, end_date) DO UPDATE SET
                 pattern_name = EXCLUDED.pattern_name,
                 matched_states = EXCLUDED.matched_states,
                 score = EXCLUDED.score,
+                edge_hits = EXCLUDED.edge_hits,
                 scan_date = EXCLUDED.scan_date,
                 window_days = EXCLUDED.window_days,
                 updated_at = NOW();
@@ -336,7 +351,7 @@ class BollPatternScanner:
                 cur,
                 sql,
                 rows,
-                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
                 page_size=200,
             )
             conn.commit()
@@ -362,16 +377,25 @@ class BollPatternScanner:
             return {"code": code, "states": n_states, "matches": 0, "skipped": False}
 
         dates = list(win["date"].tolist())
+        closes = [float(x) for x in win["close"].tolist()]
         pct_series = win["pct_b"]
         all_matches: list[dict] = []
 
         for pat in self.enabled_patterns:
-            zones = zones_from_series(pct_series, pat["zone_thresholds"])
-            zones = apply_denoise_to_states(zones, int(pat["denoise_min_len"]))
-            s = state_string(zones)
+            raw_zones = zones_from_series(pct_series, pat["zone_thresholds"])
+            match_zones = apply_denoise_to_states(raw_zones, int(pat["denoise_min_len"]))
+            s = state_string(match_zones)
             hits = find_patterns_with_dates(s, dates, [pat])
+            hits = apply_edge_filter_to_matches(
+                hits,
+                code=code,
+                raw_zones=raw_zones,
+                closes=closes,
+                dates=dates,
+                edges=pat.get("edges") or [],
+            )
             win_for_score = win.copy()
-            win_for_score["zone"] = zones
+            win_for_score["zone"] = match_zones
             for m in hits:
                 try:
                     m["score"] = score_match_from_window(m, win_for_score, df_full)
@@ -424,8 +448,10 @@ class BollPatternScanner:
 
         win = df_full.tail(int(window_days)).copy().reset_index(drop=True)
         dates = list(win["date"].tolist())
+        closes = [float(x) for x in win["close"].tolist()]
         zt = normalize_zone_thresholds(pattern.get("zone_thresholds"))
         dnl = int(pattern.get("denoise_min_len") or 0)
+        edges = validate_pattern_edges(regex, pattern.get("edges"))
         pat_cfg = {
             "id": pattern.get("id") or "draft",
             "name": pattern.get("name") or pattern.get("id") or "草稿",
@@ -433,13 +459,22 @@ class BollPatternScanner:
             "min_total_days": int(pattern.get("min_total_days") or 0),
             "zone_thresholds": zt,
             "denoise_min_len": dnl,
+            "edges": edges,
         }
-        zones = zones_from_series(win["pct_b"], zt)
-        zones = apply_denoise_to_states(zones, dnl)
-        s = state_string(zones)
+        raw_zones = zones_from_series(win["pct_b"], zt)
+        match_zones = apply_denoise_to_states(raw_zones, dnl)
+        s = state_string(match_zones)
         hits = find_patterns_with_dates(s, dates, [pat_cfg])
+        hits = apply_edge_filter_to_matches(
+            hits,
+            code=code,
+            raw_zones=raw_zones,
+            closes=closes,
+            dates=dates,
+            edges=edges,
+        )
         win_for_score = win.copy()
-        win_for_score["zone"] = zones
+        win_for_score["zone"] = match_zones
         out_matches: list[dict[str, Any]] = []
         for m in hits:
             score = None
@@ -461,6 +496,7 @@ class BollPatternScanner:
                 "score": score,
                 "start_idx": int(m["start_idx"]),
                 "end_idx": int(m["end_idx"]),
+                "edge_hits": m.get("edge_hits") or [],
             })
 
         out_matches.sort(
