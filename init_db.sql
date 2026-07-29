@@ -11,6 +11,7 @@
 CREATE TABLE IF NOT EXISTS stocks (
     code VARCHAR(12) PRIMARY KEY,                       -- 股票代码（如: sh600519, sz000002）
     name VARCHAR(64) NOT NULL,                          -- 股票名称
+    name_pinyin_abbr VARCHAR(64),                       -- 名称拼音首字母缩写（如: 思源电器→sydt，万科A→wka）
     list_date DATE,                                     -- 上市日期
     board VARCHAR(32),                                  -- 板块（主板/创业板/科创板/北交所）
     industry VARCHAR(64),                               -- 行业分类
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS stocks (
 
 -- 创建索引以加速基础筛选
 CREATE INDEX IF NOT EXISTS idx_stocks_board_st ON stocks(board, is_st) WHERE is_suspended = FALSE;
+CREATE INDEX IF NOT EXISTS idx_stocks_name_pinyin_abbr ON stocks(name_pinyin_abbr);
 
 -- 3. 时序日K行情表（如果是 TimescaleDB，后续将被转化为分区超表）
 CREATE TABLE IF NOT EXISTS daily_bars (

@@ -24,3 +24,4 @@ redis>=4.5.0
 eventlet>=0.33.0  # Win32 Celery 专用协程池驱动
 python-dotenv>=1.0.0
 PyYAML>=6.0.0
+pypinyin>=0.51.0

@@ -20,18 +20,28 @@ class TestAPIEndpoints(unittest.TestCase):
         self.client = TestClient(app)
         self.db_url = settings.DATABASE_URL
         
-        # 确保 stocks 表中有万科A和贵州茅台
+        # 确保 stocks 表中有万科A和贵州茅台（含拼音首字母，供搜索用例）
+        from backend.app.core.pinyin_abbr import ensure_stocks_pinyin_column, name_to_pinyin_abbr
+
+        ensure_stocks_pinyin_column(backfill=False)
         conn = psycopg2.connect(self.db_url)
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO stocks (code, name, list_date, board, industry, is_st, is_suspended)
+            INSERT INTO stocks (code, name, name_pinyin_abbr, list_date, board, industry, is_st, is_suspended)
             VALUES 
-            ('sz000002', '万科A', '1991-01-29', '主板', '房地产', FALSE, FALSE),
-            ('sh600519', '贵州茅台', '2001-08-27', '主板', '白酒', FALSE, FALSE)
+            ('sz000002', '万科A', %s, '1991-01-29', '主板', '房地产', FALSE, FALSE),
+            ('sh600519', '贵州茅台', %s, '2001-08-27', '主板', '白酒', FALSE, FALSE),
+            ('sz002028', '思源电气', %s, '2004-08-05', '主板', '电气设备', FALSE, FALSE)
             ON CONFLICT (code) DO UPDATE SET
+                name = EXCLUDED.name,
+                name_pinyin_abbr = EXCLUDED.name_pinyin_abbr,
                 is_st = FALSE,
                 is_suspended = FALSE;
-        """)
+        """, (
+            name_to_pinyin_abbr("万科A"),
+            name_to_pinyin_abbr("贵州茅台"),
+            name_to_pinyin_abbr("思源电气"),
+        ))
         conn.commit()
         cursor.close()
         conn.close()
@@ -139,12 +149,32 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertEqual(res_search_as_symbol.status_code, 200)
         self.assertTrue(res_search_as_symbol.json()["success"])
 
+        # 拼音首字母：sydq → 思源电气；wka → 万科A；gzmt → 贵州茅台
+        res_py = self.client.get("/api/stocks/search", params={"q": "sydq", "limit": 10})
+        self.assertEqual(res_py.status_code, 200)
+        py_items = res_py.json()["data"]["items"]
+        self.assertTrue(any(i["code"] == "sz002028" for i in py_items), py_items)
+        self.assertEqual(py_items[0]["code"], "sz002028")
+
+        res_wka = self.client.get("/api/stocks/search", params={"q": "wka", "limit": 10})
+        self.assertTrue(any(i["code"] == "sz000002" for i in res_wka.json()["data"]["items"]))
+
+        res_gzmt = self.client.get("/api/stocks/search", params={"q": "gzmt", "limit": 10})
+        self.assertTrue(any(i["code"] == "sh600519" for i in res_gzmt.json()["data"]["items"]))
+
+        # 单字母不启用拼音条件（仍可走名称/代码）
+        res_single = self.client.get("/api/stocks/search", params={"q": "s", "limit": 10})
+        self.assertEqual(res_single.status_code, 200)
+        self.assertTrue(res_single.json()["success"])
+
         bars_res = self.client.get("/api/stocks/sh600519/bars", params={"lookback_days": 60})
         self.assertEqual(bars_res.status_code, 200)
         bars_json = bars_res.json()
         if bars_json.get("success") and bars_json["data"].get("bars"):
             sample = bars_json["data"]["bars"][-1]
             self.assertIn("pct_b", sample)
+            for key in ("dif", "dea", "macd", "k", "d", "j"):
+                self.assertIn(key, sample)
 
     def test_04_historical_backtest_api(self):
         """

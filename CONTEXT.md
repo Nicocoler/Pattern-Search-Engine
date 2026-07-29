@@ -39,3 +39,7 @@ _Avoid_: scan_results（那是 DTW 模板扫描落库）
 **Scan Result**:
 DTW 模板全市场扫描写入 `scan_results` 的相似度推荐记录。
 _Avoid_: 与 Pattern Match 混称
+
+**Chart Subpane（图表副图）**:
+主图之下仅供看盘的 MACD、KDJ 等序列展示；公式权威在后端纯函数并对齐通达信，但不进入 Market Pipeline 的 `indicators` 层，也不写入 `technical_indicators`。
+_Avoid_: 把副图叫成 Indicator / 指标层；把副图公式并进脏因子重算链路；在前端另造一套数值真相

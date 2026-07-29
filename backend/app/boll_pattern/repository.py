@@ -275,7 +275,55 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         conn.commit()
+    # 命中表 pattern_name 为冗余展示字段：改名后立刻对齐
+    try:
+        sync_match_pattern_names(pattern_id)
+    except Exception as ex:
+        logger.warning("同步命中表编排名失败 pattern_id=%s: %s", pattern_id, ex)
     return get_pattern(pattern_id)  # type: ignore
+
+
+def sync_match_pattern_names(pattern_id: str | None = None) -> int:
+    """
+    用 boll_patterns.name 刷新 pattern_match_result.pattern_name。
+    pattern_id 给定则只刷该编排；否则刷全部有目录行的命中。
+    """
+    ensure_pattern_tables()
+    with db.db_cursor(dict_cursor=False) as (conn, cur):
+        # 命中表可能尚未创建（从未扫描）
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'pattern_match_result';
+            """
+        )
+        if cur.fetchone() is None:
+            return 0
+        if pattern_id:
+            cur.execute(
+                """
+                UPDATE pattern_match_result AS m
+                SET pattern_name = p.name, updated_at = NOW()
+                FROM boll_patterns AS p
+                WHERE m.pattern_id = p.id
+                  AND p.id = %s
+                  AND m.pattern_name IS DISTINCT FROM p.name;
+                """,
+                (pattern_id,),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE pattern_match_result AS m
+                SET pattern_name = p.name, updated_at = NOW()
+                FROM boll_patterns AS p
+                WHERE m.pattern_id = p.id
+                  AND m.pattern_name IS DISTINCT FROM p.name;
+                """
+            )
+        n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+    return int(n)
 
 
 def disable_pattern(pattern_id: str) -> dict[str, Any]:

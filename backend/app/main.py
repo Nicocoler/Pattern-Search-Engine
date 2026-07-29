@@ -81,6 +81,12 @@ async def lifespan(app: FastAPI):
         logger.info("⚡ 布林编排种子补缺完成: %s", seed_info)
     except Exception as ex:
         logger.warning("布林编排种子补缺跳过（库可能未就绪）: %s", ex)
+    try:
+        from backend.app.core.pinyin_abbr import ensure_stocks_pinyin_column
+        py_info = ensure_stocks_pinyin_column(backfill=True)
+        logger.info("⚡ 股票拼音首字母列检查完成: %s", py_info)
+    except Exception as ex:
+        logger.warning("股票拼音首字母列补缺跳过（库可能未就绪）: %s", ex)
     logger.info("⚡ 预设特征模板状态检查通过，准备对外倾泄行情计算服务！")
     yield
     db.closeall()
@@ -755,7 +761,13 @@ def get_sync_status():
 
 # 4. 核心同屏对齐比对比对 API (同屏画图神器)
 # -------------------------------------------------------------------------
-def _window_to_bars(df_window: pd.DataFrame) -> list:
+def _finite_or_none(row, key: str):
+    if key not in row or pd.isna(row[key]):
+        return None
+    return float(row[key])
+
+
+def _window_to_bars(df_window: pd.DataFrame, *, include_subpanes: bool = False) -> list:
     """将特征窗口 DataFrame 序列化为前端 K 线契约所需的 bar 字典列表。"""
     from backend.app.boll_pattern.pct_b import calc_pct_b
 
@@ -771,18 +783,26 @@ def _window_to_bars(df_window: pd.DataFrame) -> list:
 
     bars = []
     for _, row in df.iterrows():
-        bars.append({
+        bar = {
             "date": row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"]),
             "open": float(row["open"]),
             "high": float(row["high"]),
             "low": float(row["low"]),
             "close": float(row["close"]),
             "volume": float(row["volume"]),
-            "boll_mid": float(row["boll_mid"]) if "boll_mid" in row and not pd.isna(row["boll_mid"]) else None,
-            "boll_upper": float(row["boll_upper"]) if "boll_upper" in row and not pd.isna(row["boll_upper"]) else None,
-            "boll_lower": float(row["boll_lower"]) if "boll_lower" in row and not pd.isna(row["boll_lower"]) else None,
-            "pct_b": float(row["pct_b"]) if "pct_b" in row and not pd.isna(row["pct_b"]) else None,
-        })
+            "boll_mid": _finite_or_none(row, "boll_mid"),
+            "boll_upper": _finite_or_none(row, "boll_upper"),
+            "boll_lower": _finite_or_none(row, "boll_lower"),
+            "pct_b": _finite_or_none(row, "pct_b"),
+        }
+        if include_subpanes:
+            bar["dif"] = _finite_or_none(row, "dif")
+            bar["dea"] = _finite_or_none(row, "dea")
+            bar["macd"] = _finite_or_none(row, "macd")
+            bar["k"] = _finite_or_none(row, "k")
+            bar["d"] = _finite_or_none(row, "d")
+            bar["j"] = _finite_or_none(row, "j")
+        bars.append(bar)
     return bars
 
 @app.get("/api/compare/template/{template_id}/stock/{symbol}")
@@ -1316,11 +1336,13 @@ def get_boll_pattern_matches(
 
         cursor.execute(
             f"""
-            SELECT m.id, m.code, s.name, m.pattern_id, m.pattern_name,
+            SELECT m.id, m.code, s.name, m.pattern_id,
+                   COALESCE(bp.name, m.pattern_name) AS pattern_name,
                    m.start_date, m.end_date, m.matched_states, m.score,
                    m.scan_date, m.window_days, m.updated_at
             FROM pattern_match_result m
             LEFT JOIN stocks s ON s.code = m.code
+            LEFT JOIN boll_patterns bp ON bp.id = m.pattern_id
             WHERE {where_sql}
             ORDER BY {order_sql}
             LIMIT %s OFFSET %s;
@@ -1364,9 +1386,11 @@ def get_stock_bars_with_boll(
     lookback_days: int = Query(120, ge=30, le=500, description="返回窗口的日历回溯天数（计算暖机固定按 compare 的 250 天）"),
 ):
     """
-    返回个股 OHLCV + 布林三轨。经 market_pipeline 统一门面，与 compare 同源暖机与布林计算。
+    返回个股 OHLCV + 布林三轨 + Chart Subpane（通达信 MACD/KDJ）。
+    经 market_pipeline 统一门面暖机；副图在完整暖机序列上计算后再切展示窗（ADR 0003）。
     """
     try:
+        from backend.app.chart_subpane import apply_chart_subpanes
         from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, prepare_stock_frame
         code = symbol.lower().strip()
         if end_date:
@@ -1379,16 +1403,19 @@ def get_stock_bars_with_boll(
                 return {"success": False, "data": None, "error": "该股票暂无行情数据"}
             target = row["d"] if isinstance(row["d"], date) else datetime.strptime(str(row["d"]), "%Y-%m-%d").date()
 
-        df_out = prepare_stock_frame(
-            code,
-            target,
-            level="features",
-            display_calendar_days=int(lookback_days),
-        )
+        # 先在完整暖机帧上算副图，再按日历切展示窗（避免 EMA 种子被截断）
+        df_full = prepare_stock_frame(code, target, level="features")
+        if df_full.empty:
+            return {"success": False, "data": None, "error": "行情数据不足"}
+
+        df_full = apply_chart_subpanes(df_full)
+        display_start = target - timedelta(days=int(lookback_days))
+        dates = pd.to_datetime(df_full["date"]).dt.date
+        df_out = df_full.loc[dates >= display_start].copy().reset_index(drop=True)
         if df_out.empty:
             return {"success": False, "data": None, "error": "行情数据不足"}
 
-        bars = _window_to_bars(df_out)
+        bars = _window_to_bars(df_out, include_subpanes=True)
         return {
             "success": True,
             "data": {
@@ -1434,10 +1461,17 @@ def get_stock_boll_states_api(
 # -------------------------------------------------------------------------
 @app.get("/api/stocks/search")
 def search_stocks(
-    q: str = Query(..., min_length=1, description="名称或代码关键词"),
+    q: str = Query(..., min_length=1, description="名称、代码或拼音首字母关键词"),
     limit: int = Query(10, ge=1, le=50, description="返回条数上限"),
 ):
-    """按 code / name 模糊匹配股票池，供个股走势联想搜索。"""
+    """按 code / name / 拼音首字母前缀匹配股票池，供个股走势联想搜索。"""
+    from backend.app.core.pinyin_abbr import ensure_stocks_pinyin_column
+
+    try:
+        ensure_stocks_pinyin_column(backfill=True)
+    except Exception as ex:
+        logger.warning("搜索前拼音列确保失败（继续尝试查询）: %s", ex)
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -1450,24 +1484,73 @@ def search_stocks(
         name_like = f"%{raw}%"
         digits = "".join(ch for ch in needle if ch.isdigit())
         six = digits if len(digits) == 6 else None
+        # 纯字母且长度≥2 才启用拼音前缀（单字母噪音过大）
+        letter_only = needle.isalpha()
+        use_pinyin = letter_only and len(needle) >= 2
+        pinyin_prefix = f"{needle}%" if use_pinyin else None
 
-        # 名称精确/前缀优先，再代码精确/含匹配
-        cursor.execute(
+        # 纯字母：拼音全等/前缀优先；含数字：保持名称/代码优先
+        if letter_only:
+            order_sql = """
+              CASE
+                WHEN %s AND name_pinyin_abbr = %s THEN 0
+                WHEN %s AND name_pinyin_abbr LIKE %s THEN 1
+                WHEN name = %s THEN 2
+                WHEN name ILIKE %s THEN 3
+                WHEN code = %s THEN 4
+                WHEN %s IS NOT NULL AND RIGHT(code, 6) = %s THEN 5
+                WHEN code ILIKE %s THEN 6
+                ELSE 7
+              END
             """
-            SELECT code, name, board, industry
-            FROM stocks
-            WHERE code ILIKE %s
-               OR name ILIKE %s
-               OR (%s IS NOT NULL AND RIGHT(code, 6) = %s)
-            ORDER BY
+            order_params = (
+                use_pinyin,
+                needle,
+                use_pinyin,
+                pinyin_prefix or "",
+                raw,
+                f"{raw}%",
+                needle,
+                six,
+                six,
+                like,
+            )
+        else:
+            order_sql = """
               CASE
                 WHEN name = %s THEN 0
                 WHEN name ILIKE %s THEN 1
                 WHEN code = %s THEN 2
                 WHEN %s IS NOT NULL AND RIGHT(code, 6) = %s THEN 3
                 WHEN code ILIKE %s THEN 4
-                ELSE 5
-              END,
+                WHEN %s AND name_pinyin_abbr = %s THEN 5
+                WHEN %s AND name_pinyin_abbr LIKE %s THEN 6
+                ELSE 7
+              END
+            """
+            order_params = (
+                raw,
+                f"{raw}%",
+                needle,
+                six,
+                six,
+                like,
+                use_pinyin,
+                needle,
+                use_pinyin,
+                pinyin_prefix or "",
+            )
+
+        cursor.execute(
+            f"""
+            SELECT code, name, board, industry
+            FROM stocks
+            WHERE code ILIKE %s
+               OR name ILIKE %s
+               OR (%s IS NOT NULL AND RIGHT(code, 6) = %s)
+               OR (%s AND name_pinyin_abbr LIKE %s)
+            ORDER BY
+              {order_sql},
               code ASC
             LIMIT %s;
             """,
@@ -1476,12 +1559,9 @@ def search_stocks(
                 name_like,
                 six,
                 six,
-                raw,
-                f"{raw}%",
-                needle,
-                six,
-                six,
-                like,
+                use_pinyin,
+                pinyin_prefix or "",
+                *order_params,
                 int(limit),
             ),
         )

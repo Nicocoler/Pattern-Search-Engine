@@ -61,8 +61,12 @@ body {
 .header-left h1 {
   font-size: 1.8rem;
   font-weight: 800;
+  line-height: 1.35;
+  padding-bottom: 0.12em;
+  overflow: visible;
   background: linear-gradient(135deg, #3b82f6 0%, #a78bfa 100%);
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
   display: flex;
   align-items: center;
@@ -139,6 +143,62 @@ body {
   color: var(--color-primary);
   border-color: var(--color-primary);
   box-shadow: 0 0 12px rgba(59, 130, 246, 0.15);
+}
+
+.tab-more {
+  position: relative;
+}
+
+.tab-more-chevron {
+  transition: transform 0.2s ease;
+}
+
+.tab-more-chevron.open {
+  transform: rotate(180deg);
+}
+
+.tab-more-menu {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 0;
+  z-index: 40;
+  min-width: 260px;
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+}
+
+.tab-more-item {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-text-muted);
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.88rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  text-align: left;
+  width: 100%;
+  transition: all 0.2s ease;
+}
+
+.tab-more-item:hover {
+  background: var(--bg-card-hover);
+  color: var(--color-text-main);
+}
+
+.tab-more-item.active {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.2) 0%, rgba(59, 130, 246, 0.05) 100%);
+  color: var(--color-primary);
+  border-color: rgba(59, 130, 246, 0.35);
 }
 
 /* Layout Split */
@@ -962,6 +1022,21 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.form-group .lookback-preset-select {
+  width: 4.6rem;
+  flex-shrink: 0;
+  height: 2.35rem;
+  padding: 0.35rem 0.35rem 0.35rem 0.45rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.form-group .lookback-preset-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* 统一日期字段（DatePickerField）：隐藏原生微弱日历图标，改用显式按钮 */
 .date-picker-field {
   display: flex;
@@ -1029,7 +1104,7 @@ body {
 /* 个股走势 */
 .stock-view-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 2fr) minmax(140px, 1fr) minmax(120px, 0.8fr);
+  grid-template-columns: minmax(220px, 2fr) minmax(140px, 1fr) minmax(200px, 1.1fr);
   gap: 0.75rem 1rem;
   margin-bottom: 1rem;
   align-items: end;

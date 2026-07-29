@@ -19,6 +19,7 @@ import akshare as ak
 from psycopg2.extras import execute_values
 
 from backend.app.core import db
+from backend.app.core.pinyin_abbr import ensure_stocks_pinyin_column, name_to_pinyin_abbr
 from backend.app.core.timeutil import now_beijing, today_beijing
 
 # 日志：仅获取命名空间 logger，输出由 main.py root logger / sync_daemon 统一配置，
@@ -140,20 +141,23 @@ class DataCenterSync:
             is_st = "ST" in name or "*ST" in name
             # 最新价为空说明可能处于停牌阶段
             is_suspended = pd.isna(row['最新价']) or float(row['最新价']) == 0.0
+            name_pinyin_abbr = name_to_pinyin_abbr(name)
             
             # 由于 spot 接口无法拿到行业和上市日期，我们后续增量拉K线时如有必要可单独补齐，在此提供默认值
             stocks_to_insert.append((
-                code, name, None, board, "综合", is_st, is_suspended, now_beijing()
+                code, name, name_pinyin_abbr, None, board, "综合", is_st, is_suspended, now_beijing()
             ))
 
-        # 批量 UPSERT 入库
+        # 批量 UPSERT 入库（先确保拼音列存在，兼容旧库）
+        ensure_stocks_pinyin_column(backfill=False)
         conn = db.acquire()
         cursor = conn.cursor()
         upsert_query = """
-            INSERT INTO stocks (code, name, list_date, board, industry, is_st, is_suspended, updated_at)
+            INSERT INTO stocks (code, name, name_pinyin_abbr, list_date, board, industry, is_st, is_suspended, updated_at)
             VALUES %s
             ON CONFLICT (code) DO UPDATE SET
                 name = EXCLUDED.name,
+                name_pinyin_abbr = EXCLUDED.name_pinyin_abbr,
                 is_st = EXCLUDED.is_st,
                 is_suspended = EXCLUDED.is_suspended,
                 updated_at = EXCLUDED.updated_at;

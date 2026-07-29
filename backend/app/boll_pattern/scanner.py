@@ -506,6 +506,14 @@ class BollPatternScanner:
 
         self.ensure_tables()
         self.reload_config()
+        # 扫描前把命中表冗余 pattern_name 对齐到编排现名（改名后即使旧行未清干净也能刷新）
+        try:
+            from backend.app.boll_pattern.repository import sync_match_pattern_names
+            n_synced = sync_match_pattern_names()
+            if n_synced:
+                logger.info("扫描前已刷新命中编排名 %d 条", n_synced)
+        except Exception as ex:
+            logger.warning("扫描前刷新命中编排名失败: %s", ex)
         # 计划默认 60，至少支持 120；其它正整数亦允许便于调试
         if window_days <= 0:
             raise ValueError("window_days 必须 > 0")

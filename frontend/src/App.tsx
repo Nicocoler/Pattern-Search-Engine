@@ -3,7 +3,7 @@
 // 职责：实现极速扫描大PK、起始点归零百分比重合 Kline 绘制、高斯事件悬浮气泡标注、滚动无偏回测图表、自适应反馈闭环
 // =============================================================================
 
-import { useState, useEffect, useRef, type CSSProperties } from 'react';
+import { useState, useEffect, useRef, type CSSProperties, type MutableRefObject } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
   TrendingUp,
@@ -69,6 +69,13 @@ interface Bar {
   boll_upper?: number;
   boll_lower?: number;
   pct_b?: number | null;
+  /** Chart Subpane — 通达信 MACD/KDJ（仅 /api/stocks/.../bars） */
+  dif?: number | null;
+  dea?: number | null;
+  macd?: number | null;
+  k?: number | null;
+  d?: number | null;
+  j?: number | null;
 }
 
 interface StockSearchItem {
@@ -177,6 +184,9 @@ interface BacktestResult {
 }
 
 type ZoneBounds = { m: number; h: number; u: number };
+
+/** 个股走势 · 回看日历日快捷选项 */
+const STOCK_VIEW_LOOKBACK_PRESETS = [60, 100, 120, 250] as const;
 
 function isZoneBoundsOrdered(b: ZoneBounds): boolean {
   return (
@@ -438,7 +448,9 @@ export default function App() {
   // 2. 状态管理 (State Management)
   // -----------------------------------------------------------------------------
   const [apiBase, setApiBase] = useState('http://localhost:8000');
-  const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern' | 'stock_view'>('scan');
+  const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern' | 'stock_view'>('boll_pattern');
+  const [moreTabsOpen, setMoreTabsOpen] = useState(false);
+  const moreTabsRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -1940,6 +1952,18 @@ export default function App() {
     showToast('⚙️ 系统配置参数一键持久化成功！已应用到全模块。');
   };
 
+  // 点击外部关闭「更多」下拉
+  useEffect(() => {
+    if (!moreTabsOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (moreTabsRef.current && !moreTabsRef.current.contains(e.target as Node)) {
+        setMoreTabsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [moreTabsOpen]);
+
   // 4.9 数据库宏观事实与实时日志轮询器 (仅在 settings Tab 被激活时工作)
   useEffect(() => {
     if (activeTab !== 'settings') return;
@@ -2419,11 +2443,23 @@ export default function App() {
           if (kParam) {
             const idx = kParam.dataIndex;
             const b = cand_bars[idx];
+            const prev = idx > 0 ? cand_bars[idx - 1] : null;
+            const chgPct =
+              prev && prev.close > 0
+                ? ((b.close - prev.close) / prev.close) * 100
+                : null;
+            const chgColor =
+              chgPct == null ? '#94a3b8' : chgPct >= 0 ? '#ef4444' : '#10b981';
+            const chgText =
+              chgPct == null
+                ? 'N/A'
+                : `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`;
             html += `<b style="color: #94a3b8;">交易日期: ${b.date}</b><br/>`;
             html += `开盘价: <b style="color:#fff; font-family: monospace;">￥${b.open.toFixed(2)}</b><br/>`;
             html += `收盘价: <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'}; font-family: monospace;">￥${b.close.toFixed(2)}</b><br/>`;
             html += `最高价: <b style="color:#ef4444; font-family: monospace;">￥${b.high.toFixed(2)}</b><br/>`;
             html += `最低价: <b style="color:#10b981; font-family: monospace;">￥${b.low.toFixed(2)}</b><br/>`;
+            html += `涨跌幅: <b style="color:${chgColor}; font-family: monospace;">${chgText}</b><br/>`;
 
             const mid = b.boll_mid ? `￥${b.boll_mid.toFixed(2)}` : 'N/A';
             const upp = b.boll_upper ? `￥${b.boll_upper.toFixed(2)}` : 'N/A';
@@ -2505,30 +2541,58 @@ export default function App() {
   };
 
   // 5.0b 布林编排页：单股 K 线 + 布林 + 命中区间 markArea
-  const getBollPatternChartOption = () => {
-    if (!bollBars.length) return {};
-    const xAxisDates = bollBars.map(b => b.date);
-    const klineData = bollBars.map(b => [b.open, b.close, b.low, b.high]);
-    const bollMid = bollBars.map(b => b.boll_mid ?? null);
-    const bollUpper = bollBars.map(b => b.boll_upper ?? null);
-    const bollLower = bollBars.map(b => b.boll_lower ?? null);
-    const highlightStart = selectedBollMatch?.start_date;
-    const highlightEnd = selectedBollMatch?.end_date;
-    const hasHighlight = !!(
-      selectedBollMatch &&
-      highlightStart &&
-      highlightEnd &&
-      selectedBollMatch.matched_states
-    );
-    const tooltipCacheKey = selectedBollMatch
-      ? String(selectedBollMatch.id)
-      : `preview:${bollPreviewMeta?.code || 'na'}`;
+  // 5.0b/c 布林主图 + 通达信 MACD/KDJ 副图（三 grid；仅编排页 / 个股走势）
+  const buildKlineBollSubpaneOption = (args: {
+    bars: Bar[];
+    tooltipCacheKey: string;
+    tooltipCacheRef: MutableRefObject<{ key: string; index: number; html: string } | null>;
+    tooltipPosRef: MutableRefObject<{ key: string; index: number; pos: [number, number] } | null>;
+    highlightStart?: string;
+    highlightEnd?: string;
+    hasHighlight?: boolean;
+  }) => {
+    const {
+      bars,
+      tooltipCacheKey,
+      tooltipCacheRef,
+      tooltipPosRef,
+      highlightStart,
+      highlightEnd,
+      hasHighlight = false,
+    } = args;
+    if (!bars.length) return {};
+
+    const xAxisDates = bars.map(b => b.date);
+    const klineData = bars.map(b => [b.open, b.close, b.low, b.high]);
+    const bollMid = bars.map(b => b.boll_mid ?? null);
+    const bollUpper = bars.map(b => b.boll_upper ?? null);
+    const bollLower = bars.map(b => b.boll_lower ?? null);
+    const dif = bars.map(b => b.dif ?? null);
+    const dea = bars.map(b => b.dea ?? null);
+    const macdHist = bars.map(b => b.macd ?? null);
+    const kLine = bars.map(b => b.k ?? null);
+    const dLine = bars.map(b => b.d ?? null);
+    const jLine = bars.map(b => b.j ?? null);
+
     const fmtPx = (v: number | null | undefined, digits = 2) =>
       v == null || Number.isNaN(Number(v)) ? 'N/A' : `￥${Number(v).toFixed(digits)}`;
+    const fmtNum = (v: number | null | undefined, digits = 2) =>
+      v == null || Number.isNaN(Number(v)) ? 'N/A' : Number(v).toFixed(digits);
+
+    const axisCommon = {
+      type: 'category' as const,
+      data: xAxisDates,
+      boundaryGap: true,
+      axisLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.1)' } },
+      axisTick: { alignWithLabel: true },
+    };
+    const ySplit = { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' as const } };
 
     return {
-      // 标题改到图表外渲染，避免矮图内与坐标系/图例重叠
       backgroundColor: 'transparent',
+      axisPointer: {
+        link: [{ xAxisIndex: [0, 1, 2] }],
+      },
       tooltip: {
         trigger: 'axis',
         triggerOn: 'mousemove',
@@ -2544,18 +2608,30 @@ export default function App() {
         textStyle: { color: '#e2e8f0', fontSize: 11 },
         formatter: (params: any) => {
           const kParam = (params || []).find((p: any) => p.seriesName === '日K');
-          const cached = bollAxisTooltipCacheRef.current;
+          const cached = tooltipCacheRef.current;
           if (!kParam) return cached?.html ?? '';
           const idx = kParam.dataIndex as number;
           if (cached && cached.key === tooltipCacheKey && cached.index === idx) {
             return cached.html;
           }
-          const b = bollBars[idx];
+          const b = bars[idx];
           if (!b) return cached?.html ?? '';
+          const prev = idx > 0 ? bars[idx - 1] : null;
+          const chgPct =
+            prev && prev.close > 0
+              ? ((b.close - prev.close) / prev.close) * 100
+              : null;
+          const chgColor =
+            chgPct == null ? '#94a3b8' : chgPct >= 0 ? '#ef4444' : '#10b981';
+          const chgText =
+            chgPct == null
+              ? 'N/A'
+              : `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`;
           let html = `<div style="padding:4px 8px;line-height:1.6;">`;
           html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
           html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
           html += `低 ${fmtPx(b.low)}　高 ${fmtPx(b.high)}<br/>`;
+          html += `涨跌幅: <b style="color:${chgColor};font-family:monospace;">${chgText}</b><br/>`;
           html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
           html += `BOLL-M: <b style="color:#e2e8f0;font-family:monospace;">${fmtPx(b.boll_mid, 3)}</b><br/>`;
           html += `UB: <b style="color:#f59e0b;font-family:monospace;">${fmtPx(b.boll_upper, 3)}</b><br/>`;
@@ -2565,8 +2641,16 @@ export default function App() {
               ? 'N/A'
               : Number(b.pct_b).toFixed(3);
           html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
+          html += `</div>`;
+          html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
+          html += `MACD(12,26,9) DIF:<b style="color:#e2e8f0;font-family:monospace;">${fmtNum(b.dif)}</b> `;
+          html += `DEA:<b style="color:#facc15;font-family:monospace;">${fmtNum(b.dea)}</b> `;
+          html += `MACD:<b style="color:${(b.macd ?? 0) >= 0 ? '#ef4444' : '#10b981'};font-family:monospace;">${fmtNum(b.macd)}</b><br/>`;
+          html += `KDJ(9,3,3) K:<b style="color:#e2e8f0;font-family:monospace;">${fmtNum(b.k)}</b> `;
+          html += `D:<b style="color:#facc15;font-family:monospace;">${fmtNum(b.d)}</b> `;
+          html += `J:<b style="color:#d946ef;font-family:monospace;">${fmtNum(b.j)}</b>`;
           html += `</div></div>`;
-          bollAxisTooltipCacheRef.current = { key: tooltipCacheKey, index: idx, html };
+          tooltipCacheRef.current = { key: tooltipCacheKey, index: idx, html };
           return html;
         },
         position: (point: number[], params: any, _dom: HTMLElement, _rect: any, size: { contentSize: number[]; viewSize: number[] }) => {
@@ -2574,8 +2658,8 @@ export default function App() {
           const kParam = list.find((p: any) => p?.seriesName === '日K');
           const idx = typeof kParam?.dataIndex === 'number'
             ? kParam.dataIndex
-            : bollAxisTooltipCacheRef.current?.index;
-          const posCache = bollAxisTooltipPosRef.current;
+            : tooltipCacheRef.current?.index;
+          const posCache = tooltipPosRef.current;
           if (posCache && posCache.key === tooltipCacheKey && posCache.index === idx && idx != null) {
             return posCache.pos;
           }
@@ -2583,45 +2667,100 @@ export default function App() {
           const y = Math.max(8, point[1] - size.contentSize[1] - 12);
           const pos: [number, number] = [Math.max(8, x), y];
           if (idx != null) {
-            bollAxisTooltipPosRef.current = { key: tooltipCacheKey, index: idx, pos };
+            tooltipPosRef.current = { key: tooltipCacheKey, index: idx, pos };
           }
           return pos;
         },
       },
-      legend: {
-        data: ['日K', 'BOLL-M', 'UB', 'LB'],
-        top: 0,
-        left: 'center',
-        itemGap: 18,
-        itemWidth: 16,
-        itemHeight: 8,
-        icon: 'roundRect',
-        textStyle: { color: '#94a3b8', fontSize: 11, padding: [0, 0, 0, 4] },
-      },
-      grid: { left: 48, right: 16, top: 32, bottom: 28, containLabel: false },
-      xAxis: {
-        type: 'category',
-        data: xAxisDates,
-        boundaryGap: true,
-        axisLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.1)' } },
-        axisLabel: {
-          color: '#94a3b8',
-          fontSize: 9,
-          hideOverlap: true,
-          showMaxLabel: true,
+      legend: [
+        {
+          data: ['日K', 'BOLL-M', 'UB', 'LB'],
+          top: '1%',
+          left: 'center',
+          itemGap: 14,
+          itemWidth: 14,
+          itemHeight: 8,
+          icon: 'roundRect',
+          textStyle: { color: '#94a3b8', fontSize: 10, padding: [0, 0, 0, 4] },
         },
-        axisTick: { alignWithLabel: true },
-      },
-      yAxis: {
-        type: 'value',
-        scale: true,
-        axisLabel: { color: '#94a3b8', fontSize: 9, formatter: '￥{value}' },
-        splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } },
-      },
+        {
+          data: ['DIF', 'DEA', 'MACD'],
+          top: '34%',
+          left: 56,
+          itemGap: 10,
+          itemWidth: 12,
+          itemHeight: 6,
+          textStyle: { color: '#94a3b8', fontSize: 10 },
+        },
+        {
+          data: ['K', 'D', 'J'],
+          top: '46%',
+          left: 56,
+          itemGap: 10,
+          itemWidth: 12,
+          itemHeight: 6,
+          textStyle: { color: '#94a3b8', fontSize: 10 },
+        },
+      ],
+      grid: [
+        // 主图不动；MACD 再收窄；省下高度给 KDJ
+        { left: 48, right: 16, top: '7%', height: '22%', containLabel: false },
+        { left: 48, right: 16, top: '38%', height: '8%', containLabel: false },
+        { left: 48, right: 16, top: '52%', height: '40%', containLabel: false },
+      ],
+      xAxis: [
+        {
+          ...axisCommon,
+          gridIndex: 0,
+          axisLabel: { show: false },
+        },
+        {
+          ...axisCommon,
+          gridIndex: 1,
+          axisLabel: { show: false },
+        },
+        {
+          ...axisCommon,
+          gridIndex: 2,
+          axisLabel: {
+            color: '#94a3b8',
+            fontSize: 9,
+            hideOverlap: true,
+            showMaxLabel: true,
+          },
+        },
+      ],
+      yAxis: [
+        {
+          type: 'value',
+          gridIndex: 0,
+          scale: true,
+          axisLabel: { color: '#94a3b8', fontSize: 9, formatter: '￥{value}' },
+          splitLine: ySplit,
+        },
+        {
+          type: 'value',
+          gridIndex: 1,
+          scale: true,
+          splitNumber: 2,
+          axisLabel: { color: '#94a3b8', fontSize: 8 },
+          splitLine: ySplit,
+        },
+        {
+          type: 'value',
+          gridIndex: 2,
+          scale: true,
+          splitNumber: 2,
+          axisLabel: { color: '#94a3b8', fontSize: 8 },
+          splitLine: ySplit,
+        },
+      ],
       series: [
         {
           name: '日K',
           type: 'candlestick',
+          xAxisIndex: 0,
+          yAxisIndex: 0,
           data: klineData,
           itemStyle: {
             color: '#ef4444',
@@ -2629,7 +2768,7 @@ export default function App() {
             borderColor: '#ef4444',
             borderColor0: '#10b981',
           },
-          ...(hasHighlight
+          ...(hasHighlight && highlightStart && highlightEnd
             ? {
                 markArea: {
                   silent: true,
@@ -2642,6 +2781,8 @@ export default function App() {
         {
           name: 'BOLL-M',
           type: 'line',
+          xAxisIndex: 0,
+          yAxisIndex: 0,
           data: bollMid,
           smooth: true,
           showSymbol: false,
@@ -2650,6 +2791,8 @@ export default function App() {
         {
           name: 'UB',
           type: 'line',
+          xAxisIndex: 0,
+          yAxisIndex: 0,
           data: bollUpper,
           smooth: true,
           showSymbol: false,
@@ -2658,157 +2801,110 @@ export default function App() {
         {
           name: 'LB',
           type: 'line',
+          xAxisIndex: 0,
+          yAxisIndex: 0,
           data: bollLower,
           smooth: true,
           showSymbol: false,
           lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.85 },
+        },
+        {
+          name: 'MACD',
+          type: 'bar',
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          data: macdHist,
+          // 通达信式细线（1px），非宽柱
+          barWidth: 1,
+          barCategoryGap: '80%',
+          itemStyle: {
+            color: (params: any) =>
+              (params.value ?? 0) >= 0 ? '#ef4444' : '#10b981',
+            borderRadius: 0,
+          },
+        },
+        {
+          name: 'DIF',
+          type: 'line',
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          data: dif,
+          showSymbol: false,
+          lineStyle: { color: '#e2e8f0', width: 1 },
+        },
+        {
+          name: 'DEA',
+          type: 'line',
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          data: dea,
+          showSymbol: false,
+          lineStyle: { color: '#facc15', width: 1 },
+        },
+        {
+          name: 'K',
+          type: 'line',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          data: kLine,
+          showSymbol: false,
+          lineStyle: { color: '#e2e8f0', width: 1 },
+        },
+        {
+          name: 'D',
+          type: 'line',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          data: dLine,
+          showSymbol: false,
+          lineStyle: { color: '#facc15', width: 1 },
+        },
+        {
+          name: 'J',
+          type: 'line',
+          xAxisIndex: 2,
+          yAxisIndex: 2,
+          data: jLine,
+          showSymbol: false,
+          lineStyle: { color: '#d946ef', width: 1 },
         },
       ],
     };
   };
 
-  // 5.0c 个股走势页：单股 K 线 + 布林（无命中 markArea）
+  const getBollPatternChartOption = () => {
+    if (!bollBars.length) return {};
+    const highlightStart = selectedBollMatch?.start_date;
+    const highlightEnd = selectedBollMatch?.end_date;
+    const hasHighlight = !!(
+      selectedBollMatch &&
+      highlightStart &&
+      highlightEnd &&
+      selectedBollMatch.matched_states
+    );
+    const tooltipCacheKey = selectedBollMatch
+      ? String(selectedBollMatch.id)
+      : `preview:${bollPreviewMeta?.code || 'na'}`;
+    return buildKlineBollSubpaneOption({
+      bars: bollBars,
+      tooltipCacheKey,
+      tooltipCacheRef: bollAxisTooltipCacheRef,
+      tooltipPosRef: bollAxisTooltipPosRef,
+      highlightStart,
+      highlightEnd,
+      hasHighlight,
+    });
+  };
+
+  // 5.0c 个股走势页：单股 K 线 + 布林 + MACD/KDJ
   const getStockViewChartOption = () => {
     if (!stockViewBars.length || !selectedStockView) return {};
-    const xAxisDates = stockViewBars.map(b => b.date);
-    const klineData = stockViewBars.map(b => [b.open, b.close, b.low, b.high]);
-    const bollMid = stockViewBars.map(b => b.boll_mid ?? null);
-    const bollUpper = stockViewBars.map(b => b.boll_upper ?? null);
-    const bollLower = stockViewBars.map(b => b.boll_lower ?? null);
-    const fmtPx = (v: number | null | undefined, digits = 2) =>
-      v == null || Number.isNaN(Number(v)) ? 'N/A' : `￥${Number(v).toFixed(digits)}`;
-
-    return {
-      backgroundColor: 'transparent',
-      tooltip: {
-        trigger: 'axis',
-        triggerOn: 'mousemove',
-        alwaysShowContent: true,
-        transitionDuration: 0,
-        axisPointer: {
-          type: 'line',
-          lineStyle: { color: 'rgba(148,163,184,0.45)' },
-          label: { show: false },
-        },
-        backgroundColor: 'rgba(15, 23, 42, 0.95)',
-        borderColor: 'rgba(255,255,255,0.12)',
-        textStyle: { color: '#e2e8f0', fontSize: 11 },
-        formatter: (params: any) => {
-          const kParam = (params || []).find((p: any) => p.seriesName === '日K');
-          const cached = stockViewAxisTooltipCacheRef.current;
-          if (!kParam) return cached?.html ?? '';
-          const idx = kParam.dataIndex as number;
-          const cacheKey = selectedStockView.code;
-          if (cached && cached.key === cacheKey && cached.index === idx) {
-            return cached.html;
-          }
-          const b = stockViewBars[idx];
-          if (!b) return cached?.html ?? '';
-          let html = `<div style="padding:4px 8px;line-height:1.6;">`;
-          html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
-          html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
-          html += `低 ${fmtPx(b.low)}　高 ${fmtPx(b.high)}<br/>`;
-          html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
-          html += `BOLL-M: <b style="color:#e2e8f0;font-family:monospace;">${fmtPx(b.boll_mid, 3)}</b><br/>`;
-          html += `UB: <b style="color:#f59e0b;font-family:monospace;">${fmtPx(b.boll_upper, 3)}</b><br/>`;
-          html += `LB: <b style="color:#d946ef;font-family:monospace;">${fmtPx(b.boll_lower, 3)}</b><br/>`;
-          const pctB =
-            b.pct_b == null || Number.isNaN(Number(b.pct_b))
-              ? 'N/A'
-              : Number(b.pct_b).toFixed(3);
-          html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
-          html += `</div></div>`;
-          stockViewAxisTooltipCacheRef.current = { key: cacheKey, index: idx, html };
-          return html;
-        },
-        position: (point: number[], params: any, _dom: HTMLElement, _rect: any, size: { contentSize: number[]; viewSize: number[] }) => {
-          const list = Array.isArray(params) ? params : params ? [params] : [];
-          const kParam = list.find((p: any) => p?.seriesName === '日K');
-          const idx = typeof kParam?.dataIndex === 'number'
-            ? kParam.dataIndex
-            : stockViewAxisTooltipCacheRef.current?.index;
-          const cacheKey = selectedStockView.code;
-          const posCache = stockViewAxisTooltipPosRef.current;
-          if (posCache && posCache.key === cacheKey && posCache.index === idx && idx != null) {
-            return posCache.pos;
-          }
-          const x = Math.min(point[0], size.viewSize[0] - size.contentSize[0] - 8);
-          const y = Math.max(8, point[1] - size.contentSize[1] - 12);
-          const pos: [number, number] = [Math.max(8, x), y];
-          if (idx != null) {
-            stockViewAxisTooltipPosRef.current = { key: cacheKey, index: idx, pos };
-          }
-          return pos;
-        },
-      },
-      legend: {
-        data: ['日K', 'BOLL-M', 'UB', 'LB'],
-        top: 0,
-        left: 'center',
-        itemGap: 18,
-        itemWidth: 16,
-        itemHeight: 8,
-        icon: 'roundRect',
-        textStyle: { color: '#94a3b8', fontSize: 11, padding: [0, 0, 0, 4] },
-      },
-      grid: { left: 48, right: 16, top: 32, bottom: 28, containLabel: false },
-      xAxis: {
-        type: 'category',
-        data: xAxisDates,
-        boundaryGap: true,
-        axisLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.1)' } },
-        axisLabel: {
-          color: '#94a3b8',
-          fontSize: 9,
-          hideOverlap: true,
-          showMaxLabel: true,
-        },
-        axisTick: { alignWithLabel: true },
-      },
-      yAxis: {
-        type: 'value',
-        scale: true,
-        axisLabel: { color: '#94a3b8', fontSize: 9, formatter: '￥{value}' },
-        splitLine: { lineStyle: { color: 'rgba(255, 255, 255, 0.04)', type: 'dashed' } },
-      },
-      series: [
-        {
-          name: '日K',
-          type: 'candlestick',
-          data: klineData,
-          itemStyle: {
-            color: '#ef4444',
-            color0: '#10b981',
-            borderColor: '#ef4444',
-            borderColor0: '#10b981',
-          },
-        },
-        {
-          name: 'BOLL-M',
-          type: 'line',
-          data: bollMid,
-          smooth: true,
-          showSymbol: false,
-          lineStyle: { color: '#e2e8f0', width: 1.5, opacity: 0.85 },
-        },
-        {
-          name: 'UB',
-          type: 'line',
-          data: bollUpper,
-          smooth: true,
-          showSymbol: false,
-          lineStyle: { color: '#f59e0b', width: 1.5, opacity: 0.85 },
-        },
-        {
-          name: 'LB',
-          type: 'line',
-          data: bollLower,
-          smooth: true,
-          showSymbol: false,
-          lineStyle: { color: '#d946ef', width: 1.5, opacity: 0.85 },
-        },
-      ],
-    };
+    return buildKlineBollSubpaneOption({
+      bars: stockViewBars,
+      tooltipCacheKey: selectedStockView.code,
+      tooltipCacheRef: stockViewAxisTooltipCacheRef,
+      tooltipPosRef: stockViewAxisTooltipPosRef,
+    });
   };
 
   // 5.1 【最强神级 KlineCompareChart 归一化重合 K 线图】
@@ -3120,61 +3216,69 @@ export default function App() {
       {/* 6.2 Header */}
       <header className="dashboard-header">
         <div className="header-left">
-          <h1><Sparkles size={24} color="#f59e0b" /> 形态选股归一化研盘工作台</h1>
-          <p>朔哥哥好！今日为您提供多维时间扭曲对齐(DTW)量化决策闭环。</p>
-        </div>
-        <div className="header-right">
-          <div className="api-config">
-            <Server size={14} color="#3b82f6" />
-            <span>后端API:</span>
-            <input
-              type="text"
-              value={apiBase}
-              onChange={(e) => setApiBase(e.target.value)}
-              placeholder="http://localhost:8000"
-            />
-          </div>
+          <h1><Sparkles size={24} color="#f59e0b" /> 形态选股工作台</h1>
         </div>
       </header>
 
-      {/* 6.3 Tabs 导航 */}
+      {/* 6.3 Tabs 导航（扫描/回测/模板拟废弃，收入「更多」） */}
       <nav className="dashboard-tabs">
         <button
-          className={`tab-btn ${activeTab === 'scan' ? 'active' : ''}`}
-          onClick={() => setActiveTab('scan')}
-        >
-          <TrendingUp size={16} /> 极速形态每日扫描大PK
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'backtest' ? 'active' : ''}`}
-          onClick={() => setActiveTab('backtest')}
-        >
-          <BarChart2 size={16} /> 历史形态滚动仿真回测
-        </button>
-        <button
           className={`tab-btn ${activeTab === 'boll_pattern' ? 'active' : ''}`}
-          onClick={() => setActiveTab('boll_pattern')}
+          onClick={() => { setMoreTabsOpen(false); setActiveTab('boll_pattern'); }}
         >
           <Sparkles size={16} /> 布林编排
         </button>
         <button
           className={`tab-btn ${activeTab === 'stock_view' ? 'active' : ''}`}
-          onClick={() => setActiveTab('stock_view')}
+          onClick={() => { setMoreTabsOpen(false); setActiveTab('stock_view'); }}
         >
           <Search size={16} /> 个股走势
         </button>
         <button
-          className={`tab-btn ${activeTab === 'templates' ? 'active' : ''}`}
-          onClick={() => setActiveTab('templates')}
-        >
-          <Sliders size={16} /> 形态模板与权重参数自进化
-        </button>
-        <button
           className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`}
-          onClick={() => setActiveTab('settings')}
+          onClick={() => { setMoreTabsOpen(false); setActiveTab('settings'); }}
         >
           <Settings size={16} /> 系统设置与数据仓库管护
         </button>
+        <div className="tab-more" ref={moreTabsRef}>
+          <button
+            type="button"
+            className={`tab-btn ${['scan', 'backtest', 'templates'].includes(activeTab) ? 'active' : ''}`}
+            aria-expanded={moreTabsOpen}
+            aria-haspopup="menu"
+            onClick={() => setMoreTabsOpen((open) => !open)}
+          >
+            更多 <ChevronDown size={16} className={moreTabsOpen ? 'tab-more-chevron open' : 'tab-more-chevron'} />
+          </button>
+          {moreTabsOpen && (
+            <div className="tab-more-menu" role="menu">
+              <button
+                type="button"
+                role="menuitem"
+                className={`tab-more-item ${activeTab === 'scan' ? 'active' : ''}`}
+                onClick={() => { setActiveTab('scan'); setMoreTabsOpen(false); }}
+              >
+                <TrendingUp size={16} /> 极速形态每日扫描大PK
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className={`tab-more-item ${activeTab === 'backtest' ? 'active' : ''}`}
+                onClick={() => { setActiveTab('backtest'); setMoreTabsOpen(false); }}
+              >
+                <BarChart2 size={16} /> 历史形态滚动仿真回测
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className={`tab-more-item ${activeTab === 'templates' ? 'active' : ''}`}
+                onClick={() => { setActiveTab('templates'); setMoreTabsOpen(false); }}
+              >
+                <Sliders size={16} /> 形态模板与权重参数自进化
+              </button>
+            </div>
+          )}
+        </div>
       </nav>
 
       {/* 6.4 内容主体布局 */}
@@ -3799,7 +3903,7 @@ export default function App() {
                     </div>
                     <ReactECharts
                       option={getBollPatternChartOption()}
-                      style={{ height: '220px', width: '100%' }}
+                      style={{ height: '520px', width: '100%' }}
                       notMerge
                     />
                     <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
@@ -4009,13 +4113,13 @@ export default function App() {
                         </p>
                       )}
                       <div className="form-group stock-view-search" ref={bollTrySearchWrapRef}>
-                        <label>股票代码</label>
+                        <label>搜索股票（名称 / 代码 / 拼音首字母）</label>
                         <div className="stock-search-input-wrap">
                           <Search size={14} className="stock-search-icon" />
                           <input
                             type="text"
                             value={bollTryCode}
-                            placeholder="如 茅台、600519、sz000002"
+                            placeholder="如 茅台、600519、sydq"
                             onChange={(e) => {
                               setBollTryCode(e.target.value);
                               setBollTrySelected(null);
@@ -4224,13 +4328,13 @@ export default function App() {
               <h2 className="panel-title" style={{ marginBottom: '0.9rem' }}>个股走势</h2>
               <div className="stock-view-toolbar">
                 <div className="form-group stock-view-search" ref={stockSearchWrapRef}>
-                  <label>搜索股票（名称 / 代码）</label>
+                  <label>搜索股票（名称 / 代码 / 拼音首字母）</label>
                   <div className="stock-search-input-wrap">
                     <Search size={14} className="stock-search-icon" />
                     <input
                       type="text"
                       value={stockSearchQuery}
-                      placeholder="如 茅台、600519、sh600519"
+                      placeholder="如 茅台、600519、sydq"
                       onChange={(e) => {
                         setStockSearchQuery(e.target.value);
                         setStockSearchOpen(true);
@@ -4322,6 +4426,31 @@ export default function App() {
                     >
                       +
                     </button>
+                    <select
+                      className="lookback-preset-select"
+                      disabled={!selectedStockView}
+                      title="快捷回看天数"
+                      aria-label="快捷回看天数"
+                      value={
+                        (STOCK_VIEW_LOOKBACK_PRESETS as readonly number[]).includes(stockViewLookback)
+                          ? String(stockViewLookback)
+                          : ''
+                      }
+                      onChange={(e) => {
+                        const next = Number(e.target.value);
+                        if (!Number.isFinite(next) || next <= 0) return;
+                        setStockViewLookback(Math.min(500, Math.max(30, next)));
+                      }}
+                    >
+                      <option value="" disabled>
+                        快捷
+                      </option>
+                      {STOCK_VIEW_LOOKBACK_PRESETS.map((days) => (
+                        <option key={days} value={days}>
+                          {days}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                 </div>
               </div>
@@ -4329,7 +4458,7 @@ export default function App() {
               {!selectedStockView ? (
                 <div className="empty-wrapper" style={{ padding: '2.5rem 0' }}>
                   <Info size={28} color="#94a3b8" />
-                  <p>输入名称或代码搜索股票，查看日 K + 布林走势。</p>
+                  <p>输入名称、代码或拼音首字母搜索股票，查看日 K + 布林走势。</p>
                 </div>
               ) : stockViewLoading && stockViewBars.length === 0 ? (
                 <div className="loading-wrapper" style={{ padding: '2rem 0' }}>
@@ -4357,7 +4486,7 @@ export default function App() {
                   </div>
                   <ReactECharts
                     option={getStockViewChartOption()}
-                    style={{ height: '400px', width: '100%' }}
+                    style={{ height: '560px', width: '100%' }}
                     notMerge
                   />
                   <div style={{ marginTop: '0.75rem' }}>
