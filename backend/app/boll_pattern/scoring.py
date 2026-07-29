@@ -2,6 +2,9 @@
 """
 布林编排二次打分：不影响是否命中，仅用于排序。
 分量：突破强度 0.45 + 横盘平整 0.35 + 量能确认 0.20 → 总分 0～100。
+
+突破/量能看命中段里的「最高强度区」：有 U 用 U，否则用 H；
+纯 L/M 编排给中性地板分，避免无 U 的合法编排被系统性压分。
 """
 
 from __future__ import annotations
@@ -10,6 +13,9 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+
+# 强度区优先级（高 → 低）
+_STRENGTH_ORDER = ("U", "H")
 
 
 def _clip(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
@@ -23,16 +29,51 @@ def _linear_map(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
     return y0 + t * (y1 - y0)
 
 
+def peak_strength_zone(zones: Sequence[str]) -> str | None:
+    """命中段最高强度区：U > H；都没有则 None。"""
+    present = set(zones)
+    for z in _STRENGTH_ORDER:
+        if z in present:
+            return z
+    return None
+
+
+def _first_run(zones: Sequence[str], label: str) -> tuple[int, int] | None:
+    """首段连续 label 的 [start, end) 下标；没有则 None。"""
+    start = None
+    for i, z in enumerate(zones):
+        if z == label:
+            start = i
+            break
+    if start is None:
+        return None
+    end = start
+    while end < len(zones) and zones[end] == label:
+        end += 1
+    return start, end
+
+
 def score_breakout_strength(zones: Sequence[str], pct_b: Sequence[float | None]) -> float:
-    """U 段 max(%B)：[0.95, 1.2] → [40, 100]。"""
+    """
+    最高强度区内 max(%B) 映射到 40～100。
+    - U：[0.95, 1.2] → [40, 100]
+    - H：[0.60, 1.0] → [40, 100]（兼容默认 H 上界 0.95 与自定义贴近 1）
+    - 无 U/H：地板 40
+    """
+    peak = peak_strength_zone(zones)
+    if peak is None:
+        return 40.0
+
     vals = []
     for z, p in zip(zones, pct_b):
-        if z == "U" and p is not None and not (isinstance(p, float) and np.isnan(p)):
+        if z == peak and p is not None and not (isinstance(p, float) and np.isnan(p)):
             vals.append(float(p))
     if not vals:
         return 40.0
     mx = max(vals)
-    return _clip(_linear_map(mx, 0.95, 1.2, 40.0, 100.0))
+    if peak == "U":
+        return _clip(_linear_map(mx, 0.95, 1.2, 40.0, 100.0))
+    return _clip(_linear_map(mx, 0.60, 1.0, 40.0, 100.0))
 
 
 def _longest_m_slice(zones: Sequence[str]) -> slice | None:
@@ -85,27 +126,23 @@ def score_volume_confirm(
     lookback_volumes: Sequence[float] | None = None,
 ) -> float:
     """
-    首段 U 均量 / 前 20 日均量：[0.8, 2.0] → [30, 100]。
-    无量数据 → 50 中性分。
+    最高强度区首段均量 / 前 20 日均量：[0.8, 2.0] → [30, 100]。
+    无强度区或无量数据 → 50 中性分。
     """
     if not volumes or len(volumes) != len(zones):
         return 50.0
 
-    # 找首段连续 U
-    start = None
-    for i, z in enumerate(zones):
-        if z == "U":
-            start = i
-            break
-    if start is None:
+    peak = peak_strength_zone(zones)
+    if peak is None:
         return 50.0
-    end = start
-    while end < len(zones) and zones[end] == "U":
-        end += 1
-    u_vols = [float(v) for v in volumes[start:end] if v is not None]
-    if not u_vols:
+    run = _first_run(zones, peak)
+    if run is None:
         return 50.0
-    u_avg = sum(u_vols) / len(u_vols)
+    start, end = run
+    peak_vols = [float(v) for v in volumes[start:end] if v is not None]
+    if not peak_vols:
+        return 50.0
+    peak_avg = sum(peak_vols) / len(peak_vols)
 
     baseline = None
     if lookback_volumes:
@@ -115,7 +152,7 @@ def score_volume_confirm(
     if baseline is None or baseline <= 0:
         return 50.0
 
-    ratio = u_avg / baseline
+    ratio = peak_avg / baseline
     return _clip(_linear_map(ratio, 0.8, 2.0, 30.0, 100.0))
 
 

@@ -1,0 +1,28 @@
+---
+description: Frontend date inputs must use shared DatePickerField
+globs: frontend/**/*.{tsx,ts,jsx,js,css}
+alwaysApply: false
+---
+
+# Date picker convention
+
+Do **not** use raw `<input type="date" />` in the PSE frontend.
+
+Use the shared component instead:
+
+```tsx
+import { DatePickerField } from './components/DatePickerField';
+// or from '../components/DatePickerField' depending on file location
+
+<DatePickerField
+  value={someDate}
+  onChange={setSomeDate}
+  title="选择截止日"
+/>
+```
+
+- Styles live in `App.css` under `.date-picker-field*`.
+- Component: `frontend/src/components/DatePickerField.tsx`.
+- Rationale: native calendar indicators are hard to see/click in dark theme; the shared control hides them and exposes an explicit calendar button with `showPicker()`.
+
+When adding a new date field, reuse `DatePickerField`. Do not copy-paste the markup again.

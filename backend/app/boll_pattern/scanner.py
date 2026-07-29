@@ -14,6 +14,7 @@ from typing import Any, Callable, Sequence
 import pandas as pd
 from psycopg2.extras import execute_values
 
+from backend.app.boll_pattern.loader import normalize_zone_thresholds
 from backend.app.boll_pattern.matcher import find_patterns_with_dates
 from backend.app.boll_pattern.repository import (
     ENSURE_PATTERN_TABLES_SQL,
@@ -385,6 +386,110 @@ class BollPatternScanner:
         n_matches = self.upsert_matches(code, all_matches, scan_date, window_days)
         return {"code": code, "states": n_states, "matches": n_matches, "skipped": False}
 
+    def preview_one(
+        self,
+        code: str,
+        pattern: dict[str, Any],
+        *,
+        window_days: int = 60,
+        as_of: date | None = None,
+    ) -> dict[str, Any]:
+        """
+        单票草稿试跑：算法与 process_one 同窗匹配，但不写库。
+        pattern 须已是 effective 配置（含 zone_thresholds / denoise_min_len）。
+        """
+        code = code.lower().strip()
+        if window_days <= 0:
+            raise ValueError("window_days 必须 > 0")
+        regex = (pattern.get("regex") or "").strip()
+        if not regex:
+            raise ValueError("regex 不能为空")
+
+        end = self.resolve_scan_date(as_of)
+        df_full = prepare_stock_frame(code, end, level="pattern")
+        if df_full.empty or len(df_full) < 25:
+            return {
+                "code": code,
+                "name": _lookup_stock_name(code),
+                "as_of": end.isoformat(),
+                "window_days": int(window_days),
+                "pattern_id": pattern.get("id") or "draft",
+                "pattern_name": pattern.get("name") or pattern.get("id") or "草稿",
+                "state_string": "",
+                "matches": [],
+                "hit": False,
+                "skipped": True,
+                "message": "行情数据不足，无法试跑",
+            }
+
+        win = df_full.tail(int(window_days)).copy().reset_index(drop=True)
+        dates = list(win["date"].tolist())
+        zt = normalize_zone_thresholds(pattern.get("zone_thresholds"))
+        dnl = int(pattern.get("denoise_min_len") or 0)
+        pat_cfg = {
+            "id": pattern.get("id") or "draft",
+            "name": pattern.get("name") or pattern.get("id") or "草稿",
+            "regex": regex,
+            "min_total_days": int(pattern.get("min_total_days") or 0),
+            "zone_thresholds": zt,
+            "denoise_min_len": dnl,
+        }
+        zones = zones_from_series(win["pct_b"], zt)
+        zones = apply_denoise_to_states(zones, dnl)
+        s = state_string(zones)
+        hits = find_patterns_with_dates(s, dates, [pat_cfg])
+        win_for_score = win.copy()
+        win_for_score["zone"] = zones
+        out_matches: list[dict[str, Any]] = []
+        for m in hits:
+            score = None
+            try:
+                score = score_match_from_window(m, win_for_score, df_full)
+            except Exception as ex:
+                logger.warning(
+                    "试跑打分失败 code=%s pattern=%s: %s",
+                    code, pat_cfg["id"], ex,
+                )
+            start_d = m["start_date"]
+            end_d = m["end_date"]
+            out_matches.append({
+                "pattern_id": pat_cfg["id"],
+                "pattern_name": pat_cfg["name"],
+                "start_date": start_d.isoformat() if hasattr(start_d, "isoformat") else str(start_d),
+                "end_date": end_d.isoformat() if hasattr(end_d, "isoformat") else str(end_d),
+                "matched_states": m["matched_states"],
+                "score": score,
+                "start_idx": int(m["start_idx"]),
+                "end_idx": int(m["end_idx"]),
+            })
+
+        out_matches.sort(
+            key=lambda x: (
+                x["score"] is None,
+                -(x["score"] if x["score"] is not None else 0.0),
+                x["end_date"],
+            ),
+        )
+
+        return {
+            "code": code,
+            "name": _lookup_stock_name(code),
+            "as_of": end.isoformat(),
+            "window_days": int(window_days),
+            "pattern_id": pat_cfg["id"],
+            "pattern_name": pat_cfg["name"],
+            "state_string": s,
+            "matches": out_matches,
+            "hit": len(out_matches) > 0,
+            "skipped": False,
+            "message": (
+                f"窗口内命中 {len(out_matches)} 条"
+                if out_matches
+                else "窗口内无匹配"
+            ),
+        }
+
+
     def run_scan(
         self,
         window_days: int = 60,
@@ -518,6 +623,16 @@ class BollPatternScanner:
                 error=str(ex)[:500],
             )
             raise
+
+
+def _lookup_stock_name(code: str) -> str | None:
+    try:
+        with db.db_cursor(dict_cursor=True) as (conn, cursor):
+            cursor.execute("SELECT name FROM stocks WHERE code = %s;", (code,))
+            row = cursor.fetchone()
+        return row["name"] if row else None
+    except Exception:
+        return None
 
 
 def get_stock_boll_states(code: str, limit: int = 60) -> list[dict]:

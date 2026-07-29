@@ -26,6 +26,7 @@ import {
   ChevronUp
 } from 'lucide-react';
 import './App.css';
+import { DatePickerField } from './components/DatePickerField';
 
 // -----------------------------------------------------------------------------
 // 1. 类型定义 (TypeScript Interface)
@@ -565,7 +566,6 @@ export default function App() {
   const [stockViewZoneLoading, setStockViewZoneLoading] = useState(false);
   const stockViewReqKeyRef = useRef('');
   const stockSearchWrapRef = useRef<HTMLDivElement | null>(null);
-  const stockViewEndDateRef = useRef<HTMLInputElement | null>(null);
   const bollAxisTooltipCacheRef = useRef<{ key: string; index: number; html: string } | null>(null);
   const stockViewAxisTooltipCacheRef = useRef<{ key: string; index: number; html: string } | null>(null);
   const bollAxisTooltipPosRef = useRef<{ key: string; index: number; pos: [number, number] } | null>(null);
@@ -587,6 +587,23 @@ export default function App() {
   const [bollGlobalBounds, setBollGlobalBounds] = useState({ m: 0.35, h: 0.65, u: 0.95 });
   const [bollGlobalBoundsInvalid, setBollGlobalBoundsInvalid] = useState(false);
   const [bollFormBoundsInvalid, setBollFormBoundsInvalid] = useState(false);
+  const [bollTryCode, setBollTryCode] = useState('');
+  const [bollTrySearchItems, setBollTrySearchItems] = useState<StockSearchItem[]>([]);
+  const [bollTrySearchOpen, setBollTrySearchOpen] = useState(false);
+  const [bollTrySearchLoading, setBollTrySearchLoading] = useState(false);
+  const [bollTrySelected, setBollTrySelected] = useState<StockSearchItem | null>(null);
+  const bollTrySearchWrapRef = useRef<HTMLDivElement | null>(null);
+  const [bollTryAsOf, setBollTryAsOf] = useState('');
+  const [bollTryRunning, setBollTryRunning] = useState(false);
+  const [bollTryHits, setBollTryHits] = useState<BollPatternMatch[]>([]);
+  const [bollChartSource, setBollChartSource] = useState<'scan' | 'preview'>('scan');
+  const [bollPreviewMeta, setBollPreviewMeta] = useState<{
+    code: string;
+    name?: string;
+    asOf?: string;
+  } | null>(null);
+  const [bollTryMessage, setBollTryMessage] = useState('');
+  const [bollTryStateString, setBollTryStateString] = useState('');
 
   // -----------------------------------------------------------------------------
   // 3. 通用辅助函数 (Helpers)
@@ -1113,7 +1130,30 @@ export default function App() {
     }
   };
 
+  const loadBollBarsForChart = async (code: string, endDate?: string) => {
+    setBollLoading(true);
+    try {
+      const qs = new URLSearchParams({ lookback_days: '120' });
+      if (endDate) qs.set('end_date', endDate);
+      const barsRes = await fetch(`${apiBase}/api/stocks/${code}/bars?${qs.toString()}`);
+      const barsJson = await barsRes.json();
+      if (barsJson.success) {
+        setBollBars(barsJson.data.bars || []);
+      } else {
+        setBollBars([]);
+        showToast('加载 K 线失败：' + (barsJson.error || ''));
+      }
+    } catch {
+      setBollBars([]);
+      showToast('加载试跑图表异常');
+    } finally {
+      setBollLoading(false);
+    }
+  };
+
   const handleSelectBollMatch = async (m: BollPatternMatch) => {
+    setBollChartSource('scan');
+    setBollPreviewMeta(null);
     setSelectedBollMatch(m);
     setBollLoading(true);
     try {
@@ -1137,6 +1177,136 @@ export default function App() {
       setBollBars([]);
     } finally {
       setBollLoading(false);
+    }
+  };
+
+  const applyBollPreviewMatch = async (
+    m: BollPatternMatch,
+    stateString: string,
+    chartEndDate: string,
+  ) => {
+    setBollChartSource('preview');
+    setBollPreviewMeta(null);
+    setSelectedBollMatch(m);
+    setBollStateString(stateString);
+    await loadBollBarsForChart(m.code, chartEndDate || m.end_date);
+  };
+
+  const handleSelectBollTryStock = (item: StockSearchItem) => {
+    setBollTrySelected(item);
+    setBollTryCode(`${item.code.toUpperCase()} ${item.name || ''}`.trim());
+    setBollTrySearchOpen(false);
+    setBollTrySearchItems([]);
+  };
+
+  const handleBollTryRun = async () => {
+    const code = (
+      bollTrySelected?.code ||
+      bollTryCode.trim().split(/\s+/)[0] ||
+      ''
+    ).toLowerCase();
+    if (!code) {
+      showToast('请填写试跑股票代码');
+      return;
+    }
+    if (!bollForm.regex.trim()) {
+      showToast('请填写 regex');
+      return;
+    }
+    if (bollForm.override_zone && !isZoneBoundsOrdered(bollForm.bounds)) {
+      setBollFormBoundsInvalid(true);
+      showToast('本编排分区边界须满足 m < h < u');
+      return;
+    }
+    if (!bollForm.override_zone && !isZoneBoundsOrdered(bollGlobalBounds)) {
+      setBollGlobalBoundsInvalid(true);
+      showToast('全局分区边界须满足 m < h < u（试跑会使用页面上的全局草稿）');
+      return;
+    }
+
+    const zone_thresholds = bollForm.override_zone
+      ? buildZoneThresholds(bollForm.bounds)
+      : buildZoneThresholds(bollGlobalBounds);
+    const denoise_min_len = bollForm.override_denoise ? bollForm.denoise : bollGlobalDenoise;
+
+    setBollTryRunning(true);
+    setBollTryMessage('');
+    try {
+      const body: Record<string, unknown> = {
+        code,
+        window_days: bollWindowDays,
+        pattern_id: (bollEditId || bollForm.id || '').trim() || null,
+        pattern_name: (bollForm.name || '').trim() || '草稿',
+        regex: bollForm.regex,
+        min_total_days: bollForm.min_total_days,
+        zone_thresholds,
+        denoise_min_len,
+      };
+      if (bollTryAsOf.trim()) body.as_of = bollTryAsOf.trim();
+
+      const res = await fetch(`${apiBase}/api/boll-patterns/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json();
+      if (!json.success) {
+        setBollTryHits([]);
+        setBollTryMessage(json.error || '试跑失败');
+        showToast('试跑失败：' + (json.error || ''));
+        return;
+      }
+
+      const data = json.data || {};
+      const stateString = data.state_string || '';
+      const asOf = data.as_of || bollTryAsOf.trim();
+      if (!bollTryAsOf.trim() && asOf) setBollTryAsOf(asOf);
+
+      const hits: BollPatternMatch[] = (data.matches || []).map((m: {
+        pattern_id?: string;
+        pattern_name?: string;
+        start_date: string;
+        end_date: string;
+        matched_states: string;
+        score: number | null;
+      }, i: number) => ({
+        id: -(i + 1),
+        code: data.code || code,
+        name: data.name || undefined,
+        pattern_id: m.pattern_id || data.pattern_id || 'draft',
+        pattern_name: m.pattern_name || data.pattern_name || '草稿',
+        start_date: m.start_date,
+        end_date: m.end_date,
+        matched_states: m.matched_states,
+        score: m.score,
+        scan_date: asOf || null,
+        window_days: data.window_days ?? bollWindowDays,
+      }));
+
+      setBollTryHits(hits);
+      setBollTryStateString(stateString);
+      setBollTryMessage(data.message || (hits.length ? `命中 ${hits.length} 条` : '窗口内无匹配'));
+      showToast(data.message || (hits.length ? `试跑命中 ${hits.length} 条` : '试跑：窗口内无匹配'));
+
+      if (hits.length > 0) {
+        await applyBollPreviewMatch(hits[0], stateString, asOf);
+      } else {
+        setBollChartSource('preview');
+        setSelectedBollMatch(null);
+        setBollStateString(stateString);
+        setBollPreviewMeta({
+          code: (data.code || code).toLowerCase(),
+          name: data.name || bollTrySelected?.name,
+          asOf: asOf || undefined,
+        });
+        await loadBollBarsForChart(data.code || code, asOf || undefined);
+      }
+    } catch {
+      setBollTryHits([]);
+      setBollTryMessage('无法连接后端试跑');
+      showToast('无法连接后端试跑');
+    } finally {
+      setBollTryRunning(false);
     }
   };
 
@@ -1526,10 +1696,10 @@ export default function App() {
                 </div>
                 <div className="form-item">
                   <label>历史截止日期 (source_end)</label>
-                  <input
-                    type="date"
+                  <DatePickerField
                     value={newTplEndDate}
-                    onChange={(e) => setNewTplEndDate(e.target.value)}
+                    onChange={setNewTplEndDate}
+                    title="选择历史截止日期"
                   />
                 </div>
               </div>
@@ -1866,6 +2036,48 @@ export default function App() {
     };
   }, [activeTab, apiBase, stockSearchQuery, selectedStockView]);
 
+  // 布林编排试跑：模糊搜索联想
+  useEffect(() => {
+    if (activeTab !== 'boll_pattern') return;
+    const q = bollTryCode.trim();
+    if (q.length < 1) {
+      setBollTrySearchItems([]);
+      setBollTrySearchOpen(false);
+      return;
+    }
+    if (
+      bollTrySelected &&
+      q === `${bollTrySelected.code.toUpperCase()} ${bollTrySelected.name || ''}`.trim()
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      setBollTrySearchLoading(true);
+      try {
+        const res = await fetch(
+          `${apiBase}/api/stocks/search?q=${encodeURIComponent(q)}&limit=10`,
+        );
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.success) {
+          setBollTrySearchItems(json.data?.items || []);
+          setBollTrySearchOpen(true);
+        } else {
+          setBollTrySearchItems([]);
+        }
+      } catch {
+        if (!cancelled) setBollTrySearchItems([]);
+      } finally {
+        if (!cancelled) setBollTrySearchLoading(false);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [activeTab, apiBase, bollTryCode, bollTrySelected]);
+
   // 个股走势：窗口参数变更防抖拉图
   useEffect(() => {
     if (activeTab !== 'stock_view') return;
@@ -1918,9 +2130,12 @@ export default function App() {
   // 点击外部关闭搜索下拉
   useEffect(() => {
     const onDocClick = (e: MouseEvent) => {
-      if (!stockSearchWrapRef.current) return;
-      if (!stockSearchWrapRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (stockSearchWrapRef.current && !stockSearchWrapRef.current.contains(target)) {
         setStockSearchOpen(false);
+      }
+      if (bollTrySearchWrapRef.current && !bollTrySearchWrapRef.current.contains(target)) {
+        setBollTrySearchOpen(false);
       }
     };
     document.addEventListener('mousedown', onDocClick);
@@ -2291,14 +2506,23 @@ export default function App() {
 
   // 5.0b 布林编排页：单股 K 线 + 布林 + 命中区间 markArea
   const getBollPatternChartOption = () => {
-    if (!bollBars.length || !selectedBollMatch) return {};
+    if (!bollBars.length) return {};
     const xAxisDates = bollBars.map(b => b.date);
     const klineData = bollBars.map(b => [b.open, b.close, b.low, b.high]);
     const bollMid = bollBars.map(b => b.boll_mid ?? null);
     const bollUpper = bollBars.map(b => b.boll_upper ?? null);
     const bollLower = bollBars.map(b => b.boll_lower ?? null);
-    const start = selectedBollMatch.start_date;
-    const end = selectedBollMatch.end_date;
+    const highlightStart = selectedBollMatch?.start_date;
+    const highlightEnd = selectedBollMatch?.end_date;
+    const hasHighlight = !!(
+      selectedBollMatch &&
+      highlightStart &&
+      highlightEnd &&
+      selectedBollMatch.matched_states
+    );
+    const tooltipCacheKey = selectedBollMatch
+      ? String(selectedBollMatch.id)
+      : `preview:${bollPreviewMeta?.code || 'na'}`;
     const fmtPx = (v: number | null | undefined, digits = 2) =>
       v == null || Number.isNaN(Number(v)) ? 'N/A' : `￥${Number(v).toFixed(digits)}`;
 
@@ -2323,8 +2547,7 @@ export default function App() {
           const cached = bollAxisTooltipCacheRef.current;
           if (!kParam) return cached?.html ?? '';
           const idx = kParam.dataIndex as number;
-          const cacheKey = String(selectedBollMatch.id);
-          if (cached && cached.key === cacheKey && cached.index === idx) {
+          if (cached && cached.key === tooltipCacheKey && cached.index === idx) {
             return cached.html;
           }
           const b = bollBars[idx];
@@ -2343,7 +2566,7 @@ export default function App() {
               : Number(b.pct_b).toFixed(3);
           html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
           html += `</div></div>`;
-          bollAxisTooltipCacheRef.current = { key: cacheKey, index: idx, html };
+          bollAxisTooltipCacheRef.current = { key: tooltipCacheKey, index: idx, html };
           return html;
         },
         position: (point: number[], params: any, _dom: HTMLElement, _rect: any, size: { contentSize: number[]; viewSize: number[] }) => {
@@ -2352,16 +2575,15 @@ export default function App() {
           const idx = typeof kParam?.dataIndex === 'number'
             ? kParam.dataIndex
             : bollAxisTooltipCacheRef.current?.index;
-          const cacheKey = String(selectedBollMatch.id);
           const posCache = bollAxisTooltipPosRef.current;
-          if (posCache && posCache.key === cacheKey && posCache.index === idx && idx != null) {
+          if (posCache && posCache.key === tooltipCacheKey && posCache.index === idx && idx != null) {
             return posCache.pos;
           }
           const x = Math.min(point[0], size.viewSize[0] - size.contentSize[0] - 8);
           const y = Math.max(8, point[1] - size.contentSize[1] - 12);
           const pos: [number, number] = [Math.max(8, x), y];
           if (idx != null) {
-            bollAxisTooltipPosRef.current = { key: cacheKey, index: idx, pos };
+            bollAxisTooltipPosRef.current = { key: tooltipCacheKey, index: idx, pos };
           }
           return pos;
         },
@@ -2407,11 +2629,15 @@ export default function App() {
             borderColor: '#ef4444',
             borderColor0: '#10b981',
           },
-          markArea: {
-            silent: true,
-            itemStyle: { color: 'rgba(56, 189, 248, 0.08)' },
-            data: [[{ xAxis: start }, { xAxis: end }]],
-          },
+          ...(hasHighlight
+            ? {
+                markArea: {
+                  silent: true,
+                  itemStyle: { color: 'rgba(56, 189, 248, 0.08)' },
+                  data: [[{ xAxis: highlightStart }, { xAxis: highlightEnd }]],
+                },
+              }
+            : {}),
         },
         {
           name: 'BOLL-M',
@@ -2975,14 +3201,11 @@ export default function App() {
               <>
                 <div className="form-group">
                   <label>扫描交易日期</label>
-                  <div style={{ display: 'flex', gap: '0.4rem' }}>
-                    <Calendar size={18} color="#94a3b8" style={{ marginTop: '0.5rem' }} />
-                    <input
-                      type="date"
-                      value={runDate}
-                      onChange={(e) => setRunDate(e.target.value)}
-                    />
-                  </div>
+                  <DatePickerField
+                    value={runDate}
+                    onChange={setRunDate}
+                    title="选择扫描交易日期"
+                  />
                 </div>
 
                 <button
@@ -3008,18 +3231,18 @@ export default function App() {
               <>
                 <div className="form-group">
                   <label>回测开始日期</label>
-                  <input
-                    type="date"
+                  <DatePickerField
                     value={btStartDate}
-                    onChange={(e) => setBtStartDate(e.target.value)}
+                    onChange={setBtStartDate}
+                    title="选择回测开始日期"
                   />
                 </div>
                 <div className="form-group">
                   <label>回测结束日期</label>
-                  <input
-                    type="date"
+                  <DatePickerField
                     value={btEndDate}
-                    onChange={(e) => setBtEndDate(e.target.value)}
+                    onChange={setBtEndDate}
+                    title="选择回测结束日期"
                   />
                 </div>
                 <div className="form-group">
@@ -3534,21 +3757,44 @@ export default function App() {
               </div>
 
               <div className="data-card" style={{ padding: '1rem', minHeight: '280px' }}>
-                {!selectedBollMatch ? (
+                {!selectedBollMatch && bollBars.length === 0 ? (
                   <div className="empty-wrapper">
                     <Info size={28} color="#94a3b8" />
-                    <p>选择左侧命中行，查看布林 K 线与高亮区间。</p>
+                    <p>
+                      {bollChartSource === 'preview' && bollStateString
+                        ? '试跑窗口内无匹配。下方为窗口 zone 串；可改 regex / as_of 再试。'
+                        : '选择左侧命中行，或在编排表单中试跑，查看布林 K 线与高亮区间。'}
+                    </p>
+                    {bollChartSource === 'preview' && bollStateString && (
+                      <div style={{ marginTop: '0.8rem', width: '100%', textAlign: 'left' }}>
+                        <b style={{ color: '#cbd5e1', fontSize: '0.75rem' }}>试跑窗口 zone</b>
+                        <div className="boll-zone-string">{bollStateString}</div>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <>
                     <div style={{ marginBottom: '0.45rem' }}>
                       <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
-                        布林编排 · {selectedBollMatch.code.toUpperCase()} {selectedBollMatch.name || ''}
+                        {bollChartSource === 'preview' ? '试跑 · ' : '布林编排 · '}
+                        {(selectedBollMatch?.code || bollPreviewMeta?.code || '').toUpperCase()}{' '}
+                        {selectedBollMatch?.name || bollPreviewMeta?.name || ''}
                       </div>
                       <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem', lineHeight: 1.35 }}>
-                        {selectedBollMatch.pattern_name} | {selectedBollMatch.start_date} ~ {selectedBollMatch.end_date}
-                        {' | score '}
-                        {selectedBollMatch.score != null ? Number(selectedBollMatch.score).toFixed(2) : '—'}
+                        {selectedBollMatch ? (
+                          <>
+                            {selectedBollMatch.pattern_name} | {selectedBollMatch.start_date} ~ {selectedBollMatch.end_date}
+                            {' | score '}
+                            {selectedBollMatch.score != null ? Number(selectedBollMatch.score).toFixed(2) : '—'}
+                            {bollChartSource === 'preview' ? ' | 不落库' : ''}
+                          </>
+                        ) : (
+                          <>
+                            窗口内无匹配
+                            {bollPreviewMeta?.asOf ? ` | as_of ${bollPreviewMeta.asOf}` : ''}
+                            {' | 不落库'}
+                          </>
+                        )}
                       </div>
                     </div>
                     <ReactECharts
@@ -3557,13 +3803,17 @@ export default function App() {
                       notMerge
                     />
                     <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                      <div style={{ marginBottom: '0.45rem' }}>
-                        <b style={{ color: '#cbd5e1' }}>命中状态串</b>
-                        <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
-                      </div>
+                      {selectedBollMatch?.matched_states ? (
+                        <div style={{ marginBottom: '0.45rem' }}>
+                          <b style={{ color: '#cbd5e1' }}>命中状态串</b>
+                          <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
+                        </div>
+                      ) : null}
                       {bollStateString && (
                         <div>
-                          <b style={{ color: '#cbd5e1' }}>近 60 日 zone</b>
+                          <b style={{ color: '#cbd5e1' }}>
+                            {bollChartSource === 'preview' ? '试跑窗口 zone' : '近 60 日 zone'}
+                          </b>
                           <div className="boll-zone-string">{bollStateString}</div>
                         </div>
                       )}
@@ -3742,6 +3992,140 @@ export default function App() {
                       </p>
                     )}
 
+                    <div
+                      style={{
+                        borderTop: '1px solid var(--border-color)',
+                        paddingTop: '0.7rem',
+                        marginTop: '0.35rem',
+                        marginBottom: '0.75rem',
+                      }}
+                    >
+                      <h4 style={{ fontSize: '0.8rem', margin: '0 0 0.5rem', color: 'var(--color-text-main)' }}>
+                        试跑（不落库）
+                      </h4>
+                      {!bollForm.enabled && (
+                        <p style={{ fontSize: '0.7rem', color: '#f59e0b', margin: '0 0 0.45rem', lineHeight: 1.45 }}>
+                          当前未启用：可试跑，但正式扫描不会跑它。
+                        </p>
+                      )}
+                      <div className="form-group stock-view-search" ref={bollTrySearchWrapRef}>
+                        <label>股票代码</label>
+                        <div className="stock-search-input-wrap">
+                          <Search size={14} className="stock-search-icon" />
+                          <input
+                            type="text"
+                            value={bollTryCode}
+                            placeholder="如 茅台、600519、sz000002"
+                            onChange={(e) => {
+                              setBollTryCode(e.target.value);
+                              setBollTrySelected(null);
+                              setBollTrySearchOpen(true);
+                            }}
+                            onFocus={() => {
+                              if (bollTrySearchItems.length > 0) setBollTrySearchOpen(true);
+                            }}
+                            autoComplete="off"
+                            style={{ fontFamily: 'monospace' }}
+                          />
+                          {bollTrySearchLoading && <span className="stock-search-hint">搜索中…</span>}
+                        </div>
+                        {bollTrySearchOpen && bollTrySearchItems.length > 0 && (
+                          <ul className="stock-search-dropdown">
+                            {bollTrySearchItems.map((item) => (
+                              <li key={item.code}>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSelectBollTryStock(item)}
+                                >
+                                  <span className="stock-search-code">{item.code.toUpperCase()}</span>
+                                  <span className="stock-search-name">{item.name}</span>
+                                  {item.board ? (
+                                    <span className="stock-search-board">{item.board}</span>
+                                  ) : null}
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        {bollTrySearchOpen &&
+                          !bollTrySearchLoading &&
+                          bollTryCode.trim().length > 0 &&
+                          bollTrySearchItems.length === 0 &&
+                          !(
+                            bollTrySelected &&
+                            bollTryCode.trim() ===
+                              `${bollTrySelected.code.toUpperCase()} ${bollTrySelected.name || ''}`.trim()
+                          ) && (
+                            <div className="stock-search-empty">无匹配股票</div>
+                          )}
+                      </div>
+                      <div className="form-group">
+                        <label>as_of（截止日）</label>
+                        <DatePickerField
+                          value={bollTryAsOf}
+                          onChange={setBollTryAsOf}
+                          title="选择截止日"
+                        />
+                        <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
+                          截止日：假装这一天是「今天」。系统只使用该日及之前的行情，回看 window_days（左侧扫描窗口）根交易日做匹配。留空则用库里最新交易日。
+                        </p>
+                      </div>
+                      <button
+                        className="btn-primary"
+                        onClick={() => { void handleBollTryRun(); }}
+                        disabled={bollTryRunning}
+                        style={{ marginBottom: '0.5rem' }}
+                      >
+                        {bollTryRunning ? '试跑中…' : '试跑'}
+                      </button>
+                      {bollTryMessage && (
+                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', margin: '0 0 0.4rem' }}>
+                          {bollTryMessage} · 窗口 {bollWindowDays} 日
+                        </p>
+                      )}
+                      {bollTryHits.length > 0 && (
+                        <div className="table-wrapper" style={{ maxHeight: '140px', overflow: 'auto' }}>
+                          <table className="scan-table">
+                            <thead>
+                              <tr>
+                                <th>区间</th>
+                                <th>分</th>
+                                <th>状态串</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {bollTryHits.map(m => (
+                                <tr
+                                  key={m.id}
+                                  className={
+                                    bollChartSource === 'preview' && selectedBollMatch?.id === m.id
+                                      ? 'active-row'
+                                      : ''
+                                  }
+                                  onClick={() => {
+                                    void applyBollPreviewMatch(m, bollTryStateString, bollTryAsOf || m.end_date);
+                                  }}
+                                  style={{ cursor: 'pointer' }}
+                                >
+                                  <td style={{ fontSize: '0.7rem', fontFamily: 'monospace' }}>
+                                    {m.start_date}<br />~ {m.end_date}
+                                  </td>
+                                  <td>
+                                    <span className="score-badge">
+                                      {m.score != null ? m.score.toFixed(1) : '—'}
+                                    </span>
+                                  </td>
+                                  <td style={{ fontSize: '0.68rem', fontFamily: 'monospace', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                    {m.matched_states}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+
                     <div style={{ display: 'flex', gap: '0.5rem' }}>
                       <button className="btn-primary" onClick={handleSaveBollPattern}>保存</button>
                       <button
@@ -3890,39 +4274,12 @@ export default function App() {
                 </div>
                 <div className="form-group">
                   <label>截止日</label>
-                  <div className="date-picker-field">
-                    <input
-                      ref={stockViewEndDateRef}
-                      type="date"
-                      className="date-picker-field__input"
-                      value={stockViewEndDate}
-                      disabled={!selectedStockView}
-                      onChange={(e) => setStockViewEndDate(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="lookback-stepper__btn date-picker-field__btn"
-                      disabled={!selectedStockView}
-                      aria-label="打开日期选择"
-                      title="选择截止日"
-                      onClick={() => {
-                        const el = stockViewEndDateRef.current;
-                        if (!el || el.disabled) return;
-                        try {
-                          if (typeof el.showPicker === 'function') {
-                            el.showPicker();
-                          } else {
-                            el.focus();
-                            el.click();
-                          }
-                        } catch {
-                          el.focus();
-                        }
-                      }}
-                    >
-                      <Calendar size={16} strokeWidth={2.25} />
-                    </button>
-                  </div>
+                  <DatePickerField
+                    value={stockViewEndDate}
+                    onChange={setStockViewEndDate}
+                    disabled={!selectedStockView}
+                    title="选择截止日"
+                  />
                 </div>
                 <div className="form-group">
                   <label>回看日历日</label>

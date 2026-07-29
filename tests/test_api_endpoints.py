@@ -118,6 +118,34 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertTrue(res_json["success"])
         self.assertGreater(len(res_json["data"]["results"]), 0)
 
+    def test_03b_stock_search_and_bars_pct_b(self):
+        """验证股票模糊搜索与 bars 返回 pct_b。"""
+        res_name = self.client.get("/api/stocks/search", params={"q": "茅台", "limit": 10})
+        self.assertEqual(res_name.status_code, 200)
+        name_json = res_name.json()
+        self.assertTrue(name_json["success"])
+        items = name_json["data"]["items"]
+        self.assertGreaterEqual(len(items), 1)
+        self.assertLessEqual(len(items), 10)
+        self.assertTrue(any(i["code"] == "sh600519" for i in items))
+
+        res_code = self.client.get("/api/stocks/search", params={"q": "600519", "limit": 10})
+        self.assertEqual(res_code.status_code, 200)
+        code_items = res_code.json()["data"]["items"]
+        self.assertTrue(any(i["code"] == "sh600519" for i in code_items))
+
+        # search 不应被 /stocks/{symbol} 吞掉
+        res_search_as_symbol = self.client.get("/api/stocks/search", params={"q": "万科"})
+        self.assertEqual(res_search_as_symbol.status_code, 200)
+        self.assertTrue(res_search_as_symbol.json()["success"])
+
+        bars_res = self.client.get("/api/stocks/sh600519/bars", params={"lookback_days": 60})
+        self.assertEqual(bars_res.status_code, 200)
+        bars_json = bars_res.json()
+        if bars_json.get("success") and bars_json["data"].get("bars"):
+            sample = bars_json["data"]["bars"][-1]
+            self.assertIn("pct_b", sample)
+
     def test_04_historical_backtest_api(self):
         """
         验证 POST /api/backtests: 触发历史滚动无偏回测并一键落库

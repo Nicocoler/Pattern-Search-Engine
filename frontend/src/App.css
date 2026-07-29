@@ -962,7 +962,7 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* 个股走势 · 截止日：隐藏原生微弱日历图标，改用显式按钮 */
+/* 统一日期字段（DatePickerField）：隐藏原生微弱日历图标，改用显式按钮 */
 .date-picker-field {
   display: flex;
   align-items: center;

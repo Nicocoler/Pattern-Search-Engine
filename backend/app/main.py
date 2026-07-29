@@ -144,6 +144,20 @@ class BollPatternScanPayload(BaseModel):
     codes: list[str] | None = Field(default=None, example=None, description="可选股票子集；为空则扫非ST非停牌全市场")
     scan_date: str | None = Field(default=None, example=None, description="扫描截止日 YYYY-MM-DD；默认取 daily_bars 最大日期")
 
+class BollPatternPreviewPayload(BaseModel):
+    code: str = Field(..., description="股票代码，如 sz000002")
+    as_of: str | None = Field(
+        default=None,
+        description="截止日 YYYY-MM-DD；空则取 daily_bars 最大日期（与正式扫描一致）",
+    )
+    window_days: int = Field(default=60, ge=1, le=500, description="匹配窗口交易日数")
+    pattern_id: str | None = Field(default=None, description="可选；未保存草稿可空，仅用于展示")
+    pattern_name: str | None = Field(default=None, description="展示用名称；空则用草稿/id")
+    regex: str = Field(..., description="编排正则（可用未保存草稿）")
+    min_total_days: int = Field(default=0, ge=0)
+    zone_thresholds: dict = Field(..., description="effective 分区阈值（含页面未保存的全局草稿合并结果）")
+    denoise_min_len: int = Field(default=0, ge=0, description="effective 去抖最短持续天数")
+
 class BollPatternCreatePayload(BaseModel):
     id: str = Field(..., description="编排唯一 id，创建后不可改")
     name: str = Field(...)
@@ -980,6 +994,64 @@ def list_boll_patterns(include_disabled: bool = Query(True, description="是否�
         }
     except Exception as e:
         logger.error(f"列出布林编排异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.post("/api/boll-patterns/preview")
+def preview_boll_pattern(payload: BollPatternPreviewPayload):
+    """
+    单票编排试跑（不落库）：按 as_of + window_days 镜像正式扫描匹配算法，
+    使用请求体中的草稿 effective 尺子与 regex。
+    """
+    try:
+        import re as _re
+        from datetime import datetime as _dt
+        from backend.app.boll_pattern.loader import normalize_zone_thresholds
+        from backend.app.boll_pattern.scanner import BollPatternScanner
+
+        code = (payload.code or "").lower().strip()
+        if not code:
+            return {"success": False, "data": None, "error": "code 不能为空"}
+        regex = (payload.regex or "").strip()
+        if not regex:
+            return {"success": False, "data": None, "error": "regex 不能为空"}
+        try:
+            _re.compile(regex)
+        except _re.error as ex:
+            return {"success": False, "data": None, "error": f"regex 无效: {ex}"}
+        try:
+            zt = normalize_zone_thresholds(payload.zone_thresholds)
+        except (TypeError, ValueError) as ex:
+            return {"success": False, "data": None, "error": f"zone_thresholds 无效: {ex}"}
+
+        as_of = None
+        if payload.as_of:
+            try:
+                as_of = _dt.strptime(payload.as_of, "%Y-%m-%d").date()
+            except ValueError:
+                return {"success": False, "data": None, "error": "as_of 须为 YYYY-MM-DD"}
+
+        pattern = {
+            "id": (payload.pattern_id or "").strip() or "draft",
+            "name": (payload.pattern_name or "").strip()
+            or (payload.pattern_id or "").strip()
+            or "草稿",
+            "regex": regex,
+            "min_total_days": int(payload.min_total_days or 0),
+            "zone_thresholds": zt,
+            "denoise_min_len": int(payload.denoise_min_len or 0),
+        }
+        data = BollPatternScanner().preview_one(
+            code,
+            pattern,
+            window_days=payload.window_days,
+            as_of=as_of,
+        )
+        return {"success": True, "data": data, "error": None}
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"布林编排试跑异常: {e}")
         return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
 
 

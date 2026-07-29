@@ -16,6 +16,9 @@ DEFAULT_ZONE_THRESHOLDS: dict[str, tuple[float, float]] = {
     "U": (0.95, float("inf")),    # 触及/突破上轨（%B ≥ 0.95；贴上轨=1）
 }
 
+# 无效 / NaN 区：必须单字符，保证 state_string 与交易日一一对应
+INVALID_ZONE = "N"
+
 # 分区遍历顺序（由低到高），保证边界归左闭右开
 _ZONE_ORDER = ("L", "M", "H", "U")
 
@@ -41,15 +44,15 @@ def _normalize_thresholds(
 
 
 def zone(pct_b: float, thresholds: Mapping[str, Sequence[float]] | None = None) -> str:
-    """单个 %B 值映射为 L/M/H/U；NaN/异常 → NA。"""
+    """单个 %B 值映射为 L/M/H/U；NaN/异常 → N（单字符，避免状态串长度错位）。"""
     if pct_b is None or (isinstance(pct_b, float) and math.isnan(pct_b)) or pd.isna(pct_b):
-        return "NA"
+        return INVALID_ZONE
     try:
         x = float(pct_b)
     except (TypeError, ValueError):
-        return "NA"
+        return INVALID_ZONE
     if math.isnan(x) or math.isinf(x):
-        return "NA"
+        return INVALID_ZONE
 
     bounds = _normalize_thresholds(thresholds)
     for label in _ZONE_ORDER:
