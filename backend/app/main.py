@@ -1403,16 +1403,28 @@ def get_boll_pattern_matches(
 def get_stock_bars_with_boll(
     symbol: str = Path(..., description="股票代码 (如 sz000002)"),
     end_date: str | None = Query(None, description="截止日 YYYY-MM-DD，默认取最新交易日"),
-    lookback_days: int = Query(120, ge=30, le=500, description="返回窗口的日历回溯天数（计算暖机固定按 compare 的 250 天）"),
+    period: str = Query("daily", description="K 线周期：daily | weekly | monthly（ADR 0005）"),
+    lookback_bars: int | None = Query(
+        None, ge=30, le=500, description="返回窗口的当前周期 K 根数（优先于 lookback_days）"
+    ),
+    lookback_days: int = Query(
+        120, ge=30, le=500, description="兼容别名：等同 lookback_bars（当前周期根数，非日历日）"
+    ),
 ):
     """
     返回个股 OHLCV + 布林三轨 + Chart Subpane（通达信 MACD/KDJ）。
-    经 market_pipeline 统一门面暖机；副图在完整暖机序列上计算后再切展示窗（ADR 0003）。
+    日/周/月：读时从 daily_bars 聚合；副图在完整暖机序列上计算后再截 lookback_bars（ADR 0003/0005）。
     """
     try:
         from backend.app.chart_subpane import apply_chart_subpanes
-        from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, prepare_stock_frame
+        from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, prepare_chart_bars
+
         code = symbol.lower().strip()
+        period_norm = (period or "daily").strip().lower()
+        if period_norm not in ("daily", "weekly", "monthly"):
+            return {"success": False, "data": None, "error": "period 须为 daily | weekly | monthly"}
+        n_bars = int(lookback_bars if lookback_bars is not None else lookback_days)
+
         if end_date:
             target = datetime.strptime(end_date, "%Y-%m-%d").date()
         else:
@@ -1423,15 +1435,12 @@ def get_stock_bars_with_boll(
                 return {"success": False, "data": None, "error": "该股票暂无行情数据"}
             target = row["d"] if isinstance(row["d"], date) else datetime.strptime(str(row["d"]), "%Y-%m-%d").date()
 
-        # 先在完整暖机帧上算副图，再按日历切展示窗（避免 EMA 种子被截断）
-        df_full = prepare_stock_frame(code, target, level="features")
+        df_full = prepare_chart_bars(code, target, period=period_norm, lookback_bars=n_bars)
         if df_full.empty:
             return {"success": False, "data": None, "error": "行情数据不足"}
 
         df_full = apply_chart_subpanes(df_full)
-        display_start = target - timedelta(days=int(lookback_days))
-        dates = pd.to_datetime(df_full["date"]).dt.date
-        df_out = df_full.loc[dates >= display_start].copy().reset_index(drop=True)
+        df_out = df_full.tail(n_bars).copy().reset_index(drop=True)
         if df_out.empty:
             return {"success": False, "data": None, "error": "行情数据不足"}
 
@@ -1441,6 +1450,8 @@ def get_stock_bars_with_boll(
             "data": {
                 "code": code,
                 "end_date": target.isoformat(),
+                "period": period_norm,
+                "lookback_bars": n_bars,
                 "bars": bars,
                 "calc_lookback_days": COMPARE_LOOKBACK_DAYS,
             },

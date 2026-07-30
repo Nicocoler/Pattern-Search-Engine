@@ -201,8 +201,30 @@ interface BacktestResult {
 
 type ZoneBounds = { m: number; h: number; u: number };
 
-/** 个股走势 · 回看日历日快捷选项 */
+/** 个股走势 · 回看 K 根数快捷选项（当前周期） */
 const STOCK_VIEW_LOOKBACK_PRESETS = [60, 100, 120, 250] as const;
+
+/** 看盘 K 线周期（ADR 0005）；① 个股走势与 ② 编排详情图共用 */
+type ChartPeriod = 'daily' | 'weekly' | 'monthly';
+
+const CHART_PERIOD_OPTIONS: { value: ChartPeriod; label: string }[] = [
+  { value: 'daily', label: '日' },
+  { value: 'weekly', label: '周' },
+  { value: 'monthly', label: '月' },
+];
+
+const CHART_PERIOD_LOOKBACK_DEFAULTS: Record<ChartPeriod, number> = {
+  daily: 120,
+  weekly: 104,
+  monthly: 60,
+};
+
+const CHART_PERIOD_LABEL: Record<ChartPeriod, string> = {
+  daily: '日',
+  weekly: '周',
+  monthly: '月',
+};
+
 
 function isZoneBoundsOrdered(b: ZoneBounds): boolean {
   return (
@@ -586,13 +608,27 @@ export default function App() {
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
   const [selectedStockView, setSelectedStockView] = useState<StockSearchItem | null>(null);
   const [stockViewEndDate, setStockViewEndDate] = useState('');
-  const [stockViewLookback, setStockViewLookback] = useState(120);
+  /** ①② 共用周期；默认日线，不持久化（ADR 0005） */
+  const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('daily');
+  const [lookbackByPeriod, setLookbackByPeriod] = useState<Record<ChartPeriod, number>>({
+    ...CHART_PERIOD_LOOKBACK_DEFAULTS,
+  });
+  const stockViewLookback = lookbackByPeriod[chartPeriod];
+  const setStockViewLookback = (next: number | ((prev: number) => number)) => {
+    setLookbackByPeriod((prev) => {
+      const cur = prev[chartPeriod];
+      const resolved = typeof next === 'function' ? next(cur) : next;
+      return { ...prev, [chartPeriod]: resolved };
+    });
+  };
   const [stockViewBars, setStockViewBars] = useState<Bar[]>([]);
   const [stockViewLoading, setStockViewLoading] = useState(false);
   const [stockViewZoneOpen, setStockViewZoneOpen] = useState(false);
   const [stockViewZoneString, setStockViewZoneString] = useState('');
   const [stockViewZoneLoading, setStockViewZoneLoading] = useState(false);
   const stockViewReqKeyRef = useRef('');
+  /** 周期切换已立即拉图时，跳过随后的 lookback 防抖 effect，避免重复请求 */
+  const skipBarsDebounceRef = useRef(false);
   const stockSearchWrapRef = useRef<HTMLDivElement | null>(null);
   const bollAxisTooltipCacheRef = useRef<{ key: string; index: number; html: string } | null>(null);
   const stockViewAxisTooltipCacheRef = useRef<{ key: string; index: number; html: string } | null>(null);
@@ -1163,11 +1199,24 @@ export default function App() {
     }
   };
 
-  const loadBollBarsForChart = async (code: string, endDate?: string) => {
+  const buildBarsQuery = (endDate: string | undefined, lookback: number, period: ChartPeriod) => {
+    const lb = Math.min(500, Math.max(30, lookback || CHART_PERIOD_LOOKBACK_DEFAULTS[period]));
+    const qs = new URLSearchParams();
+    qs.set('period', period);
+    qs.set('lookback_bars', String(lb));
+    if (endDate) qs.set('end_date', endDate);
+    return { qs, lb };
+  };
+
+  const loadBollBarsForChart = async (
+    code: string,
+    endDate?: string,
+    period: ChartPeriod = chartPeriod,
+    lookback: number = stockViewLookback,
+  ) => {
     setBollLoading(true);
     try {
-      const qs = new URLSearchParams({ lookback_days: '120' });
-      if (endDate) qs.set('end_date', endDate);
+      const { qs } = buildBarsQuery(endDate, lookback, period);
       const barsRes = await fetch(`${apiBase}/api/stocks/${code}/bars?${qs.toString()}`);
       const barsJson = await barsRes.json();
       if (barsJson.success) {
@@ -1190,20 +1239,28 @@ export default function App() {
     setSelectedBollMatch(m);
     setBollLoading(true);
     try {
-      const [barsRes, stateRes] = await Promise.all([
-        fetch(`${apiBase}/api/stocks/${m.code}/bars?end_date=${m.end_date}&lookback_days=120`),
-        fetch(`${apiBase}/api/stocks/${m.code}/boll-states?limit=60`),
-      ]);
+      const { qs } = buildBarsQuery(m.end_date, stockViewLookback, chartPeriod);
+      const fetches: Promise<Response>[] = [
+        fetch(`${apiBase}/api/stocks/${m.code}/bars?${qs.toString()}`),
+      ];
+      if (chartPeriod === 'daily') {
+        fetches.push(fetch(`${apiBase}/api/stocks/${m.code}/boll-states?limit=60`));
+      }
+      const [barsRes, stateRes] = await Promise.all(fetches);
       const barsJson = await barsRes.json();
-      const stateJson = await stateRes.json();
       if (barsJson.success) {
         setBollBars(barsJson.data.bars || []);
       } else {
         setBollBars([]);
         showToast('加载 K 线失败：' + (barsJson.error || ''));
       }
-      if (stateJson.success) {
-        setBollStateString(stateJson.data.state_string || '');
+      if (chartPeriod === 'daily' && stateRes) {
+        const stateJson = await stateRes.json();
+        if (stateJson.success) {
+          setBollStateString(stateJson.data.state_string || '');
+        }
+      } else {
+        setBollStateString('');
       }
     } catch {
       showToast('加载编排个股图表异常');
@@ -1350,22 +1407,20 @@ export default function App() {
     code: string,
     endDate: string | undefined,
     lookback: number,
+    period: ChartPeriod = chartPeriod,
   ) => {
-    const lb = Math.min(500, Math.max(30, lookback || 120));
-    const key = `${code}|${endDate || 'latest'}|${lb}`;
+    const { qs, lb } = buildBarsQuery(endDate, lookback, period);
+    const key = `${code}|${endDate || 'latest'}|${period}|${lb}`;
     if (stockViewReqKeyRef.current === key) return;
     stockViewReqKeyRef.current = key;
     setStockViewLoading(true);
     try {
-      const qs = new URLSearchParams();
-      qs.set('lookback_days', String(lb));
-      if (endDate) qs.set('end_date', endDate);
       const res = await fetch(`${apiBase}/api/stocks/${code}/bars?${qs.toString()}`);
       const json = await res.json();
       if (json.success) {
         const resolvedEnd = json.data?.end_date || endDate || '';
         if (!endDate && resolvedEnd) {
-          stockViewReqKeyRef.current = `${code}|${resolvedEnd}|${lb}`;
+          stockViewReqKeyRef.current = `${code}|${resolvedEnd}|${period}|${lb}`;
           setStockViewEndDate(resolvedEnd);
         }
         setStockViewBars(json.data.bars || []);
@@ -2126,25 +2181,34 @@ export default function App() {
     };
   }, [activeTab, apiBase, bollTryCode, bollTrySelected]);
 
-  // 个股走势：窗口参数变更防抖拉图
+  // 个股走势：截止日 / 回看变更防抖拉图（周期切换立即请求，见 setChartPeriod）
   useEffect(() => {
     if (activeTab !== 'stock_view') return;
     if (!selectedStockView) return;
     if (stockViewLookback < 30 || stockViewLookback > 500) return;
+    if (skipBarsDebounceRef.current) {
+      skipBarsDebounceRef.current = false;
+      return;
+    }
     const t = setTimeout(() => {
       void loadStockViewBars(
         selectedStockView.code,
         stockViewEndDate || undefined,
         stockViewLookback,
+        chartPeriod,
       );
     }, 300);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, selectedStockView?.code, stockViewEndDate, stockViewLookback, apiBase]);
+  }, [activeTab, selectedStockView?.code, stockViewEndDate, stockViewLookback, chartPeriod, apiBase]);
 
-  // 个股走势：展开 zone 时再请求
+  // 个股走势：展开 zone 时再请求（仅日线）
   useEffect(() => {
     if (activeTab !== 'stock_view' || !stockViewZoneOpen || !selectedStockView) return;
+    if (chartPeriod !== 'daily') {
+      setStockViewZoneString('');
+      return;
+    }
     let cancelled = false;
     setStockViewZoneLoading(true);
     void (async () => {
@@ -2173,7 +2237,49 @@ export default function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, stockViewZoneOpen, selectedStockView?.code, apiBase]);
+  }, [activeTab, stockViewZoneOpen, selectedStockView?.code, chartPeriod, apiBase]);
+
+  // 布林编排详情图：回看变更防抖重拉（周期切换立即请求）
+  useEffect(() => {
+    if (activeTab !== 'boll_pattern') return;
+    if (stockViewLookback < 30 || stockViewLookback > 500) return;
+    const code =
+      selectedBollMatch?.code ||
+      bollPreviewMeta?.code ||
+      '';
+    if (!code) return;
+    if (skipBarsDebounceRef.current) {
+      skipBarsDebounceRef.current = false;
+      return;
+    }
+    const end =
+      selectedBollMatch?.end_date ||
+      bollPreviewMeta?.asOf ||
+      undefined;
+    const t = setTimeout(() => {
+      void loadBollBarsForChart(code, end);
+      if (chartPeriod === 'daily' && selectedBollMatch?.code) {
+        void (async () => {
+          try {
+            const stateRes = await fetch(
+              `${apiBase}/api/stocks/${selectedBollMatch.code}/boll-states?limit=60`,
+            );
+            const stateJson = await stateRes.json();
+            if (stateJson.success) {
+              setBollStateString(stateJson.data.state_string || '');
+            }
+          } catch {
+            /* ignore */
+          }
+        })();
+      } else if (chartPeriod !== 'daily') {
+        setBollStateString('');
+      }
+    }, 300);
+    return () => clearTimeout(t);
+    // 回看变更防抖；选中命中由 handleSelectBollMatch 负责
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, chartPeriod, stockViewLookback, apiBase]);
 
   // 点击外部关闭搜索下拉
   useEffect(() => {
@@ -2575,6 +2681,7 @@ export default function App() {
     highlightEnd?: string;
     hasHighlight?: boolean;
     edgeHits?: BollEdgeHit[];
+    candleName?: string;
   }) => {
     const {
       bars,
@@ -2585,6 +2692,7 @@ export default function App() {
       highlightEnd,
       hasHighlight = false,
       edgeHits = [],
+      candleName = '日K',
     } = args;
     if (!bars.length) return {};
 
@@ -2635,6 +2743,8 @@ export default function App() {
 
     return {
       backgroundColor: 'transparent',
+      // 周期切换时禁止新旧序列 morph，避免布林线拉丝错乱
+      animation: false,
       axisPointer: {
         link: [{ xAxisIndex: [0, 1, 2] }],
       },
@@ -2652,7 +2762,7 @@ export default function App() {
         borderColor: 'rgba(255,255,255,0.12)',
         textStyle: { color: '#e2e8f0', fontSize: 11 },
         formatter: (params: any) => {
-          const kParam = (params || []).find((p: any) => p.seriesName === '日K');
+          const kParam = (params || []).find((p: any) => p.seriesName === candleName);
           const cached = tooltipCacheRef.current;
           if (!kParam) return cached?.html ?? '';
           const idx = kParam.dataIndex as number;
@@ -2700,7 +2810,7 @@ export default function App() {
         },
         position: (point: number[], params: any, _dom: HTMLElement, _rect: any, size: { contentSize: number[]; viewSize: number[] }) => {
           const list = Array.isArray(params) ? params : params ? [params] : [];
-          const kParam = list.find((p: any) => p?.seriesName === '日K');
+          const kParam = list.find((p: any) => p?.seriesName === candleName);
           const idx = typeof kParam?.dataIndex === 'number'
             ? kParam.dataIndex
             : tooltipCacheRef.current?.index;
@@ -2719,7 +2829,7 @@ export default function App() {
       },
       legend: [
         {
-          data: ['日K', 'BOLL-M', 'UB', 'LB'],
+          data: [candleName, 'BOLL-M', 'UB', 'LB'],
           top: '1%',
           left: 'center',
           itemGap: 14,
@@ -2802,7 +2912,7 @@ export default function App() {
       ],
       series: [
         {
-          name: '日K',
+          name: candleName,
           type: 'candlestick',
           xAxisIndex: 0,
           yAxisIndex: 0,
@@ -2928,37 +3038,121 @@ export default function App() {
 
   const getBollPatternChartOption = () => {
     if (!bollBars.length) return {};
-    const highlightStart = selectedBollMatch?.start_date;
-    const highlightEnd = selectedBollMatch?.end_date;
+    const rawStart = selectedBollMatch?.start_date;
+    const rawEnd = selectedBollMatch?.end_date;
+    let highlightStart = rawStart;
+    let highlightEnd = rawEnd;
+    if (chartPeriod !== 'daily' && rawStart && rawEnd) {
+      const inRange = bollBars.filter((b) => b.date >= rawStart && b.date <= rawEnd);
+      if (inRange.length) {
+        highlightStart = inRange[0].date;
+        highlightEnd = inRange[inRange.length - 1].date;
+      } else {
+        highlightStart = undefined;
+        highlightEnd = undefined;
+      }
+    }
     const hasHighlight = !!(
       selectedBollMatch &&
       highlightStart &&
       highlightEnd &&
       selectedBollMatch.matched_states
     );
-    const tooltipCacheKey = selectedBollMatch
-      ? String(selectedBollMatch.id)
-      : `preview:${bollPreviewMeta?.code || 'na'}`;
     return buildKlineBollSubpaneOption({
       bars: bollBars,
-      tooltipCacheKey,
+      tooltipCacheKey: selectedBollMatch
+        ? `${selectedBollMatch.id}:${chartPeriod}`
+        : `preview:${bollPreviewMeta?.code || 'na'}:${chartPeriod}`,
       tooltipCacheRef: bollAxisTooltipCacheRef,
       tooltipPosRef: bollAxisTooltipPosRef,
       highlightStart,
       highlightEnd,
       hasHighlight,
-      edgeHits: selectedBollMatch?.edge_hits || [],
+      // 边命中打点仅日线（ADR 0005）
+      edgeHits: chartPeriod === 'daily' ? (selectedBollMatch?.edge_hits || []) : [],
+      candleName: `${CHART_PERIOD_LABEL[chartPeriod]}K`,
     });
   };
+
+  const setChartPeriodAndMaybeCloseZone = (p: ChartPeriod) => {
+    if (p === chartPeriod) return;
+    const nextLookback = lookbackByPeriod[p];
+    skipBarsDebounceRef.current = true;
+    setChartPeriod(p);
+    if (p !== 'daily') setStockViewZoneOpen(false);
+    // 立刻清空旧周期序列，避免 ECharts 日→周/月 morph 拉丝
+    setStockViewBars([]);
+    stockViewReqKeyRef.current = '';
+    bollAxisTooltipCacheRef.current = null;
+    stockViewAxisTooltipCacheRef.current = null;
+    bollAxisTooltipPosRef.current = null;
+    stockViewAxisTooltipPosRef.current = null;
+
+    if (activeTab === 'stock_view' && selectedStockView) {
+      setStockViewLoading(true);
+      void loadStockViewBars(
+        selectedStockView.code,
+        stockViewEndDate || undefined,
+        nextLookback,
+        p,
+      );
+    }
+
+    const bollCode = selectedBollMatch?.code || bollPreviewMeta?.code;
+    if (activeTab === 'boll_pattern' && bollCode) {
+      setBollBars([]);
+      setBollLoading(true);
+      const end = selectedBollMatch?.end_date || bollPreviewMeta?.asOf || undefined;
+      void loadBollBarsForChart(bollCode, end, p, nextLookback);
+      if (p === 'daily' && selectedBollMatch?.code) {
+        void (async () => {
+          try {
+            const stateRes = await fetch(
+              `${apiBase}/api/stocks/${selectedBollMatch.code}/boll-states?limit=60`,
+            );
+            const stateJson = await stateRes.json();
+            if (stateJson.success) {
+              setBollStateString(stateJson.data.state_string || '');
+            }
+          } catch {
+            /* ignore */
+          }
+        })();
+      } else {
+        setBollStateString('');
+      }
+    } else if (bollCode) {
+      // 非编排页切周期：清缓存，进编排页时由 effect / 选中逻辑重拉
+      setBollBars([]);
+      setBollStateString('');
+    }
+  };
+
+  const renderChartPeriodSwitcher = (disabled = false) => (
+    <div className="chart-period-switch" role="group" aria-label="K 线周期">
+      {CHART_PERIOD_OPTIONS.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          className={`chart-period-btn${chartPeriod === opt.value ? ' active' : ''}`}
+          disabled={disabled}
+          onClick={() => setChartPeriodAndMaybeCloseZone(opt.value)}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
 
   // 5.0c 个股走势页：单股 K 线 + 布林 + MACD/KDJ
   const getStockViewChartOption = () => {
     if (!stockViewBars.length || !selectedStockView) return {};
     return buildKlineBollSubpaneOption({
       bars: stockViewBars,
-      tooltipCacheKey: selectedStockView.code,
+      tooltipCacheKey: `${selectedStockView.code}:${chartPeriod}`,
       tooltipCacheRef: stockViewAxisTooltipCacheRef,
       tooltipPosRef: stockViewAxisTooltipPosRef,
+      candleName: `${CHART_PERIOD_LABEL[chartPeriod]}K`,
     });
   };
 
@@ -3933,42 +4127,56 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    <div style={{ marginBottom: '0.45rem' }}>
-                      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
-                        {bollChartSource === 'preview' ? '试跑 · ' : '布林编排 · '}
-                        {(selectedBollMatch?.code || bollPreviewMeta?.code || '').toUpperCase()}{' '}
-                        {selectedBollMatch?.name || bollPreviewMeta?.name || ''}
+                    <div style={{ marginBottom: '0.45rem', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
+                      <div>
+                        <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
+                          {bollChartSource === 'preview' ? '试跑 · ' : '布林编排 · '}
+                          {(selectedBollMatch?.code || bollPreviewMeta?.code || '').toUpperCase()}{' '}
+                          {selectedBollMatch?.name || bollPreviewMeta?.name || ''}
+                        </div>
+                        <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem', lineHeight: 1.35 }}>
+                          {CHART_PERIOD_LABEL[chartPeriod]}K · 回看 {stockViewLookback} 根
+                          {selectedBollMatch ? (
+                            <>
+                              {' · '}
+                              {selectedBollMatch.pattern_name} | {selectedBollMatch.start_date} ~ {selectedBollMatch.end_date}
+                              {' | score '}
+                              {selectedBollMatch.score != null ? Number(selectedBollMatch.score).toFixed(2) : '—'}
+                              {bollChartSource === 'preview' ? ' | 不落库' : ''}
+                            </>
+                          ) : (
+                            <>
+                              {' · '}
+                              窗口内无匹配
+                              {bollPreviewMeta?.asOf ? ` | as_of ${bollPreviewMeta.asOf}` : ''}
+                              {' | 不落库'}
+                            </>
+                          )}
+                        </div>
                       </div>
-                      <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem', lineHeight: 1.35 }}>
-                        {selectedBollMatch ? (
-                          <>
-                            {selectedBollMatch.pattern_name} | {selectedBollMatch.start_date} ~ {selectedBollMatch.end_date}
-                            {' | score '}
-                            {selectedBollMatch.score != null ? Number(selectedBollMatch.score).toFixed(2) : '—'}
-                            {bollChartSource === 'preview' ? ' | 不落库' : ''}
-                          </>
-                        ) : (
-                          <>
-                            窗口内无匹配
-                            {bollPreviewMeta?.asOf ? ` | as_of ${bollPreviewMeta.asOf}` : ''}
-                            {' | 不落库'}
-                          </>
-                        )}
-                      </div>
+                      {renderChartPeriodSwitcher(bollLoading)}
                     </div>
-                    <ReactECharts
-                      option={getBollPatternChartOption()}
-                      style={{ height: '520px', width: '100%' }}
-                      notMerge
-                    />
+                    {bollLoading && bollBars.length === 0 ? (
+                      <div className="loading-wrapper" style={{ height: '520px' }}>
+                        <div className="spinner" />
+                      </div>
+                    ) : (
+                      <ReactECharts
+                        key={`boll-chart-${chartPeriod}`}
+                        option={getBollPatternChartOption()}
+                        style={{ height: '520px', width: '100%' }}
+                        notMerge
+                        opts={{ renderer: 'canvas' }}
+                      />
+                    )}
                     <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                      {selectedBollMatch?.matched_states ? (
+                      {chartPeriod === 'daily' && selectedBollMatch?.matched_states ? (
                         <div style={{ marginBottom: '0.45rem' }}>
                           <b style={{ color: '#cbd5e1' }}>命中状态串</b>
                           <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
                         </div>
                       ) : null}
-                      {selectedBollMatch?.edge_hits && selectedBollMatch.edge_hits.length > 0 ? (
+                      {chartPeriod === 'daily' && selectedBollMatch?.edge_hits && selectedBollMatch.edge_hits.length > 0 ? (
                         <div style={{ marginBottom: '0.45rem' }}>
                           <b style={{ color: '#fdba74' }}>边条件命中</b>
                           <div style={{ fontFamily: 'monospace', marginTop: '0.2rem', lineHeight: 1.5 }}>
@@ -3980,7 +4188,7 @@ export default function App() {
                           </div>
                         </div>
                       ) : null}
-                      {bollStateString && (
+                      {chartPeriod === 'daily' && bollStateString && (
                         <div>
                           <b style={{ color: '#cbd5e1' }}>
                             {bollChartSource === 'preview' ? '试跑窗口 zone' : '近 60 日 zone'}
@@ -3988,6 +4196,11 @@ export default function App() {
                           <div className="boll-zone-string">{bollStateString}</div>
                         </div>
                       )}
+                      {chartPeriod !== 'daily' ? (
+                        <p style={{ margin: 0, fontSize: '0.72rem', color: '#64748b' }}>
+                          zone / 边命中仅日线可用
+                        </p>
+                      ) : null}
                     </div>
                   </>
                 )}
@@ -4541,14 +4754,18 @@ export default function App() {
                   />
                 </div>
                 <div className="form-group">
-                  <label>回看日历日</label>
+                  <label>周期</label>
+                  {renderChartPeriodSwitcher(!selectedStockView)}
+                </div>
+                <div className="form-group">
+                  <label>回看根数（{CHART_PERIOD_LABEL[chartPeriod]}K）</label>
                   <div
                     className="zone-bound-stepper lookback-stepper"
                     style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}
                   >
                     <button
                       type="button"
-                      aria-label="减少回看天数"
+                      aria-label="减少回看根数"
                       className="zone-bound-stepper__btn lookback-stepper__btn"
                       disabled={!selectedStockView || stockViewLookback <= 30}
                       onClick={() => {
@@ -4572,7 +4789,7 @@ export default function App() {
                     />
                     <button
                       type="button"
-                      aria-label="增加回看天数"
+                      aria-label="增加回看根数"
                       className="zone-bound-stepper__btn lookback-stepper__btn"
                       disabled={!selectedStockView || stockViewLookback >= 500}
                       onClick={() => {
@@ -4584,8 +4801,8 @@ export default function App() {
                     <select
                       className="lookback-preset-select"
                       disabled={!selectedStockView}
-                      title="快捷回看天数"
-                      aria-label="快捷回看天数"
+                      title="快捷回看根数"
+                      aria-label="快捷回看根数"
                       value={
                         (STOCK_VIEW_LOOKBACK_PRESETS as readonly number[]).includes(stockViewLookback)
                           ? String(stockViewLookback)
@@ -4613,7 +4830,7 @@ export default function App() {
               {!selectedStockView ? (
                 <div className="empty-wrapper" style={{ padding: '2.5rem 0' }}>
                   <Info size={28} color="#94a3b8" />
-                  <p>输入名称、代码或拼音首字母搜索股票，查看日 K + 布林走势。</p>
+                  <p>输入名称、代码或拼音首字母搜索股票，查看日/周/月 K + 布林走势。</p>
                 </div>
               ) : stockViewLoading && stockViewBars.length === 0 ? (
                 <div className="loading-wrapper" style={{ padding: '2rem 0' }}>
@@ -4636,32 +4853,42 @@ export default function App() {
                       ) : null}
                     </div>
                     <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem' }}>
-                      截止 {stockViewEndDate || '—'} · 回看 {stockViewLookback} 日历日 · BOLL(20,2)
+                      截止 {stockViewEndDate || '—'} · {CHART_PERIOD_LABEL[chartPeriod]}K · 回看 {stockViewLookback} 根 · BOLL(20,2)
                     </div>
                   </div>
                   <ReactECharts
+                    key={`stock-view-${chartPeriod}`}
                     option={getStockViewChartOption()}
                     style={{ height: '560px', width: '100%' }}
                     notMerge
+                    opts={{ renderer: 'canvas' }}
                   />
                   <div style={{ marginTop: '0.75rem' }}>
-                    <button
-                      type="button"
-                      className="stock-zone-toggle"
-                      onClick={() => setStockViewZoneOpen((v) => !v)}
-                    >
-                      {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                      {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
-                    </button>
-                    {stockViewZoneOpen && (
-                      <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                        <b style={{ color: '#cbd5e1' }}>近 60 日 zone</b>
-                        {stockViewZoneLoading ? (
-                          <div style={{ marginTop: '0.35rem' }}>加载中…</div>
-                        ) : (
-                          <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
+                    {chartPeriod === 'daily' ? (
+                      <>
+                        <button
+                          type="button"
+                          className="stock-zone-toggle"
+                          onClick={() => setStockViewZoneOpen((v) => !v)}
+                        >
+                          {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                          {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
+                        </button>
+                        {stockViewZoneOpen && (
+                          <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                            <b style={{ color: '#cbd5e1' }}>近 60 日 zone</b>
+                            {stockViewZoneLoading ? (
+                              <div style={{ marginTop: '0.35rem' }}>加载中…</div>
+                            ) : (
+                              <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
+                            )}
+                          </div>
                         )}
-                      </div>
+                      </>
+                    ) : (
+                      <p style={{ margin: 0, fontSize: '0.72rem', color: '#64748b' }}>
+                        zone 仅日线可用
+                      </p>
                     )}
                   </div>
                 </>

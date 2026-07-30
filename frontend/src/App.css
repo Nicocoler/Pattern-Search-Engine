@@ -1104,7 +1104,7 @@ body {
 /* 个股走势 */
 .stock-view-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 2fr) minmax(140px, 1fr) minmax(200px, 1.1fr);
+  grid-template-columns: minmax(200px, 2fr) minmax(130px, 0.9fr) minmax(110px, 0.7fr) minmax(200px, 1.1fr);
   gap: 0.75rem 1rem;
   margin-bottom: 1rem;
   align-items: end;
@@ -1114,6 +1114,46 @@ body {
   .stock-view-toolbar {
     grid-template-columns: 1fr;
   }
+}
+
+.chart-period-switch {
+  display: inline-flex;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.chart-period-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  line-height: 1.2;
+  min-width: 2.1rem;
+}
+
+.chart-period-btn + .chart-period-btn {
+  border-left: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.chart-period-btn:hover:not(:disabled) {
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.45);
+}
+
+.chart-period-btn.active {
+  color: #f8fafc;
+  background: rgba(59, 130, 246, 0.35);
+}
+
+.chart-period-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .stock-view-search {
