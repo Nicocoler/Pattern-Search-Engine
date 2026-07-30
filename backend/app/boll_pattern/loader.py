@@ -75,6 +75,7 @@ def load_boll_patterns(path: str | Path | None = None) -> dict[str, Any]:
             "regex": str(p.get("regex") or ""),
             "min_total_days": int(p.get("min_total_days") or 0),
             "enabled": bool(p.get("enabled", True)),
+            "period": str(p.get("period") or "daily").strip().lower() or "daily",
             "zone_thresholds": normalize_zone_thresholds(zt_raw) if zt_raw is not None else None,
             "denoise_min_len": (
                 int(p["denoise_min_len"]) if p.get("denoise_min_len") is not None else None

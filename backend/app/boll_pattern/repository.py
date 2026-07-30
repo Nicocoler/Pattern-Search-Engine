@@ -41,10 +41,20 @@ CREATE TABLE IF NOT EXISTS boll_patterns (
     zone_thresholds JSONB,
     denoise_min_len INT,
     edges JSONB NOT NULL DEFAULT '[]'::jsonb,
+    period VARCHAR(16) NOT NULL DEFAULT 'daily',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 """
+
+VALID_BAR_PERIODS = frozenset({"daily", "weekly", "monthly"})
+
+
+def normalize_bar_period(raw: Any, *, default: str = "daily") -> str:
+    p = str(raw or default).strip().lower()
+    if p not in VALID_BAR_PERIODS:
+        raise ValueError("period 须为 daily | weekly | monthly")
+    return p
 
 
 def ensure_pattern_tables() -> None:
@@ -55,6 +65,19 @@ def ensure_pattern_tables() -> None:
             """
             ALTER TABLE boll_patterns
             ADD COLUMN IF NOT EXISTS edges JSONB NOT NULL DEFAULT '[]'::jsonb;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE boll_patterns
+            ADD COLUMN IF NOT EXISTS period VARCHAR(16) NOT NULL DEFAULT 'daily';
+            """
+        )
+        cur.execute(
+            """
+            UPDATE boll_patterns
+            SET period = 'daily'
+            WHERE period IS NULL OR TRIM(period) = '' OR period NOT IN ('daily', 'weekly', 'monthly');
             """
         )
         conn.commit()
@@ -78,12 +101,17 @@ def _row_edges(raw: Any) -> list[dict[str, str]]:
 
 def _pattern_from_row(row: dict) -> dict[str, Any]:
     zt = row.get("zone_thresholds")
+    try:
+        period = normalize_bar_period(row.get("period"), default="daily")
+    except ValueError:
+        period = "daily"
     return {
         "id": row["id"],
         "name": row["name"],
         "regex": row["regex"],
         "min_total_days": int(row["min_total_days"] or 0),
         "enabled": bool(row["enabled"]),
+        "period": period,
         "zone_thresholds": _row_thresholds(zt) if zt is not None else None,
         "denoise_min_len": (
             int(row["denoise_min_len"]) if row.get("denoise_min_len") is not None else None
@@ -163,7 +191,7 @@ def update_settings(
 def list_patterns(include_disabled: bool = True) -> list[dict[str, Any]]:
     ensure_pattern_tables()
     sql = """
-        SELECT id, name, regex, min_total_days, enabled,
+        SELECT id, name, regex, min_total_days, enabled, period,
                zone_thresholds, denoise_min_len, edges, created_at, updated_at
         FROM boll_patterns
     """
@@ -181,7 +209,7 @@ def get_pattern(pattern_id: str) -> dict[str, Any] | None:
     with db.db_cursor(dict_cursor=True) as (conn, cur):
         cur.execute(
             """
-            SELECT id, name, regex, min_total_days, enabled,
+            SELECT id, name, regex, min_total_days, enabled, period,
                    zone_thresholds, denoise_min_len, edges, created_at, updated_at
             FROM boll_patterns WHERE id = %s;
             """,
@@ -200,6 +228,13 @@ def validate_regex(regex: str) -> None:
         raise ValueError(f"非法正则: {e}") from e
 
 
+def _validate_edges_for_period(period: str, regex: str, edges_raw: Any) -> list[dict[str, str]]:
+    edges = validate_pattern_edges(regex, edges_raw)
+    if period != "daily" and edges:
+        raise ValueError("周/月编排禁止配置 edges（ADR 0006）；仅日线支持 limit_up 等边条件")
+    return edges
+
+
 def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
     ensure_pattern_tables()
     pid = str(payload.get("id", "")).strip()
@@ -210,7 +245,8 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or pid).strip()
     regex = str(payload.get("regex") or "").strip()
     validate_regex(regex)
-    edges = validate_pattern_edges(regex, payload.get("edges"))
+    period = normalize_bar_period(payload.get("period"), default="daily")
+    edges = _validate_edges_for_period(period, regex, payload.get("edges"))
     min_days = int(payload.get("min_total_days") or 0)
     enabled = bool(payload.get("enabled", True))
     zt_raw = payload.get("zone_thresholds")
@@ -222,9 +258,9 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
         cur.execute(
             """
             INSERT INTO boll_patterns (
-                id, name, regex, min_total_days, enabled,
+                id, name, regex, min_total_days, enabled, period,
                 zone_thresholds, denoise_min_len, edges, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
             """,
             (
                 pid,
@@ -232,6 +268,7 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
                 regex,
                 min_days,
                 enabled,
+                period,
                 Json(thresholds_to_jsonable(zt)) if zt is not None else None,
                 dnl_val,
                 Json(edges),
@@ -248,15 +285,20 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"编排不存在: {pattern_id}")
     if "id" in payload and str(payload["id"]).strip() != pattern_id:
         raise ValueError("不允许修改编排 id")
+    if "period" in payload and payload["period"] is not None:
+        new_p = normalize_bar_period(payload["period"])
+        if new_p != existing["period"]:
+            raise ValueError("不允许修改编排 period（ADR 0006）；请复制新建")
 
     name = str(payload["name"]).strip() if "name" in payload else existing["name"]
     regex = str(payload["regex"]).strip() if "regex" in payload else existing["regex"]
     validate_regex(regex)
+    period = existing["period"]
     if "edges" in payload:
-        edges = validate_pattern_edges(regex, payload.get("edges"))
+        edges = _validate_edges_for_period(period, regex, payload.get("edges"))
     else:
         # regex 变更时仍须与既有 edges 交叉校验
-        edges = validate_pattern_edges(regex, existing.get("edges") or [])
+        edges = _validate_edges_for_period(period, regex, existing.get("edges") or [])
     min_days = (
         int(payload["min_total_days"])
         if "min_total_days" in payload
@@ -376,20 +418,25 @@ def effective_config(pattern: dict[str, Any], settings: dict[str, Any] | None = 
         "regex": pattern["regex"],
         "min_total_days": int(pattern.get("min_total_days") or 0),
         "enabled": bool(pattern.get("enabled", True)),
+        "period": normalize_bar_period(pattern.get("period"), default="daily"),
         "zone_thresholds": zt,
         "denoise_min_len": dnl,
         "edges": list(pattern.get("edges") or []),
     }
 
 
-def list_enabled_effective() -> list[dict[str, Any]]:
+def list_enabled_effective(period: str | None = None) -> list[dict[str, Any]]:
     settings = get_settings()
     patterns = list_patterns(include_disabled=False)
+    want = normalize_bar_period(period) if period is not None else None
     out = []
     for p in patterns:
         if not p.get("regex"):
             continue
-        out.append(effective_config(p, settings))
+        eff = effective_config(p, settings)
+        if want is not None and eff["period"] != want:
+            continue
+        out.append(eff)
     return out
 
 
@@ -402,6 +449,7 @@ def serialize_pattern_for_api(pattern: dict[str, Any], settings: dict[str, Any] 
         "regex": pattern["regex"],
         "min_total_days": pattern["min_total_days"],
         "enabled": pattern["enabled"],
+        "period": pattern.get("period") or "daily",
         "zone_thresholds": (
             thresholds_to_jsonable(pattern["zone_thresholds"])
             if pattern.get("zone_thresholds") is not None
@@ -448,6 +496,7 @@ def seed_from_yaml(yaml_path: str | None = None) -> dict[str, Any]:
             "regex": p["regex"],
             "min_total_days": p["min_total_days"],
             "enabled": p["enabled"],
+            "period": p.get("period") or "daily",
             "zone_thresholds": None,
             "denoise_min_len": None,
         })

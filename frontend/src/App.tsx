@@ -93,6 +93,9 @@ interface BollEdgeHit {
   idx?: number;
 }
 
+/** 看盘 / 编排共用 K 线周期（ADR 0005 / 0006） */
+type ChartPeriod = 'daily' | 'weekly' | 'monthly';
+
 interface BollPatternEdge {
   from: string;
   to: string;
@@ -105,6 +108,7 @@ interface BollPatternMatch {
   name?: string;
   pattern_id: string;
   pattern_name: string;
+  period?: ChartPeriod;
   start_date: string;
   end_date: string;
   matched_states: string;
@@ -118,6 +122,7 @@ interface BollPatternMeta {
   id: string;
   name: string;
   enabled: boolean;
+  period?: ChartPeriod;
   regex?: string;
   min_total_days?: number;
   zone_thresholds?: Record<string, [string | number, string | number]> | null;
@@ -140,6 +145,7 @@ interface BollScanProgress {
   matches: number;
   percent: number;
   window_days: number | null;
+  period?: string | null;
   scan_date: string | null;
   current_code: string | null;
   message: string;
@@ -203,9 +209,6 @@ type ZoneBounds = { m: number; h: number; u: number };
 
 /** 个股走势 · 回看 K 根数快捷选项（当前周期） */
 const STOCK_VIEW_LOOKBACK_PRESETS = [60, 100, 120, 250] as const;
-
-/** 看盘 K 线周期（ADR 0005）；① 个股走势与 ② 编排详情图共用 */
-type ChartPeriod = 'daily' | 'weekly' | 'monthly';
 
 const CHART_PERIOD_OPTIONS: { value: ChartPeriod; label: string }[] = [
   { value: 'daily', label: '日' },
@@ -369,6 +372,76 @@ function ZoneBoundStepper({
         }}
       />
       <button type="button" aria-label="增大" className="zone-bound-stepper__btn" style={btnStyle} onClick={() => bump(1)}>+</button>
+    </div>
+  );
+}
+
+/** 整数步进：显式 +/-，避免深色主题下原生 spinner 几乎看不见 */
+function IntStepper({
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  title,
+  disabled = false,
+}: {
+  value: number;
+  onChange: (n: number) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  title?: string;
+  disabled?: boolean;
+}) {
+  const clamp = (n: number) => {
+    let next = Number.isFinite(n) ? n : (min ?? 0);
+    if (min != null) next = Math.max(min, next);
+    if (max != null) next = Math.min(max, next);
+    return Math.trunc(next);
+  };
+  const bump = (dir: 1 | -1) => {
+    if (disabled) return;
+    onChange(clamp((value || 0) + dir * step));
+  };
+  const atMin = min != null && value <= min;
+  const atMax = max != null && value >= max;
+
+  return (
+    <div
+      className="zone-bound-stepper lookback-stepper"
+      style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+      title={title}
+    >
+      <button
+        type="button"
+        aria-label="减小"
+        className="zone-bound-stepper__btn lookback-stepper__btn"
+        disabled={disabled || atMin}
+        onClick={() => bump(-1)}
+      >
+        −
+      </button>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={disabled}
+        className="zone-bound-stepper__input lookback-stepper__input"
+        onChange={e => onChange(Number(e.target.value))}
+        onBlur={() => onChange(clamp(value))}
+      />
+      <button
+        type="button"
+        aria-label="增大"
+        className="zone-bound-stepper__btn lookback-stepper__btn"
+        disabled={disabled || atMax}
+        onClick={() => bump(1)}
+      >
+        +
+      </button>
     </div>
   );
 }
@@ -590,6 +663,13 @@ export default function App() {
   const [bollPatternFilter, setBollPatternFilter] = useState('');
   const [bollEndWithinDays, setBollEndWithinDays] = useState(3);
   const [bollWindowDays, setBollWindowDays] = useState(60);
+  /** 编排扫描 / 命中列表周期（ADR 0006：一次扫描单周期） */
+  const [bollScanPeriod, setBollScanPeriod] = useState<ChartPeriod>('daily');
+  const SCAN_WINDOW_DEFAULTS: Record<ChartPeriod, number> = {
+    daily: 60,
+    weekly: 52,
+    monthly: 36,
+  };
   const [bollScanning, setBollScanning] = useState(false);
   const [bollScanProgress, setBollScanProgress] = useState<BollScanProgress | null>(null);
   const [bollLoading, setBollLoading] = useState(false);
@@ -640,6 +720,7 @@ export default function App() {
     id: '',
     name: '',
     regex: '',
+    period: 'daily' as ChartPeriod,
     min_total_days: 10,
     enabled: true,
     override_zone: false,
@@ -941,6 +1022,7 @@ export default function App() {
       id: '',
       name: '',
       regex: 'L+M{3,}H*U+H*M{3,}',
+      period: 'daily',
       min_total_days: 10,
       enabled: true,
       override_zone: false,
@@ -961,6 +1043,7 @@ export default function App() {
       id: p.id,
       name: p.name,
       regex: p.regex || '',
+      period: (p.period as ChartPeriod) || 'daily',
       min_total_days: p.min_total_days ?? 0,
       enabled: p.enabled,
       override_zone: hasZoneOverride,
@@ -995,7 +1078,7 @@ export default function App() {
           regex: bollForm.regex,
           min_total_days: bollForm.min_total_days,
           enabled: bollForm.enabled,
-          edges: bollForm.edges,
+          edges: bollForm.period === 'daily' ? bollForm.edges : [],
           clear_zone_override: !bollForm.override_zone,
           clear_denoise_override: !bollForm.override_denoise,
         };
@@ -1025,11 +1108,12 @@ export default function App() {
             id: bollForm.id,
             name: bollForm.name,
             regex: bollForm.regex,
+            period: bollForm.period,
             min_total_days: bollForm.min_total_days,
             enabled: bollForm.enabled,
             zone_thresholds: zonePayload,
             denoise_min_len: denoisePayload,
-            edges: bollForm.edges,
+            edges: bollForm.period === 'daily' ? bollForm.edges : [],
           }),
         });
         const json = await res.json();
@@ -1115,6 +1199,7 @@ export default function App() {
         end_within_days: String(bollEndWithinDays),
         order_by: 'score',
         limit: '100',
+        period: bollScanPeriod,
       });
       if (bollPatternFilter) qs.set('pattern_id', bollPatternFilter);
       const res = await fetch(`${apiBase}/api/boll-pattern-matches?${qs}`);
@@ -1176,12 +1261,12 @@ export default function App() {
       summary: null,
       error: null,
     });
-    showToast(`布林编排扫描已启动（window_days=${bollWindowDays}）...`);
+    showToast(`布林编排扫描已启动（${CHART_PERIOD_LABEL[bollScanPeriod]}线 · window=${bollWindowDays}）...`);
     try {
       const res = await fetch(`${apiBase}/api/jobs/scan-boll-patterns`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ window_days: bollWindowDays }),
+        body: JSON.stringify({ window_days: bollWindowDays, period: bollScanPeriod }),
       });
       const json = await res.json();
       if (json.success) {
@@ -1237,13 +1322,21 @@ export default function App() {
     setBollChartSource('scan');
     setBollPreviewMeta(null);
     setSelectedBollMatch(m);
+    const matchPeriod = (m.period as ChartPeriod) || 'daily';
+    // 选中命中强制切到编排周期（ADR 0006）
+    if (matchPeriod !== chartPeriod) {
+      skipBarsDebounceRef.current = true;
+      setChartPeriod(matchPeriod);
+      if (matchPeriod !== 'daily') setStockViewZoneOpen(false);
+    }
     setBollLoading(true);
     try {
-      const { qs } = buildBarsQuery(m.end_date, stockViewLookback, chartPeriod);
+      const lb = lookbackByPeriod[matchPeriod];
+      const { qs } = buildBarsQuery(m.end_date, lb, matchPeriod);
       const fetches: Promise<Response>[] = [
         fetch(`${apiBase}/api/stocks/${m.code}/bars?${qs.toString()}`),
       ];
-      if (chartPeriod === 'daily') {
+      if (matchPeriod === 'daily') {
         fetches.push(fetch(`${apiBase}/api/stocks/${m.code}/boll-states?limit=60`));
       }
       const [barsRes, stateRes] = await Promise.all(fetches);
@@ -1254,7 +1347,7 @@ export default function App() {
         setBollBars([]);
         showToast('加载 K 线失败：' + (barsJson.error || ''));
       }
-      if (chartPeriod === 'daily' && stateRes) {
+      if (matchPeriod === 'daily' && stateRes) {
         const stateJson = await stateRes.json();
         if (stateJson.success) {
           setBollStateString(stateJson.data.state_string || '');
@@ -1278,8 +1371,19 @@ export default function App() {
     setBollChartSource('preview');
     setBollPreviewMeta(null);
     setSelectedBollMatch(m);
-    setBollStateString(stateString);
-    await loadBollBarsForChart(m.code, chartEndDate || m.end_date);
+    setBollStateString(bollForm.period === 'daily' ? stateString : '');
+    const matchPeriod = (m.period as ChartPeriod) || bollForm.period || 'daily';
+    if (matchPeriod !== chartPeriod) {
+      skipBarsDebounceRef.current = true;
+      setChartPeriod(matchPeriod);
+      if (matchPeriod !== 'daily') setStockViewZoneOpen(false);
+    }
+    await loadBollBarsForChart(
+      m.code,
+      chartEndDate || m.end_date,
+      matchPeriod,
+      lookbackByPeriod[matchPeriod],
+    );
   };
 
   const handleSelectBollTryStock = (item: StockSearchItem) => {
@@ -1325,13 +1429,14 @@ export default function App() {
       const body: Record<string, unknown> = {
         code,
         window_days: bollWindowDays,
+        period: bollForm.period,
         pattern_id: (bollEditId || bollForm.id || '').trim() || null,
         pattern_name: (bollForm.name || '').trim() || '草稿',
         regex: bollForm.regex,
         min_total_days: bollForm.min_total_days,
         zone_thresholds,
         denoise_min_len,
-        edges: bollForm.edges,
+        edges: bollForm.period === 'daily' ? bollForm.edges : [],
       };
       if (bollTryAsOf.trim()) body.as_of = bollTryAsOf.trim();
 
@@ -2094,7 +2199,7 @@ export default function App() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, apiBase, bollEndWithinDays, bollPatternFilter]);
+  }, [activeTab, apiBase, bollEndWithinDays, bollPatternFilter, bollScanPeriod]);
 
   // 个股走势：模糊搜索联想
   useEffect(() => {
@@ -2751,7 +2856,8 @@ export default function App() {
       tooltip: {
         trigger: 'axis',
         triggerOn: 'mousemove',
-        alwaysShowContent: true,
+        alwaysShowContent: false,
+        hideDelay: 0,
         transitionDuration: 0,
         axisPointer: {
           type: 'line',
@@ -2840,7 +2946,7 @@ export default function App() {
         },
         {
           data: ['DIF', 'DEA', 'MACD'],
-          top: '34%',
+          top: '52%',
           left: 56,
           itemGap: 10,
           itemWidth: 12,
@@ -2849,7 +2955,7 @@ export default function App() {
         },
         {
           data: ['K', 'D', 'J'],
-          top: '46%',
+          top: '70%',
           left: 56,
           itemGap: 10,
           itemWidth: 12,
@@ -2858,10 +2964,10 @@ export default function App() {
         },
       ],
       grid: [
-        // 主图不动；MACD 再收窄；省下高度给 KDJ
-        { left: 48, right: 16, top: '7%', height: '22%', containLabel: false },
-        { left: 48, right: 16, top: '38%', height: '8%', containLabel: false },
-        { left: 48, right: 16, top: '52%', height: '40%', containLabel: false },
+        // 主图占大半；副图压紧并铺满底部，避免右下大块留白
+        { left: 48, right: 16, top: '5%', height: '44%', containLabel: false },
+        { left: 48, right: 16, top: '55%', height: '12%', containLabel: false },
+        { left: 48, right: 16, top: '73%', bottom: '3%', containLabel: false },
       ],
       xAxis: [
         {
@@ -3973,36 +4079,56 @@ export default function App() {
               <div className="data-card" style={{ padding: '1rem' }}>
                 <h2 className="panel-title" style={{ marginBottom: '0.8rem' }}>布林编排命中</h2>
                 <div className="form-group">
+                  <label>扫描 / 列表周期</label>
+                  <select
+                    value={bollScanPeriod}
+                    onChange={(e) => {
+                      const p = e.target.value as ChartPeriod;
+                      setBollScanPeriod(p);
+                      setBollWindowDays(SCAN_WINDOW_DEFAULTS[p]);
+                    }}
+                  >
+                    <option value="daily">日线</option>
+                    <option value="weekly">周线</option>
+                    <option value="monthly">月线</option>
+                  </select>
+                </div>
+                <div className="form-group">
                   <label>编排筛选</label>
                   <select
                     value={bollPatternFilter}
                     onChange={(e) => setBollPatternFilter(e.target.value)}
                   >
-                    <option value="">全部 enabled 编排</option>
-                    {bollPatterns.filter(p => p.enabled).map(p => (
+                    <option value="">全部 enabled（本周期）</option>
+                    {bollPatterns
+                      .filter(p => p.enabled && ((p.period || 'daily') === bollScanPeriod))
+                      .map(p => (
                       <option key={p.id} value={p.id}>{p.name}</option>
                     ))}
                   </select>
                 </div>
                 <div className="form-group">
-                  <label>end_within_days（0=全量）</label>
+                  <label>近端结束（0=全量）</label>
                   <select
                     value={bollEndWithinDays}
                     onChange={(e) => setBollEndWithinDays(Number(e.target.value))}
                   >
-                    <option value={3}>近 3 个交易日结束</option>
-                    <option value={1}>仅当日结束</option>
+                    <option value={3}>近 3 根{CHART_PERIOD_LABEL[bollScanPeriod]}K 内结束</option>
+                    <option value={1}>仅最近 1 根结束</option>
                     <option value={0}>全量历史命中</option>
                   </select>
                 </div>
                 <div className="form-group">
-                  <label>扫描窗口 window_days</label>
+                  <label>扫描窗口（{CHART_PERIOD_LABEL[bollScanPeriod]}K 根数）</label>
                   <select
                     value={bollWindowDays}
                     onChange={(e) => setBollWindowDays(Number(e.target.value))}
                   >
                     <option value={60}>60</option>
+                    <option value={52}>52</option>
+                    <option value={36}>36</option>
                     <option value={120}>120</option>
+                    <option value={104}>104</option>
                   </select>
                 </div>
                 <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.8rem' }}>
@@ -4092,7 +4218,14 @@ export default function App() {
                               <div style={{ fontWeight: 700, fontFamily: 'monospace' }}>{m.code.toUpperCase()}</div>
                               <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{m.name || ''}</div>
                             </td>
-                            <td style={{ fontSize: '0.75rem' }}>{m.pattern_name}</td>
+                            <td style={{ fontSize: '0.75rem' }}>
+                              {m.pattern_name}
+                              {m.period ? (
+                                <span style={{ marginLeft: 4, color: '#94a3b8', fontSize: '0.68rem' }}>
+                                  ·{CHART_PERIOD_LABEL[m.period as ChartPeriod] || m.period}
+                                </span>
+                              ) : null}
+                            </td>
                             <td style={{ fontSize: '0.72rem', fontFamily: 'monospace' }}>
                               {m.start_date}<br />~ {m.end_date}
                             </td>
@@ -4109,7 +4242,7 @@ export default function App() {
                 )}
               </div>
 
-              <div className="data-card" style={{ padding: '1rem', minHeight: '280px' }}>
+              <div className="data-card boll-pattern-chart-card" style={{ padding: '1rem', minHeight: '280px' }}>
                 {!selectedBollMatch && bollBars.length === 0 ? (
                   <div className="empty-wrapper">
                     <Info size={28} color="#94a3b8" />
@@ -4127,7 +4260,7 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    <div style={{ marginBottom: '0.45rem', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
+                    <div style={{ marginBottom: '0.45rem', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap', flexShrink: 0 }}>
                       <div>
                         <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
                           {bollChartSource === 'preview' ? '试跑 · ' : '布林编排 · '}
@@ -4157,19 +4290,21 @@ export default function App() {
                       {renderChartPeriodSwitcher(bollLoading)}
                     </div>
                     {bollLoading && bollBars.length === 0 ? (
-                      <div className="loading-wrapper" style={{ height: '520px' }}>
+                      <div className="loading-wrapper boll-pattern-chart-host">
                         <div className="spinner" />
                       </div>
                     ) : (
-                      <ReactECharts
-                        key={`boll-chart-${chartPeriod}`}
-                        option={getBollPatternChartOption()}
-                        style={{ height: '520px', width: '100%' }}
-                        notMerge
-                        opts={{ renderer: 'canvas' }}
-                      />
+                      <div className="boll-pattern-chart-host">
+                        <ReactECharts
+                          key={`boll-chart-${chartPeriod}`}
+                          option={getBollPatternChartOption()}
+                          style={{ height: '100%', width: '100%' }}
+                          notMerge
+                          opts={{ renderer: 'canvas' }}
+                        />
+                      </div>
                     )}
-                    <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                    <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)', flexShrink: 0 }}>
                       {chartPeriod === 'daily' && selectedBollMatch?.matched_states ? (
                         <div style={{ marginBottom: '0.45rem' }}>
                           <b style={{ color: '#cbd5e1' }}>命中状态串</b>
@@ -4245,7 +4380,12 @@ export default function App() {
                   </div>
                   <div className="form-group">
                     <label>denoise_min_len（最短持续天数去抖，0=关闭）</label>
-                    <input type="number" min={0} value={bollGlobalDenoise} onChange={e => setBollGlobalDenoise(Number(e.target.value))} />
+                    <IntStepper
+                      min={0}
+                      value={bollGlobalDenoise}
+                      onChange={n => setBollGlobalDenoise(n)}
+                      title="全局去抖最短持续天数"
+                    />
                     <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
                       匹配正则前，把 zone 游程里短于该天数的段并入相邻段，用来抹掉单日误穿轨等噪声。
                       例：设为 2 会吃掉只持续 1 天的尖刺；过大可能抹掉真实短促突破。不确定时保持 0。
@@ -4275,6 +4415,25 @@ export default function App() {
                       <input value={bollForm.name} onChange={e => setBollForm(f => ({ ...f, name: e.target.value }))} />
                     </div>
                     <div className="form-group">
+                      <label>周期（创建后不可改）</label>
+                      <select
+                        value={bollForm.period}
+                        disabled={!!bollEditId}
+                        onChange={e => {
+                          const period = e.target.value as ChartPeriod;
+                          setBollForm(f => ({
+                            ...f,
+                            period,
+                            edges: period === 'daily' ? f.edges : [],
+                          }));
+                        }}
+                      >
+                        <option value="daily">日线</option>
+                        <option value="weekly">周线</option>
+                        <option value="monthly">月线</option>
+                      </select>
+                    </div>
+                    <div className="form-group">
                       <label>regex（例 L+M{'{3,}'}H*U+H*M{'{3,}'}）</label>
                       <input value={bollForm.regex} onChange={e => setBollForm(f => ({ ...f, regex: e.target.value }))} style={{ fontFamily: 'monospace' }} />
                       {(() => {
@@ -4287,13 +4446,19 @@ export default function App() {
                       })()}
                     </div>
                     <div className="form-group">
-                      <label>min_total_days</label>
-                      <input type="number" value={bollForm.min_total_days} onChange={e => setBollForm(f => ({ ...f, min_total_days: Number(e.target.value) }))} />
+                      <label>min_total_days（最少 Bar 数）</label>
+                      <IntStepper
+                        min={0}
+                        value={bollForm.min_total_days}
+                        onChange={n => setBollForm(f => ({ ...f, min_total_days: n }))}
+                        title="命中最短总天数"
+                      />
                     </div>
+                    {bollForm.period === 'daily' ? (
                     <div className="form-group">
-                      <label>转移边条件（可选）</label>
+                      <label>转移边条件（可选，仅日线）</label>
                       <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0 0 0.45rem', lineHeight: 1.45 }}>
-                        硬过滤：命中区间内须出现相邻 from→to，且 Arrival 日满足 when。v1 仅 limit_up；from/to 须在 regex 中相邻（不可夹 H*）。
+                        硬过滤：命中区间内须出现相邻 from→to，且 Arrival 日满足 when。v1 仅 limit_up；from/to 在 regex 里须为相邻阶段（中间不能夹其它 zone，例如 L 与 M 之间不能有 H*）。
                       </p>
                       {bollForm.edges.map((edge, idx) => (
                         <div
@@ -4378,6 +4543,11 @@ export default function App() {
                         + 添加边条件
                       </button>
                     </div>
+                    ) : (
+                      <p style={{ fontSize: '0.72rem', color: '#64748b', marginBottom: '0.6rem' }}>
+                        周/月编排不支持边条件（ADR 0006）
+                      </p>
+                    )}
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.6rem' }}>
                       <input type="checkbox" checked={bollForm.enabled} onChange={e => setBollForm(f => ({ ...f, enabled: e.target.checked }))} />
                       启用（参与扫描）
@@ -4448,11 +4618,11 @@ export default function App() {
                     {bollForm.override_denoise ? (
                       <div className="form-group">
                         <label>本编排 denoise_min_len（0=关闭）</label>
-                        <input
-                          type="number"
+                        <IntStepper
                           min={0}
                           value={bollForm.denoise}
-                          onChange={e => setBollForm(f => ({ ...f, denoise: Number(e.target.value) }))}
+                          onChange={n => setBollForm(f => ({ ...f, denoise: n }))}
+                          title="本编排去抖最短持续天数"
                         />
                         <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
                           仅本编排生效：短于该天数的 zone 段并入相邻段后再匹配；0=不去抖。
@@ -4628,7 +4798,12 @@ export default function App() {
                     {bollPatterns.map(p => (
                       <tr key={p.id}>
                         <td style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{p.id}</td>
-                        <td>{p.name}</td>
+                        <td>
+                          {p.name}
+                          <span style={{ marginLeft: 6, color: '#94a3b8', fontSize: '0.68rem' }}>
+                            {CHART_PERIOD_LABEL[(p.period as ChartPeriod) || 'daily']}
+                          </span>
+                        </td>
                         <td>
                           <input
                             type="checkbox"
@@ -4859,7 +5034,7 @@ export default function App() {
                   <ReactECharts
                     key={`stock-view-${chartPeriod}`}
                     option={getStockViewChartOption()}
-                    style={{ height: '560px', width: '100%' }}
+                    style={{ height: '640px', width: '100%' }}
                     notMerge
                     opts={{ renderer: 'canvas' }}
                   />

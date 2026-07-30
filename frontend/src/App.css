@@ -944,7 +944,19 @@ body {
 }
 
 .boll-pattern-layout {
-  align-items: start;
+  align-items: stretch;
+}
+
+.boll-pattern-chart-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.boll-pattern-chart-host {
+  flex: 1 1 auto;
+  min-height: clamp(560px, 68vh, 820px);
+  width: 100%;
 }
 
 @media (max-width: 1100px) {

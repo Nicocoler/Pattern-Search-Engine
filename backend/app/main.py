@@ -146,7 +146,8 @@ class SyncMarketDataPayload(BaseModel):
     delay_max: int = Field(default=300, example=300)
 
 class BollPatternScanPayload(BaseModel):
-    window_days: int = Field(default=60, example=60, description="匹配窗口交易日数，默认60，常用60/120")
+    window_days: int = Field(default=60, example=60, description="匹配窗口：当前周期 K 根数（日/周/月）")
+    period: str = Field(default="daily", description="扫描周期 daily|weekly|monthly；一次任务只跑该周期编排")
     codes: list[str] | None = Field(default=None, example=None, description="可选股票子集；为空则扫非ST非停牌全市场")
     scan_date: str | None = Field(default=None, example=None, description="扫描截止日 YYYY-MM-DD；默认取 daily_bars 最大日期")
 
@@ -156,7 +157,11 @@ class BollPatternPreviewPayload(BaseModel):
         default=None,
         description="截止日 YYYY-MM-DD；空则取 daily_bars 最大日期（与正式扫描一致）",
     )
-    window_days: int = Field(default=60, ge=1, le=500, description="匹配窗口交易日数")
+    window_days: int = Field(default=60, ge=1, le=500, description="匹配窗口：当前周期 K 根数")
+    period: str | None = Field(
+        default=None,
+        description="试跑周期；空则用编排 period（草稿默认 daily）",
+    )
     pattern_id: str | None = Field(default=None, description="可选；未保存草稿可空，仅用于展示")
     pattern_name: str | None = Field(default=None, description="展示用名称；空则用草稿/id")
     regex: str = Field(..., description="编排正则（可用未保存草稿）")
@@ -165,18 +170,19 @@ class BollPatternPreviewPayload(BaseModel):
     denoise_min_len: int = Field(default=0, ge=0, description="effective 去抖最短持续天数")
     edges: list[dict] | None = Field(
         default=None,
-        description="可选转移边条件，如 [{from:L,to:M,when:limit_up}]；空/省略=不启用",
+        description="可选转移边条件，如 [{from:L,to:M,when:limit_up}]；空/省略=不启用；仅日线",
     )
 
 class BollPatternCreatePayload(BaseModel):
     id: str = Field(..., description="编排唯一 id，创建后不可改")
     name: str = Field(...)
     regex: str = Field(...)
+    period: str = Field(default="daily", description="Bar Period：daily|weekly|monthly；创建后不可改")
     min_total_days: int = Field(default=0)
     enabled: bool = Field(default=True)
     zone_thresholds: dict | None = Field(default=None, description="稀疏覆盖；null 用全局")
     denoise_min_len: int | None = Field(default=None, description="稀疏覆盖；null 用全局")
-    edges: list[dict] | None = Field(default=None, description="转移边条件；null/[]=无")
+    edges: list[dict] | None = Field(default=None, description="转移边条件；null/[]=无；仅日线可配")
 
 class BollPatternUpdatePayload(BaseModel):
     name: str | None = None
@@ -1067,6 +1073,7 @@ def preview_boll_pattern(payload: BollPatternPreviewPayload):
             or "草稿",
             "regex": regex,
             "min_total_days": int(payload.min_total_days or 0),
+            "period": (payload.period or "daily").strip().lower() or "daily",
             "zone_thresholds": zt,
             "denoise_min_len": int(payload.denoise_min_len or 0),
             "edges": payload.edges or [],
@@ -1076,6 +1083,7 @@ def preview_boll_pattern(payload: BollPatternPreviewPayload):
             pattern,
             window_days=payload.window_days,
             as_of=as_of,
+            period=pattern["period"],
         )
         return {"success": True, "data": data, "error": None}
     except ValueError as e:
@@ -1221,10 +1229,13 @@ def get_boll_pattern_scan_status():
 
 @app.post("/api/jobs/scan-boll-patterns")
 def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks: BackgroundTasks):
-    """异步触发布林编排扫描（BackgroundTasks），写入 stock_state_daily / pattern_match_result。"""
+    """异步触发布林编排扫描（BackgroundTasks）；一次任务只跑一个 period（ADR 0006）。"""
     global IS_BOLL_PATTERN_SCANNING
     if payload.window_days <= 0:
         return {"success": False, "data": None, "error": "window_days 必须 > 0"}
+    period = (payload.period or "daily").strip().lower()
+    if period not in ("daily", "weekly", "monthly"):
+        return {"success": False, "data": None, "error": "period 须为 daily | weekly | monthly"}
 
     with _BOLL_PATTERN_SCAN_LOCK:
         if IS_BOLL_PATTERN_SCANNING:
@@ -1235,10 +1246,13 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
             }
         IS_BOLL_PATTERN_SCANNING = True
 
-    # 立即写入 preparing，避免前端轮询读到上一次 done
     try:
         from backend.app.boll_pattern.scanner import begin_scan_progress
-        begin_scan_progress(window_days=payload.window_days, scan_date=payload.scan_date)
+        begin_scan_progress(
+            window_days=payload.window_days,
+            scan_date=payload.scan_date,
+            period=period,
+        )
     except Exception as ex:
         logger.warning("初始化编排扫描进度失败: %s", ex)
 
@@ -1255,6 +1269,7 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
                 window_days=payload.window_days,
                 codes=payload.codes,
                 scan_date=scan_day,
+                period=period,
             )
             logger.info("布林编排后台扫描结束: %s", summary)
         except Exception as ex:
@@ -1280,8 +1295,8 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
     background_tasks.add_task(_scan_wrapper)
     return {
         "success": True,
-        "message": f"布林编排扫描已启动（window_days={payload.window_days}）",
-        "data": {"window_days": payload.window_days},
+        "message": f"布林编排扫描已启动（period={period}, window_days={payload.window_days}）",
+        "data": {"window_days": payload.window_days, "period": period},
         "error": None,
     }
 
@@ -1289,45 +1304,50 @@ def trigger_boll_pattern_scan(payload: BollPatternScanPayload, background_tasks:
 @app.get("/api/boll-pattern-matches")
 def get_boll_pattern_matches(
     pattern_id: str | None = Query(None, description="编排 id 过滤"),
+    period: str | None = Query(
+        None,
+        description="按编排周期过滤 daily|weekly|monthly；空=全部",
+    ),
     end_within_days: int | None = Query(
         3,
-        description="仅保留 end_date 落在最近 N 个交易日内；传 0 表示不过滤（全量）",
+        description="近端结束：保留 end_date 落在最近 N 根同周期 Bar 内；0=不过滤",
     ),
     scan_date: str | None = Query(None, description="按 scan_date 过滤 YYYY-MM-DD"),
     order_by: str = Query("score", description="排序：score（默认）或 end_date"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    """查询编排命中；默认 end_within_days=3（进行中/刚完成）。"""
+    """查询编排命中；end_within 按 period 的 Bar 根数计（ADR 0006）。"""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # 幂等建表，避免未跑过扫描时查询失败
-        from backend.app.boll_pattern.scanner import BollPatternScanner
+        from backend.app.boll_pattern.scanner import BollPatternScanner, recent_bar_end_dates
         BollPatternScanner().ensure_tables()
+
+        period_n = None
+        if period:
+            period_n = period.strip().lower()
+            if period_n not in ("daily", "weekly", "monthly"):
+                return {"success": False, "data": None, "error": "period 须为 daily | weekly | monthly"}
 
         clauses = ["1=1"]
         params: list = []
         if pattern_id:
             clauses.append("m.pattern_id = %s")
             params.append(pattern_id)
+        if period_n:
+            clauses.append("COALESCE(bp.period, 'daily') = %s")
+            params.append(period_n)
         if scan_date:
             clauses.append("m.scan_date = %s")
             params.append(scan_date)
 
-        # end_within_days: None 或 >0 过滤；0 不过滤
+        # end_within：同周期最近 N 根 Bar 的结束日
         if end_within_days is not None and end_within_days > 0:
-            cursor.execute(
-                """
-                SELECT DISTINCT date FROM daily_bars
-                ORDER BY date DESC LIMIT %s;
-                """,
-                (end_within_days,),
-            )
-            day_rows = cursor.fetchall()
-            if not day_rows:
+            filter_period = period_n or "daily"
+            cutoff_dates = recent_bar_end_dates(filter_period, int(end_within_days))
+            if not cutoff_dates:
                 return {"success": True, "data": {"items": [], "total": 0}, "error": None}
-            cutoff_dates = [r["date"] for r in day_rows]
             clauses.append("m.end_date = ANY(%s)")
             params.append(cutoff_dates)
 
@@ -1335,11 +1355,17 @@ def get_boll_pattern_matches(
         if order_by == "end_date":
             order_sql = "m.end_date DESC, m.code ASC"
         else:
-            # 默认按 score 降序，空分靠后，同分再按 end_date
             order_sql = "m.score DESC NULLS LAST, m.end_date DESC, m.code ASC"
 
+        # JOIN boll_patterns 以支持 period 过滤与展示
+        join_sql = """
+            FROM pattern_match_result m
+            LEFT JOIN stocks s ON s.code = m.code
+            LEFT JOIN boll_patterns bp ON bp.id = m.pattern_id
+        """
+
         cursor.execute(
-            f"SELECT COUNT(*) AS cnt FROM pattern_match_result m WHERE {where_sql};",
+            f"SELECT COUNT(*) AS cnt {join_sql} WHERE {where_sql};",
             params,
         )
         total = int(cursor.fetchone()["cnt"])
@@ -1348,11 +1374,10 @@ def get_boll_pattern_matches(
             f"""
             SELECT m.id, m.code, s.name, m.pattern_id,
                    COALESCE(bp.name, m.pattern_name) AS pattern_name,
+                   COALESCE(bp.period, 'daily') AS period,
                    m.start_date, m.end_date, m.matched_states, m.score,
                    m.edge_hits, m.scan_date, m.window_days, m.updated_at
-            FROM pattern_match_result m
-            LEFT JOIN stocks s ON s.code = m.code
-            LEFT JOIN boll_patterns bp ON bp.id = m.pattern_id
+            {join_sql}
             WHERE {where_sql}
             ORDER BY {order_sql}
             LIMIT %s OFFSET %s;
@@ -1377,6 +1402,7 @@ def get_boll_pattern_matches(
                 "name": r.get("name"),
                 "pattern_id": r["pattern_id"],
                 "pattern_name": r["pattern_name"],
+                "period": r.get("period") or "daily",
                 "start_date": r["start_date"].isoformat() if r["start_date"] else None,
                 "end_date": r["end_date"].isoformat() if r["end_date"] else None,
                 "matched_states": r["matched_states"],
@@ -1388,7 +1414,14 @@ def get_boll_pattern_matches(
             })
         return {
             "success": True,
-            "data": {"items": items, "total": total, "limit": limit, "offset": offset, "order_by": order_by},
+            "data": {
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "order_by": order_by,
+                "period": period_n,
+            },
             "error": None,
         }
     except Exception as e:
