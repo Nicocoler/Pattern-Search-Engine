@@ -76,7 +76,7 @@ export function DatePickerField({
       />
       <button
         type="button"
-        className="lookback-stepper__btn date-picker-field__btn"
+        className="date-picker-field__btn"
         disabled={disabled}
         aria-label={ariaLabel}
         title={title}

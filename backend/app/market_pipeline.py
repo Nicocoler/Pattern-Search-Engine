@@ -88,6 +88,52 @@ def chart_load_calendar_days(period: ChartPeriod, lookback_bars: int) -> int:
     return max(cal, need * factor)
 
 
+def resolve_chart_forward_end(
+    code: str,
+    anchor_end: date,
+    *,
+    period: ChartPeriod = "daily",
+    forward_bars: int = 0,
+) -> tuple[date, int]:
+    """
+    在 anchor_end 对应周期 K 之后，最多再取 forward_bars 根，返回扩展截止日与实际根数。
+
+    若之后没有更多 K（已是最新），返回 (anchor_end, 0)。
+    """
+    forward_bars = max(0, int(forward_bars))
+    if forward_bars <= 0:
+        return anchor_end, 0
+
+    code = code.lower().strip()
+    period = period if period in ("daily", "weekly", "monthly") else "daily"
+    factor = _PERIOD_CALENDAR_FACTOR.get(period, 2)
+    # 向前多取一点，保证周/月桶能正确闭合；向后再取 forward 根所需日历跨度
+    pad_before = max(factor * 2, 14)
+    pad_after = forward_bars * factor + max(factor * 2, 14)
+    df_raw = load_daily_bars(
+        code,
+        anchor_end - timedelta(days=pad_before),
+        anchor_end + timedelta(days=pad_after),
+    )
+    if df_raw.empty:
+        return anchor_end, 0
+
+    df_agg = aggregate_ohlcv(df_raw, period)
+    if df_agg.empty:
+        return anchor_end, 0
+
+    dates = pd.to_datetime(df_agg["date"]).dt.date
+    at_or_before = df_agg.loc[dates <= anchor_end]
+    if at_or_before.empty:
+        return anchor_end, 0
+    anchor_bar_date = dates.loc[at_or_before.index[-1]]
+    after = df_agg.loc[dates > anchor_bar_date].head(forward_bars)
+    if after.empty:
+        return anchor_end, 0
+    last = dates.loc[after.index[-1]]
+    return last, int(len(after))
+
+
 def prepare_chart_bars(
     code: str,
     end_date: date,

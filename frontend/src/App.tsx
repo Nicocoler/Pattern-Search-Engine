@@ -3,7 +3,7 @@
 // 职责：实现极速扫描大PK、起始点归零百分比重合 Kline 绘制、高斯事件悬浮气泡标注、滚动无偏回测图表、自适应反馈闭环
 // =============================================================================
 
-import { useState, useEffect, useRef, type CSSProperties, type MutableRefObject } from 'react';
+import { useState, useEffect, useRef, type CSSProperties, type MouseEvent, type MutableRefObject } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
   TrendingUp,
@@ -116,6 +116,29 @@ interface BollPatternMatch {
   edge_hits?: BollEdgeHit[];
   scan_date: string | null;
   window_days: number;
+  favorited?: boolean;
+  favorite_id?: number | null;
+  favorite_note?: string;
+}
+
+/** 布林命中收藏快照（与扫描结果脱钩） */
+interface BollPatternFavorite {
+  id: number;
+  code: string;
+  name?: string;
+  pattern_id: string;
+  pattern_name: string;
+  period?: ChartPeriod;
+  start_date: string;
+  end_date: string;
+  matched_states: string;
+  score: number | null;
+  edge_hits?: BollEdgeHit[];
+  scan_date: string | null;
+  window_days: number | null;
+  source_match_id?: number | null;
+  note: string;
+  favorited_at?: string | null;
 }
 
 interface BollPatternMeta {
@@ -227,6 +250,17 @@ const CHART_PERIOD_LABEL: Record<ChartPeriod, string> = {
   weekly: '周',
   monthly: '月',
 };
+
+/** zone 验真条：日线读库，周/月现算（edges 仍仅日线） */
+const bollStatesUrl = (apiBase: string, code: string, period: ChartPeriod, limit = 60) =>
+  `${apiBase}/api/stocks/${code}/boll-states?limit=${limit}&period=${period}`;
+
+/** A股看盘：涨红跌绿；阴线 RGB(84,255,255) */
+const CHART_UP_RED = '#ef4444';
+const CHART_DOWN_GREEN = '#54ffff';
+
+/** 布林命中详情：命中结束日后默认再展示的同周期 K 根数（无后续数据则更少） */
+const BOLL_MATCH_FORWARD_BARS = 10;
 
 
 function isZoneBoundsOrdered(b: ZoneBounds): boolean {
@@ -409,14 +443,14 @@ function IntStepper({
 
   return (
     <div
-      className="zone-bound-stepper lookback-stepper"
+      className="zone-bound-stepper"
       style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}
       title={title}
     >
       <button
         type="button"
         aria-label="减小"
-        className="zone-bound-stepper__btn lookback-stepper__btn"
+        className="zone-bound-stepper__btn"
         disabled={disabled || atMin}
         onClick={() => bump(-1)}
       >
@@ -429,14 +463,14 @@ function IntStepper({
         step={step}
         value={value}
         disabled={disabled}
-        className="zone-bound-stepper__input lookback-stepper__input"
+        className="zone-bound-stepper__input"
         onChange={e => onChange(Number(e.target.value))}
         onBlur={() => onChange(clamp(value))}
       />
       <button
         type="button"
         aria-label="增大"
-        className="zone-bound-stepper__btn lookback-stepper__btn"
+        className="zone-bound-stepper__btn"
         disabled={disabled || atMax}
         onClick={() => bump(1)}
       >
@@ -673,6 +707,12 @@ export default function App() {
   const [bollScanning, setBollScanning] = useState(false);
   const [bollScanProgress, setBollScanProgress] = useState<BollScanProgress | null>(null);
   const [bollLoading, setBollLoading] = useState(false);
+  /** 左侧列表：扫描命中 | 收藏夹 */
+  const [bollListMode, setBollListMode] = useState<'matches' | 'favorites'>('matches');
+  const [bollFavorites, setBollFavorites] = useState<BollPatternFavorite[]>([]);
+  const [bollFavoriteTotal, setBollFavoriteTotal] = useState(0);
+  const [bollFavoriteNoteDraft, setBollFavoriteNoteDraft] = useState('');
+  const [bollFavoriteBusy, setBollFavoriteBusy] = useState(false);
   const [selectedBollMatch, setSelectedBollMatch] = useState<BollPatternMatch | null>(null);
   const [bollBars, setBollBars] = useState<Bar[]>([]);
   const [bollStateString, setBollStateString] = useState('');
@@ -1192,6 +1232,32 @@ export default function App() {
     }
   };
 
+  const bollMatchNaturalKey = (m: {
+    code: string;
+    pattern_id: string;
+    start_date: string;
+    end_date: string;
+  }) => `${m.code.toLowerCase()}|${m.pattern_id}|${m.start_date}|${m.end_date}`;
+
+  const favoriteToMatchView = (f: BollPatternFavorite): BollPatternMatch => ({
+    id: f.source_match_id || f.id,
+    code: f.code,
+    name: f.name,
+    pattern_id: f.pattern_id,
+    pattern_name: f.pattern_name,
+    period: f.period,
+    start_date: f.start_date,
+    end_date: f.end_date,
+    matched_states: f.matched_states,
+    score: f.score,
+    edge_hits: f.edge_hits || [],
+    scan_date: f.scan_date,
+    window_days: f.window_days ?? 0,
+    favorited: true,
+    favorite_id: f.id,
+    favorite_note: f.note || '',
+  });
+
   const fetchBollMatches = async () => {
     setBollLoading(true);
     try {
@@ -1208,12 +1274,14 @@ export default function App() {
         const items: BollPatternMatch[] = json.data.items || [];
         setBollMatches(items);
         setBollMatchTotal(json.data.total || 0);
-        if (items.length > 0) {
-          void handleSelectBollMatch(items[0]);
-        } else {
-          setSelectedBollMatch(null);
-          setBollBars([]);
-          setBollStateString('');
+        if (bollListMode === 'matches') {
+          if (items.length > 0) {
+            void handleSelectBollMatch(items[0]);
+          } else {
+            setSelectedBollMatch(null);
+            setBollBars([]);
+            setBollStateString('');
+          }
         }
       } else {
         showToast('拉取编排命中失败：' + (json.error || ''));
@@ -1222,6 +1290,179 @@ export default function App() {
       showToast('拉取编排命中异常，请检查后端。');
     } finally {
       setBollLoading(false);
+    }
+  };
+
+  const fetchBollFavorites = async (opts?: { selectFirst?: boolean }) => {
+    setBollLoading(true);
+    try {
+      const res = await fetch(`${apiBase}/api/boll-pattern-favorites?limit=200`);
+      const json = await res.json();
+      if (json.success) {
+        const items: BollPatternFavorite[] = json.data.items || [];
+        setBollFavorites(items);
+        setBollFavoriteTotal(json.data.total || 0);
+        if (opts?.selectFirst || bollListMode === 'favorites') {
+          if (items.length > 0) {
+            const view = favoriteToMatchView(items[0]);
+            setBollFavoriteNoteDraft(items[0].note || '');
+            void handleSelectBollMatch(view);
+          } else {
+            setSelectedBollMatch(null);
+            setBollBars([]);
+            setBollStateString('');
+            setBollFavoriteNoteDraft('');
+          }
+        }
+      } else {
+        showToast('拉取收藏夹失败：' + (json.error || ''));
+      }
+    } catch {
+      showToast('拉取收藏夹异常，请检查后端。');
+    } finally {
+      setBollLoading(false);
+    }
+  };
+
+  const syncFavoriteOntoMatches = (fav: BollPatternFavorite | null, naturalKey: string) => {
+    setBollMatches((prev) =>
+      prev.map((m) => {
+        if (bollMatchNaturalKey(m) !== naturalKey) return m;
+        if (!fav) {
+          return { ...m, favorited: false, favorite_id: null, favorite_note: '' };
+        }
+        return {
+          ...m,
+          favorited: true,
+          favorite_id: fav.id,
+          favorite_note: fav.note || '',
+        };
+      }),
+    );
+  };
+
+  const handleToggleBollFavorite = async (m: BollPatternMatch, e?: MouseEvent) => {
+    e?.stopPropagation();
+    if (bollChartSource === 'preview' && !m.favorited) {
+      showToast('试跑命中不支持收藏，请先扫描落库');
+      return;
+    }
+    if (bollFavoriteBusy) return;
+    setBollFavoriteBusy(true);
+    const key = bollMatchNaturalKey(m);
+    try {
+      if (m.favorited && m.favorite_id) {
+        const res = await fetch(`${apiBase}/api/boll-pattern-favorites/${m.favorite_id}`, {
+          method: 'DELETE',
+        });
+        const json = await res.json();
+        if (!json.success) {
+          showToast('取消收藏失败：' + (json.error || ''));
+          return;
+        }
+        showToast('已取消收藏');
+        syncFavoriteOntoMatches(null, key);
+        setBollFavorites((prev) => prev.filter((f) => f.id !== m.favorite_id));
+        setBollFavoriteTotal((n) => Math.max(0, n - 1));
+        if (selectedBollMatch && bollMatchNaturalKey(selectedBollMatch) === key) {
+          setSelectedBollMatch({
+            ...selectedBollMatch,
+            favorited: false,
+            favorite_id: null,
+            favorite_note: '',
+          });
+          setBollFavoriteNoteDraft('');
+        }
+        if (bollListMode === 'favorites') {
+          void fetchBollFavorites({ selectFirst: true });
+        }
+      } else {
+        const res = await fetch(`${apiBase}/api/boll-pattern-favorites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: m.code,
+            name: m.name,
+            pattern_id: m.pattern_id,
+            pattern_name: m.pattern_name,
+            period: m.period || 'daily',
+            start_date: m.start_date,
+            end_date: m.end_date,
+            matched_states: m.matched_states,
+            score: m.score,
+            edge_hits: m.edge_hits || [],
+            scan_date: m.scan_date,
+            window_days: m.window_days,
+            source_match_id: m.id,
+            id: m.id,
+          }),
+        });
+        const json = await res.json();
+        if (!json.success) {
+          showToast('收藏失败：' + (json.error || ''));
+          return;
+        }
+        const fav = json.data as BollPatternFavorite;
+        showToast('已收藏');
+        const wasNew = !m.favorited;
+        syncFavoriteOntoMatches(fav, key);
+        setBollFavorites((prev) => {
+          const rest = prev.filter(
+            (f) => bollMatchNaturalKey(f) !== key,
+          );
+          return [fav, ...rest];
+        });
+        if (wasNew) setBollFavoriteTotal((n) => n + 1);
+        if (selectedBollMatch && bollMatchNaturalKey(selectedBollMatch) === key) {
+          setSelectedBollMatch({
+            ...selectedBollMatch,
+            favorited: true,
+            favorite_id: fav.id,
+            favorite_note: fav.note || '',
+          });
+          setBollFavoriteNoteDraft(fav.note || '');
+        }
+      }
+    } catch {
+      showToast('收藏操作异常');
+    } finally {
+      setBollFavoriteBusy(false);
+    }
+  };
+
+  const handleSaveBollFavoriteNote = async () => {
+    if (!selectedBollMatch?.favorite_id) return;
+    if (bollFavoriteBusy) return;
+    setBollFavoriteBusy(true);
+    try {
+      const res = await fetch(
+        `${apiBase}/api/boll-pattern-favorites/${selectedBollMatch.favorite_id}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: bollFavoriteNoteDraft }),
+        },
+      );
+      const json = await res.json();
+      if (!json.success) {
+        showToast('保存备注失败：' + (json.error || ''));
+        return;
+      }
+      const fav = json.data as BollPatternFavorite;
+      showToast('备注已保存');
+      const key = bollMatchNaturalKey(selectedBollMatch);
+      syncFavoriteOntoMatches(fav, key);
+      setBollFavorites((prev) =>
+        prev.map((f) => (f.id === fav.id ? fav : f)),
+      );
+      setSelectedBollMatch({
+        ...selectedBollMatch,
+        favorite_note: fav.note || '',
+      });
+    } catch {
+      showToast('保存备注异常');
+    } finally {
+      setBollFavoriteBusy(false);
     }
   };
 
@@ -1284,12 +1525,18 @@ export default function App() {
     }
   };
 
-  const buildBarsQuery = (endDate: string | undefined, lookback: number, period: ChartPeriod) => {
+  const buildBarsQuery = (
+    endDate: string | undefined,
+    lookback: number,
+    period: ChartPeriod,
+    forwardBars: number = 0,
+  ) => {
     const lb = Math.min(500, Math.max(30, lookback || CHART_PERIOD_LOOKBACK_DEFAULTS[period]));
     const qs = new URLSearchParams();
     qs.set('period', period);
     qs.set('lookback_bars', String(lb));
     if (endDate) qs.set('end_date', endDate);
+    if (forwardBars > 0 && endDate) qs.set('forward_bars', String(forwardBars));
     return { qs, lb };
   };
 
@@ -1298,10 +1545,11 @@ export default function App() {
     endDate?: string,
     period: ChartPeriod = chartPeriod,
     lookback: number = stockViewLookback,
+    forwardBars: number = 0,
   ) => {
     setBollLoading(true);
     try {
-      const { qs } = buildBarsQuery(endDate, lookback, period);
+      const { qs } = buildBarsQuery(endDate, lookback, period, forwardBars);
       const barsRes = await fetch(`${apiBase}/api/stocks/${code}/bars?${qs.toString()}`);
       const barsJson = await barsRes.json();
       if (barsJson.success) {
@@ -1322,24 +1570,21 @@ export default function App() {
     setBollChartSource('scan');
     setBollPreviewMeta(null);
     setSelectedBollMatch(m);
+    setBollFavoriteNoteDraft(m.favorite_note || '');
     const matchPeriod = (m.period as ChartPeriod) || 'daily';
     // 选中命中强制切到编排周期（ADR 0006）
     if (matchPeriod !== chartPeriod) {
       skipBarsDebounceRef.current = true;
       setChartPeriod(matchPeriod);
-      if (matchPeriod !== 'daily') setStockViewZoneOpen(false);
     }
     setBollLoading(true);
     try {
       const lb = lookbackByPeriod[matchPeriod];
-      const { qs } = buildBarsQuery(m.end_date, lb, matchPeriod);
-      const fetches: Promise<Response>[] = [
+      const { qs } = buildBarsQuery(m.end_date, lb, matchPeriod, BOLL_MATCH_FORWARD_BARS);
+      const [barsRes, stateRes] = await Promise.all([
         fetch(`${apiBase}/api/stocks/${m.code}/bars?${qs.toString()}`),
-      ];
-      if (matchPeriod === 'daily') {
-        fetches.push(fetch(`${apiBase}/api/stocks/${m.code}/boll-states?limit=60`));
-      }
-      const [barsRes, stateRes] = await Promise.all(fetches);
+        fetch(bollStatesUrl(apiBase, m.code, matchPeriod)),
+      ]);
       const barsJson = await barsRes.json();
       if (barsJson.success) {
         setBollBars(barsJson.data.bars || []);
@@ -1347,11 +1592,9 @@ export default function App() {
         setBollBars([]);
         showToast('加载 K 线失败：' + (barsJson.error || ''));
       }
-      if (matchPeriod === 'daily' && stateRes) {
-        const stateJson = await stateRes.json();
-        if (stateJson.success) {
-          setBollStateString(stateJson.data.state_string || '');
-        }
+      const stateJson = await stateRes.json();
+      if (stateJson.success) {
+        setBollStateString(stateJson.data.state_string || '');
       } else {
         setBollStateString('');
       }
@@ -1371,18 +1614,18 @@ export default function App() {
     setBollChartSource('preview');
     setBollPreviewMeta(null);
     setSelectedBollMatch(m);
-    setBollStateString(bollForm.period === 'daily' ? stateString : '');
+    setBollStateString(stateString);
     const matchPeriod = (m.period as ChartPeriod) || bollForm.period || 'daily';
     if (matchPeriod !== chartPeriod) {
       skipBarsDebounceRef.current = true;
       setChartPeriod(matchPeriod);
-      if (matchPeriod !== 'daily') setStockViewZoneOpen(false);
     }
     await loadBollBarsForChart(
       m.code,
       chartEndDate || m.end_date,
       matchPeriod,
       lookbackByPeriod[matchPeriod],
+      BOLL_MATCH_FORWARD_BARS,
     );
   };
 
@@ -1497,7 +1740,13 @@ export default function App() {
           name: data.name || bollTrySelected?.name,
           asOf: asOf || undefined,
         });
-        await loadBollBarsForChart(data.code || code, asOf || undefined);
+        await loadBollBarsForChart(
+          data.code || code,
+          asOf || undefined,
+          chartPeriod,
+          stockViewLookback,
+          asOf ? BOLL_MATCH_FORWARD_BARS : 0,
+        );
       }
     } catch {
       setBollTryHits([]);
@@ -2190,7 +2439,21 @@ export default function App() {
   useEffect(() => {
     if (activeTab !== 'boll_pattern') return;
     void fetchBollPatterns();
-    void fetchBollMatches();
+    if (bollListMode === 'favorites') {
+      void fetchBollFavorites({ selectFirst: false });
+    } else {
+      void fetchBollMatches();
+    }
+    // 预取收藏数量，供「收藏夹 N」角标
+    void (async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/boll-pattern-favorites?limit=1`);
+        const json = await res.json();
+        if (json.success) setBollFavoriteTotal(json.data.total || 0);
+      } catch {
+        /* ignore */
+      }
+    })();
     // 进入页时若后台已在扫，恢复进度展示
     void (async () => {
       const prog = await fetchBollScanStatus();
@@ -2307,20 +2570,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, selectedStockView?.code, stockViewEndDate, stockViewLookback, chartPeriod, apiBase]);
 
-  // 个股走势：展开 zone 时再请求（仅日线）
+  // 个股走势：展开 zone 时再请求（日/周/月）
   useEffect(() => {
     if (activeTab !== 'stock_view' || !stockViewZoneOpen || !selectedStockView) return;
-    if (chartPeriod !== 'daily') {
-      setStockViewZoneString('');
-      return;
-    }
     let cancelled = false;
     setStockViewZoneLoading(true);
     void (async () => {
       try {
-        const res = await fetch(
-          `${apiBase}/api/stocks/${selectedStockView.code}/boll-states?limit=60`,
-        );
+        const res = await fetch(bollStatesUrl(apiBase, selectedStockView.code, chartPeriod));
         const json = await res.json();
         if (cancelled) return;
         if (json.success) {
@@ -2361,13 +2618,14 @@ export default function App() {
       selectedBollMatch?.end_date ||
       bollPreviewMeta?.asOf ||
       undefined;
+    const forward = end ? BOLL_MATCH_FORWARD_BARS : 0;
     const t = setTimeout(() => {
-      void loadBollBarsForChart(code, end);
-      if (chartPeriod === 'daily' && selectedBollMatch?.code) {
+      void loadBollBarsForChart(code, end, chartPeriod, stockViewLookback, forward);
+      if (bollChartSource !== 'preview' && selectedBollMatch?.code) {
         void (async () => {
           try {
             const stateRes = await fetch(
-              `${apiBase}/api/stocks/${selectedBollMatch.code}/boll-states?limit=60`,
+              bollStatesUrl(apiBase, selectedBollMatch.code, chartPeriod),
             );
             const stateJson = await stateRes.json();
             if (stateJson.success) {
@@ -2377,8 +2635,6 @@ export default function App() {
             /* ignore */
           }
         })();
-      } else if (chartPeriod !== 'daily') {
-        setBollStateString('');
       }
     }, 300);
     return () => clearTimeout(t);
@@ -2684,16 +2940,16 @@ export default function App() {
                 ? ((b.close - prev.close) / prev.close) * 100
                 : null;
             const chgColor =
-              chgPct == null ? '#94a3b8' : chgPct >= 0 ? '#ef4444' : '#10b981';
+              chgPct == null ? '#94a3b8' : chgPct >= 0 ? CHART_UP_RED : CHART_DOWN_GREEN;
             const chgText =
               chgPct == null
                 ? 'N/A'
                 : `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`;
             html += `<b style="color: #94a3b8;">交易日期: ${b.date}</b><br/>`;
             html += `开盘价: <b style="color:#fff; font-family: monospace;">￥${b.open.toFixed(2)}</b><br/>`;
-            html += `收盘价: <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'}; font-family: monospace;">￥${b.close.toFixed(2)}</b><br/>`;
-            html += `最高价: <b style="color:#ef4444; font-family: monospace;">￥${b.high.toFixed(2)}</b><br/>`;
-            html += `最低价: <b style="color:#10b981; font-family: monospace;">￥${b.low.toFixed(2)}</b><br/>`;
+            html += `收盘价: <b style="color:${b.close >= b.open ? CHART_UP_RED : CHART_DOWN_GREEN}; font-family: monospace;">￥${b.close.toFixed(2)}</b><br/>`;
+            html += `最高价: <b style="color:${CHART_UP_RED}; font-family: monospace;">￥${b.high.toFixed(2)}</b><br/>`;
+            html += `最低价: <b style="color:${CHART_DOWN_GREEN}; font-family: monospace;">￥${b.low.toFixed(2)}</b><br/>`;
             html += `涨跌幅: <b style="color:${chgColor}; font-family: monospace;">${chgText}</b><br/>`;
 
             const mid = b.boll_mid ? `￥${b.boll_mid.toFixed(2)}` : 'N/A';
@@ -2735,15 +2991,15 @@ export default function App() {
           type: 'candlestick',
           data: klineData,
           itemStyle: {
-            color: '#ef4444',
-            color0: '#10b981',
-            borderColor: '#ef4444',
-            borderColor0: '#10b981'
+            color: CHART_UP_RED,
+            color0: CHART_DOWN_GREEN,
+            borderColor: CHART_UP_RED,
+            borderColor0: CHART_DOWN_GREEN,
           },
           markPoint: {
             data: [
               { type: 'max', valueDim: 'highest', name: '最高', label: { show: true, position: 'top', color: '#fff', fontSize: 9, backgroundColor: 'rgba(239, 68, 68, 0.85)', padding: [3, 5], borderRadius: 3 } },
-              { type: 'min', valueDim: 'lowest', name: '最低', label: { show: true, position: 'bottom', color: '#fff', fontSize: 9, backgroundColor: 'rgba(16, 185, 129, 0.85)', padding: [3, 5], borderRadius: 3 } }
+              { type: 'min', valueDim: 'lowest', name: '最低', label: { show: true, position: 'bottom', color: '#fff', fontSize: 9, backgroundColor: 'rgba(84, 255, 255, 0.85)', padding: [3, 5], borderRadius: 3 } }
             ]
           }
         },
@@ -2883,14 +3139,14 @@ export default function App() {
               ? ((b.close - prev.close) / prev.close) * 100
               : null;
           const chgColor =
-            chgPct == null ? '#94a3b8' : chgPct >= 0 ? '#ef4444' : '#10b981';
+            chgPct == null ? '#94a3b8' : chgPct >= 0 ? CHART_UP_RED : CHART_DOWN_GREEN;
           const chgText =
             chgPct == null
               ? 'N/A'
               : `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`;
           let html = `<div style="padding:4px 8px;line-height:1.6;">`;
           html += `<b style="color:#94a3b8;">${b.date}</b><br/>`;
-          html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? '#ef4444' : '#10b981'};">${fmtPx(b.close)}</b><br/>`;
+          html += `开 ${fmtPx(b.open)}　收 <b style="color:${b.close >= b.open ? CHART_UP_RED : CHART_DOWN_GREEN};">${fmtPx(b.close)}</b><br/>`;
           html += `低 ${fmtPx(b.low)}　高 ${fmtPx(b.high)}<br/>`;
           html += `涨跌幅: <b style="color:${chgColor};font-family:monospace;">${chgText}</b><br/>`;
           html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
@@ -2904,12 +3160,16 @@ export default function App() {
           html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
           html += `</div>`;
           html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
-          html += `MACD(12,26,9) DIF:<b style="color:#e2e8f0;font-family:monospace;">${fmtNum(b.dif)}</b> `;
-          html += `DEA:<b style="color:#facc15;font-family:monospace;">${fmtNum(b.dea)}</b> `;
-          html += `MACD:<b style="color:${(b.macd ?? 0) >= 0 ? '#ef4444' : '#10b981'};font-family:monospace;">${fmtNum(b.macd)}</b><br/>`;
-          html += `KDJ(9,3,3) K:<b style="color:#e2e8f0;font-family:monospace;">${fmtNum(b.k)}</b> `;
-          html += `D:<b style="color:#facc15;font-family:monospace;">${fmtNum(b.d)}</b> `;
-          html += `J:<b style="color:#d946ef;font-family:monospace;">${fmtNum(b.j)}</b>`;
+          html += `<div style="color:#64748b;font-size:10px;margin-bottom:2px;">MACD(12,26,9)</div>`;
+          html += `DIF: <b style="color:#e2e8f0;font-family:monospace;">${fmtNum(b.dif)}</b><br/>`;
+          html += `DEA: <b style="color:#facc15;font-family:monospace;">${fmtNum(b.dea)}</b><br/>`;
+          html += `MACD: <b style="color:${(b.macd ?? 0) >= 0 ? CHART_UP_RED : CHART_DOWN_GREEN};font-family:monospace;">${fmtNum(b.macd)}</b>`;
+          html += `</div>`;
+          html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
+          html += `<div style="color:#64748b;font-size:10px;margin-bottom:2px;">KDJ(9,3,3)</div>`;
+          html += `K: <b style="color:#e2e8f0;font-family:monospace;">${fmtNum(b.k)}</b><br/>`;
+          html += `D: <b style="color:#facc15;font-family:monospace;">${fmtNum(b.d)}</b><br/>`;
+          html += `J: <b style="color:#d946ef;font-family:monospace;">${fmtNum(b.j)}</b>`;
           html += `</div></div>`;
           tooltipCacheRef.current = { key: tooltipCacheKey, index: idx, html };
           return html;
@@ -2946,7 +3206,7 @@ export default function App() {
         },
         {
           data: ['DIF', 'DEA', 'MACD'],
-          top: '52%',
+          top: '29.42%',
           left: 56,
           itemGap: 10,
           itemWidth: 12,
@@ -2955,7 +3215,7 @@ export default function App() {
         },
         {
           data: ['K', 'D', 'J'],
-          top: '70%',
+          top: '47.42%',
           left: 56,
           itemGap: 10,
           itemWidth: 12,
@@ -2964,10 +3224,10 @@ export default function App() {
         },
       ],
       grid: [
-        // 主图占大半；副图压紧并铺满底部，避免右下大块留白
-        { left: 48, right: 16, top: '5%', height: '44%', containLabel: false },
-        { left: 48, right: 16, top: '55%', height: '12%', containLabel: false },
-        { left: 48, right: 16, top: '73%', bottom: '3%', containLabel: false },
+        // 主图再收 10%；多出高度给 KDJ，MACD 保持原高度并上移
+        { left: 48, right: 16, top: '5%', height: '21.42%', containLabel: false },
+        { left: 48, right: 16, top: '32.42%', height: '12%', containLabel: false },
+        { left: 48, right: 16, top: '50.42%', bottom: '3%', containLabel: false },
       ],
       xAxis: [
         {
@@ -3024,10 +3284,10 @@ export default function App() {
           yAxisIndex: 0,
           data: klineData,
           itemStyle: {
-            color: '#ef4444',
-            color0: '#10b981',
-            borderColor: '#ef4444',
-            borderColor0: '#10b981',
+            color: CHART_UP_RED,
+            color0: CHART_DOWN_GREEN,
+            borderColor: CHART_UP_RED,
+            borderColor0: CHART_DOWN_GREEN,
           },
           ...(hasHighlight && highlightStart && highlightEnd
             ? {
@@ -3089,7 +3349,7 @@ export default function App() {
           barCategoryGap: '80%',
           itemStyle: {
             color: (params: any) =>
-              (params.value ?? 0) >= 0 ? '#ef4444' : '#10b981',
+              (params.value ?? 0) >= 0 ? CHART_UP_RED : CHART_DOWN_GREEN,
             borderRadius: 0,
           },
         },
@@ -3180,12 +3440,11 @@ export default function App() {
     });
   };
 
-  const setChartPeriodAndMaybeCloseZone = (p: ChartPeriod) => {
+  const switchChartPeriod = (p: ChartPeriod) => {
     if (p === chartPeriod) return;
     const nextLookback = lookbackByPeriod[p];
     skipBarsDebounceRef.current = true;
     setChartPeriod(p);
-    if (p !== 'daily') setStockViewZoneOpen(false);
     // 立刻清空旧周期序列，避免 ECharts 日→周/月 morph 拉丝
     setStockViewBars([]);
     stockViewReqKeyRef.current = '';
@@ -3209,12 +3468,13 @@ export default function App() {
       setBollBars([]);
       setBollLoading(true);
       const end = selectedBollMatch?.end_date || bollPreviewMeta?.asOf || undefined;
-      void loadBollBarsForChart(bollCode, end, p, nextLookback);
-      if (p === 'daily' && selectedBollMatch?.code) {
+      const forward = end ? BOLL_MATCH_FORWARD_BARS : 0;
+      void loadBollBarsForChart(bollCode, end, p, nextLookback, forward);
+      if (bollChartSource !== 'preview' && selectedBollMatch?.code) {
         void (async () => {
           try {
             const stateRes = await fetch(
-              `${apiBase}/api/stocks/${selectedBollMatch.code}/boll-states?limit=60`,
+              bollStatesUrl(apiBase, selectedBollMatch.code, p),
             );
             const stateJson = await stateRes.json();
             if (stateJson.success) {
@@ -3224,8 +3484,6 @@ export default function App() {
             /* ignore */
           }
         })();
-      } else {
-        setBollStateString('');
       }
     } else if (bollCode) {
       // 非编排页切周期：清缓存，进编排页时由 effect / 选中逻辑重拉
@@ -3242,11 +3500,81 @@ export default function App() {
           type="button"
           className={`chart-period-btn${chartPeriod === opt.value ? ' active' : ''}`}
           disabled={disabled}
-          onClick={() => setChartPeriodAndMaybeCloseZone(opt.value)}
+          onClick={() => switchChartPeriod(opt.value)}
         >
           {opt.label}
         </button>
       ))}
+    </div>
+  );
+
+  const renderLookbackStepper = (disabled = false) => (
+    <div
+      className="lookback-stepper"
+      role="group"
+      aria-label={`回看根数（${CHART_PERIOD_LABEL[chartPeriod]}K）`}
+      title={`回看根数（${CHART_PERIOD_LABEL[chartPeriod]}K）`}
+    >
+      <button
+        type="button"
+        aria-label="减少回看根数"
+        className="lookback-stepper__btn"
+        disabled={disabled || stockViewLookback <= 30}
+        onClick={() => {
+          setStockViewLookback((v) => Math.min(500, Math.max(30, (v || 120) - 10)));
+        }}
+      >
+        −
+      </button>
+      <input
+        type="number"
+        min={30}
+        max={500}
+        step={10}
+        value={stockViewLookback}
+        disabled={disabled}
+        className="lookback-stepper__input"
+        onChange={(e) => setStockViewLookback(Number(e.target.value) || 0)}
+        onBlur={() => {
+          setStockViewLookback((v) => Math.min(500, Math.max(30, v || 120)));
+        }}
+      />
+      <button
+        type="button"
+        aria-label="增加回看根数"
+        className="lookback-stepper__btn"
+        disabled={disabled || stockViewLookback >= 500}
+        onClick={() => {
+          setStockViewLookback((v) => Math.min(500, Math.max(30, (v || 120) + 10)));
+        }}
+      >
+        +
+      </button>
+      <select
+        className="lookback-stepper__preset"
+        disabled={disabled}
+        title="快捷回看根数"
+        aria-label="快捷回看根数"
+        value={
+          (STOCK_VIEW_LOOKBACK_PRESETS as readonly number[]).includes(stockViewLookback)
+            ? String(stockViewLookback)
+            : ''
+        }
+        onChange={(e) => {
+          const next = Number(e.target.value);
+          if (!Number.isFinite(next) || next <= 0) return;
+          setStockViewLookback(Math.min(500, Math.max(30, next)));
+        }}
+      >
+        <option value="" disabled>
+          快捷
+        </option>
+        {STOCK_VIEW_LOOKBACK_PRESETS.map((days) => (
+          <option key={days} value={days}>
+            {days}
+          </option>
+        ))}
+      </select>
     </div>
   );
 
@@ -4077,7 +4405,32 @@ export default function App() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', width: '100%' }}>
             <div className="boll-pattern-layout" style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 1fr) minmax(420px, 1.4fr)', gap: '1rem', width: '100%' }}>
               <div className="data-card" style={{ padding: '1rem' }}>
-                <h2 className="panel-title" style={{ marginBottom: '0.8rem' }}>布林编排命中</h2>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', marginBottom: '0.8rem', flexWrap: 'wrap' }}>
+                  <h2 className="panel-title" style={{ margin: 0 }}>布林编排命中</h2>
+                  <div className="chart-period-switch" role="group" aria-label="列表模式">
+                    <button
+                      type="button"
+                      className={`chart-period-btn${bollListMode === 'matches' ? ' active' : ''}`}
+                      onClick={() => {
+                        setBollListMode('matches');
+                        void fetchBollMatches();
+                      }}
+                    >
+                      命中列表
+                    </button>
+                    <button
+                      type="button"
+                      className={`chart-period-btn${bollListMode === 'favorites' ? ' active' : ''}`}
+                      onClick={() => {
+                        setBollListMode('favorites');
+                        void fetchBollFavorites({ selectFirst: true });
+                      }}
+                    >
+                      收藏夹{bollFavoriteTotal > 0 ? ` ${bollFavoriteTotal}` : ''}
+                    </button>
+                  </div>
+                </div>
+                {bollListMode === 'matches' && (
                 <div className="form-group">
                   <label>扫描 / 列表周期</label>
                   <select
@@ -4093,6 +4446,9 @@ export default function App() {
                     <option value="monthly">月线</option>
                   </select>
                 </div>
+                )}
+                {bollListMode === 'matches' ? (
+                  <>
                 <div className="form-group">
                   <label>编排筛选</label>
                   <select
@@ -4200,6 +4556,7 @@ export default function App() {
                     <table className="scan-table">
                       <thead>
                         <tr>
+                          <th style={{ width: 36 }} />
                           <th>代码</th>
                           <th>编排</th>
                           <th>区间</th>
@@ -4210,10 +4567,30 @@ export default function App() {
                         {bollMatches.map(m => (
                           <tr
                             key={m.id}
-                            className={selectedBollMatch?.id === m.id ? 'active-row' : ''}
+                            className={
+                              selectedBollMatch && bollMatchNaturalKey(selectedBollMatch) === bollMatchNaturalKey(m)
+                                ? 'active-row'
+                                : ''
+                            }
                             onClick={() => { void handleSelectBollMatch(m); }}
                             style={{ cursor: 'pointer' }}
                           >
+                            <td>
+                              <button
+                                type="button"
+                                className="boll-fav-star-btn"
+                                title={m.favorited ? '取消收藏' : '收藏'}
+                                aria-label={m.favorited ? '取消收藏' : '收藏'}
+                                disabled={bollFavoriteBusy}
+                                onClick={(e) => { void handleToggleBollFavorite(m, e); }}
+                              >
+                                <Star
+                                  size={14}
+                                  fill={m.favorited ? '#fbbf24' : 'none'}
+                                  color={m.favorited ? '#fbbf24' : '#64748b'}
+                                />
+                              </button>
+                            </td>
                             <td>
                               <div style={{ fontWeight: 700, fontFamily: 'monospace' }}>{m.code.toUpperCase()}</div>
                               <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{m.name || ''}</div>
@@ -4240,6 +4617,102 @@ export default function App() {
                     </table>
                   </div>
                 )}
+                  </>
+                ) : (
+                  <>
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.8rem' }}>
+                      <button
+                        className="btn-primary"
+                        style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
+                        onClick={() => { void fetchBollFavorites({ selectFirst: false }); }}
+                        disabled={bollLoading}
+                      >
+                        <RotateCcw size={14} /> 刷新收藏
+                      </button>
+                    </div>
+                    <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '0.6rem' }}>
+                      共 {bollFavoriteTotal} 条 · 按收藏时间倒序
+                    </p>
+                    {bollLoading && bollFavorites.length === 0 ? (
+                      <div className="loading-wrapper"><div className="spinner" /></div>
+                    ) : bollFavorites.length === 0 ? (
+                      <div className="empty-wrapper" style={{ padding: '1.5rem 0' }}>
+                        <Star size={24} color="#fbbf24" />
+                        <p style={{ fontSize: '0.85rem' }}>暂无收藏。在命中列表点星标，或打开详情后点「收藏」。</p>
+                      </div>
+                    ) : (
+                      <div className="table-wrapper" style={{ maxHeight: '42vh', overflow: 'auto' }}>
+                        <table className="scan-table">
+                          <thead>
+                            <tr>
+                              <th style={{ width: 36 }} />
+                              <th>代码</th>
+                              <th>编排</th>
+                              <th>区间</th>
+                              <th>备注</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bollFavorites.map((f) => {
+                              const view = favoriteToMatchView(f);
+                              const selected =
+                                selectedBollMatch &&
+                                bollMatchNaturalKey(selectedBollMatch) === bollMatchNaturalKey(f);
+                              return (
+                                <tr
+                                  key={f.id}
+                                  className={selected ? 'active-row' : ''}
+                                  onClick={() => {
+                                    setBollFavoriteNoteDraft(f.note || '');
+                                    void handleSelectBollMatch(view);
+                                  }}
+                                  style={{ cursor: 'pointer' }}
+                                >
+                                  <td>
+                                    <button
+                                      type="button"
+                                      className="boll-fav-star-btn"
+                                      title="取消收藏"
+                                      aria-label="取消收藏"
+                                      disabled={bollFavoriteBusy}
+                                      onClick={(e) => { void handleToggleBollFavorite(view, e); }}
+                                    >
+                                      <Star size={14} fill="#fbbf24" color="#fbbf24" />
+                                    </button>
+                                  </td>
+                                  <td>
+                                    <div style={{ fontWeight: 700, fontFamily: 'monospace' }}>{f.code.toUpperCase()}</div>
+                                    <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{f.name || ''}</div>
+                                  </td>
+                                  <td style={{ fontSize: '0.75rem' }}>
+                                    {f.pattern_name}
+                                    {f.period ? (
+                                      <span style={{ marginLeft: 4, color: '#94a3b8', fontSize: '0.68rem' }}>
+                                        ·{CHART_PERIOD_LABEL[f.period as ChartPeriod] || f.period}
+                                      </span>
+                                    ) : null}
+                                  </td>
+                                  <td style={{ fontSize: '0.72rem', fontFamily: 'monospace' }}>
+                                    {f.start_date}<br />~ {f.end_date}
+                                  </td>
+                                  <td style={{ fontSize: '0.7rem', color: '#94a3b8', maxWidth: 120 }}>
+                                    {f.note ? (
+                                      <span title={f.note} style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {f.note}
+                                      </span>
+                                    ) : (
+                                      <span style={{ opacity: 0.45 }}>—</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
 
               <div className="data-card boll-pattern-chart-card" style={{ padding: '1rem', minHeight: '280px' }}>
@@ -4261,14 +4734,31 @@ export default function App() {
                 ) : (
                   <>
                     <div style={{ marginBottom: '0.45rem', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap', flexShrink: 0 }}>
-                      <div>
-                        <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
-                          {bollChartSource === 'preview' ? '试跑 · ' : '布林编排 · '}
-                          {(selectedBollMatch?.code || bollPreviewMeta?.code || '').toUpperCase()}{' '}
-                          {selectedBollMatch?.name || bollPreviewMeta?.name || ''}
+                      <div style={{ minWidth: 0, flex: '1 1 200px' }}>
+                        <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3, display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                          <span>
+                            {bollChartSource === 'preview' ? '试跑 · ' : '布林编排 · '}
+                            {(selectedBollMatch?.code || bollPreviewMeta?.code || '').toUpperCase()}{' '}
+                            {selectedBollMatch?.name || bollPreviewMeta?.name || ''}
+                          </span>
+                          {selectedBollMatch && bollChartSource !== 'preview' ? (
+                            <button
+                              type="button"
+                              className={`boll-fav-action-btn${selectedBollMatch.favorited ? ' is-on' : ''}`}
+                              disabled={bollFavoriteBusy}
+                              onClick={() => { void handleToggleBollFavorite(selectedBollMatch); }}
+                            >
+                              <Star
+                                size={13}
+                                fill={selectedBollMatch.favorited ? '#fbbf24' : 'none'}
+                                color={selectedBollMatch.favorited ? '#fbbf24' : 'currentColor'}
+                              />
+                              {selectedBollMatch.favorited ? '已收藏' : '收藏'}
+                            </button>
+                          ) : null}
                         </div>
                         <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '0.15rem', lineHeight: 1.35 }}>
-                          {CHART_PERIOD_LABEL[chartPeriod]}K · 回看 {stockViewLookback} 根
+                          {CHART_PERIOD_LABEL[chartPeriod]}K
                           {selectedBollMatch ? (
                             <>
                               {' · '}
@@ -4286,8 +4776,41 @@ export default function App() {
                             </>
                           )}
                         </div>
+                        {selectedBollMatch?.favorited && selectedBollMatch.favorite_id ? (
+                          <div className="boll-fav-note-row">
+                            <input
+                              type="text"
+                              className="boll-fav-note-input"
+                              placeholder="备注（可选）"
+                              value={bollFavoriteNoteDraft}
+                              maxLength={200}
+                              onChange={(e) => setBollFavoriteNoteDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  void handleSaveBollFavoriteNote();
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="boll-fav-note-save"
+                              disabled={
+                                bollFavoriteBusy ||
+                                bollFavoriteNoteDraft === (selectedBollMatch.favorite_note || '')
+                              }
+                              onClick={() => { void handleSaveBollFavoriteNote(); }}
+                            >
+                              保存备注
+                            </button>
+                          </div>
+                        ) : null}
                       </div>
-                      {renderChartPeriodSwitcher(bollLoading)}
+                      <div className="boll-chart-toolbar">
+                        <span className="boll-chart-toolbar__label">回看</span>
+                        {renderLookbackStepper()}
+                        {renderChartPeriodSwitcher(bollLoading)}
+                      </div>
                     </div>
                     {bollLoading && bollBars.length === 0 ? (
                       <div className="loading-wrapper boll-pattern-chart-host">
@@ -4305,7 +4828,7 @@ export default function App() {
                       </div>
                     )}
                     <div style={{ marginTop: '0.8rem', fontSize: '0.75rem', color: 'var(--color-text-muted)', flexShrink: 0 }}>
-                      {chartPeriod === 'daily' && selectedBollMatch?.matched_states ? (
+                      {selectedBollMatch?.matched_states ? (
                         <div style={{ marginBottom: '0.45rem' }}>
                           <b style={{ color: '#cbd5e1' }}>命中状态串</b>
                           <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
@@ -4323,17 +4846,21 @@ export default function App() {
                           </div>
                         </div>
                       ) : null}
-                      {chartPeriod === 'daily' && bollStateString && (
+                      {bollStateString && (
                         <div>
                           <b style={{ color: '#cbd5e1' }}>
-                            {bollChartSource === 'preview' ? '试跑窗口 zone' : '近 60 日 zone'}
+                            {bollChartSource === 'preview'
+                              ? '试跑窗口 zone'
+                              : `近 60 ${CHART_PERIOD_LABEL[chartPeriod]} zone`}
                           </b>
                           <div className="boll-zone-string">{bollStateString}</div>
                         </div>
                       )}
-                      {chartPeriod !== 'daily' ? (
-                        <p style={{ margin: 0, fontSize: '0.72rem', color: '#64748b' }}>
-                          zone / 边命中仅日线可用
+                      {chartPeriod !== 'daily' &&
+                      selectedBollMatch?.edge_hits &&
+                      selectedBollMatch.edge_hits.length > 0 ? (
+                        <p style={{ margin: '0.35rem 0 0', fontSize: '0.72rem', color: '#64748b' }}>
+                          边命中仅日线可用
                         </p>
                       ) : null}
                     </div>
@@ -4782,7 +5309,7 @@ export default function App() {
                 )}
               </div>
 
-              <div className="table-wrapper" style={{ maxHeight: '240px', overflow: 'auto' }}>
+              <div className="table-wrapper" style={{ maxHeight: '480px', overflow: 'auto' }}>
                 <table className="scan-table">
                   <thead>
                     <tr>
@@ -4934,71 +5461,7 @@ export default function App() {
                 </div>
                 <div className="form-group">
                   <label>回看根数（{CHART_PERIOD_LABEL[chartPeriod]}K）</label>
-                  <div
-                    className="zone-bound-stepper lookback-stepper"
-                    style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-                  >
-                    <button
-                      type="button"
-                      aria-label="减少回看根数"
-                      className="zone-bound-stepper__btn lookback-stepper__btn"
-                      disabled={!selectedStockView || stockViewLookback <= 30}
-                      onClick={() => {
-                        setStockViewLookback((v) => Math.min(500, Math.max(30, (v || 120) - 10)));
-                      }}
-                    >
-                      −
-                    </button>
-                    <input
-                      type="number"
-                      min={30}
-                      max={500}
-                      step={10}
-                      value={stockViewLookback}
-                      disabled={!selectedStockView}
-                      className="zone-bound-stepper__input lookback-stepper__input"
-                      onChange={(e) => setStockViewLookback(Number(e.target.value) || 0)}
-                      onBlur={() => {
-                        setStockViewLookback((v) => Math.min(500, Math.max(30, v || 120)));
-                      }}
-                    />
-                    <button
-                      type="button"
-                      aria-label="增加回看根数"
-                      className="zone-bound-stepper__btn lookback-stepper__btn"
-                      disabled={!selectedStockView || stockViewLookback >= 500}
-                      onClick={() => {
-                        setStockViewLookback((v) => Math.min(500, Math.max(30, (v || 120) + 10)));
-                      }}
-                    >
-                      +
-                    </button>
-                    <select
-                      className="lookback-preset-select"
-                      disabled={!selectedStockView}
-                      title="快捷回看根数"
-                      aria-label="快捷回看根数"
-                      value={
-                        (STOCK_VIEW_LOOKBACK_PRESETS as readonly number[]).includes(stockViewLookback)
-                          ? String(stockViewLookback)
-                          : ''
-                      }
-                      onChange={(e) => {
-                        const next = Number(e.target.value);
-                        if (!Number.isFinite(next) || next <= 0) return;
-                        setStockViewLookback(Math.min(500, Math.max(30, next)));
-                      }}
-                    >
-                      <option value="" disabled>
-                        快捷
-                      </option>
-                      {STOCK_VIEW_LOOKBACK_PRESETS.map((days) => (
-                        <option key={days} value={days}>
-                          {days}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  {renderLookbackStepper(!selectedStockView)}
                 </div>
               </div>
 
@@ -5039,31 +5502,25 @@ export default function App() {
                     opts={{ renderer: 'canvas' }}
                   />
                   <div style={{ marginTop: '0.75rem' }}>
-                    {chartPeriod === 'daily' ? (
-                      <>
-                        <button
-                          type="button"
-                          className="stock-zone-toggle"
-                          onClick={() => setStockViewZoneOpen((v) => !v)}
-                        >
-                          {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                          {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
-                        </button>
-                        {stockViewZoneOpen && (
-                          <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                            <b style={{ color: '#cbd5e1' }}>近 60 日 zone</b>
-                            {stockViewZoneLoading ? (
-                              <div style={{ marginTop: '0.35rem' }}>加载中…</div>
-                            ) : (
-                              <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
-                            )}
-                          </div>
+                    <button
+                      type="button"
+                      className="stock-zone-toggle"
+                      onClick={() => setStockViewZoneOpen((v) => !v)}
+                    >
+                      {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                      {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
+                    </button>
+                    {stockViewZoneOpen && (
+                      <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                        <b style={{ color: '#cbd5e1' }}>
+                          近 60 {CHART_PERIOD_LABEL[chartPeriod]} zone
+                        </b>
+                        {stockViewZoneLoading ? (
+                          <div style={{ marginTop: '0.35rem' }}>加载中…</div>
+                        ) : (
+                          <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
                         )}
-                      </>
-                    ) : (
-                      <p style={{ margin: 0, fontSize: '0.72rem', color: '#64748b' }}>
-                        zone 仅日线可用
-                      </p>
+                      </div>
                     )}
                   </div>
                 </>

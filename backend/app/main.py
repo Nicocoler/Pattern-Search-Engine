@@ -204,6 +204,30 @@ class BollPatternUpdatePayload(BaseModel):
     clear_zone_override: bool = Field(default=False, description="为 true 时清空 zone 覆盖")
     clear_denoise_override: bool = Field(default=False, description="为 true 时清空 denoise 覆盖")
 
+
+class BollFavoriteCreatePayload(BaseModel):
+    """命中快照收藏；按 (code, pattern_id, start_date, end_date) 去重。"""
+    code: str
+    pattern_id: str
+    start_date: str
+    end_date: str
+    pattern_name: str | None = None
+    period: str = "daily"
+    name: str | None = None
+    matched_states: str = ""
+    score: float | None = None
+    edge_hits: list | None = None
+    scan_date: str | None = None
+    window_days: int | None = None
+    source_match_id: int | None = None
+    id: int | None = Field(default=None, description="兼容：命中行 id，写入 source_match_id")
+    note: str | None = None
+
+
+class BollFavoriteNotePayload(BaseModel):
+    note: str = ""
+
+
 class BollPatternSettingsPayload(BaseModel):
     zone_thresholds: dict | None = None
     denoise_min_len: int | None = None
@@ -1357,11 +1381,16 @@ def get_boll_pattern_matches(
         else:
             order_sql = "m.score DESC NULLS LAST, m.end_date DESC, m.code ASC"
 
-        # JOIN boll_patterns 以支持 period 过滤与展示
+        # JOIN boll_patterns 以支持 period 过滤与展示；收藏表标星
+        from backend.app.boll_pattern.favorites import ensure_favorite_table
+        ensure_favorite_table()
         join_sql = """
             FROM pattern_match_result m
             LEFT JOIN stocks s ON s.code = m.code
             LEFT JOIN boll_patterns bp ON bp.id = m.pattern_id
+            LEFT JOIN pattern_match_favorite f
+              ON f.code = m.code AND f.pattern_id = m.pattern_id
+             AND f.start_date = m.start_date AND f.end_date = m.end_date
         """
 
         cursor.execute(
@@ -1376,7 +1405,8 @@ def get_boll_pattern_matches(
                    COALESCE(bp.name, m.pattern_name) AS pattern_name,
                    COALESCE(bp.period, 'daily') AS period,
                    m.start_date, m.end_date, m.matched_states, m.score,
-                   m.edge_hits, m.scan_date, m.window_days, m.updated_at
+                   m.edge_hits, m.scan_date, m.window_days, m.updated_at,
+                   f.id AS favorite_id, COALESCE(f.note, '') AS favorite_note
             {join_sql}
             WHERE {where_sql}
             ORDER BY {order_sql}
@@ -1396,6 +1426,7 @@ def get_boll_pattern_matches(
                     edge_hits = []
             if edge_hits is None:
                 edge_hits = []
+            fav_id = r.get("favorite_id")
             items.append({
                 "id": r["id"],
                 "code": r["code"],
@@ -1411,6 +1442,9 @@ def get_boll_pattern_matches(
                 "scan_date": r["scan_date"].isoformat() if r["scan_date"] else None,
                 "window_days": r["window_days"],
                 "updated_at": isoformat_beijing(r.get("updated_at")),
+                "favorited": fav_id is not None,
+                "favorite_id": fav_id,
+                "favorite_note": r.get("favorite_note") or "",
             })
         return {
             "success": True,
@@ -1432,6 +1466,67 @@ def get_boll_pattern_matches(
         db.release(conn)
 
 
+@app.get("/api/boll-pattern-favorites")
+def get_boll_pattern_favorites(
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """收藏夹列表：按收藏时间倒序。"""
+    try:
+        from backend.app.boll_pattern.favorites import list_favorites
+        items, total = list_favorites(limit=limit, offset=offset)
+        return {
+            "success": True,
+            "data": {"items": items, "total": total, "limit": limit, "offset": offset},
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"查询布林收藏异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.post("/api/boll-pattern-favorites")
+def create_boll_pattern_favorite(payload: BollFavoriteCreatePayload):
+    """收藏一条扫描命中（快照）。"""
+    try:
+        from backend.app.boll_pattern.favorites import add_favorite
+        item = add_favorite(payload.model_dump())
+        return {"success": True, "data": item, "error": None, "message": "已收藏"}
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"收藏布林命中异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.patch("/api/boll-pattern-favorites/{favorite_id}")
+def patch_boll_pattern_favorite(favorite_id: int, payload: BollFavoriteNotePayload):
+    """更新收藏备注。"""
+    try:
+        from backend.app.boll_pattern.favorites import update_favorite_note
+        item = update_favorite_note(favorite_id, payload.note or "")
+        if not item:
+            return {"success": False, "data": None, "error": "收藏不存在"}
+        return {"success": True, "data": item, "error": None, "message": "备注已保存"}
+    except Exception as e:
+        logger.error(f"更新布林收藏备注异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.delete("/api/boll-pattern-favorites/{favorite_id}")
+def delete_boll_pattern_favorite(favorite_id: int):
+    """取消收藏。"""
+    try:
+        from backend.app.boll_pattern.favorites import delete_favorite
+        ok = delete_favorite(favorite_id)
+        if not ok:
+            return {"success": False, "data": None, "error": "收藏不存在"}
+        return {"success": True, "data": {"id": favorite_id}, "error": None, "message": "已取消收藏"}
+    except Exception as e:
+        logger.error(f"取消布林收藏异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
 @app.get("/api/stocks/{symbol}/bars")
 def get_stock_bars_with_boll(
     symbol: str = Path(..., description="股票代码 (如 sz000002)"),
@@ -1443,6 +1538,12 @@ def get_stock_bars_with_boll(
     lookback_days: int = Query(
         120, ge=30, le=500, description="兼容别名：等同 lookback_bars（当前周期根数，非日历日）"
     ),
+    forward_bars: int = Query(
+        0,
+        ge=0,
+        le=60,
+        description="在 end_date 之后再附带最多 N 根同周期 K（命中详情看后续走势；无更多数据则为 0）",
+    ),
 ):
     """
     返回个股 OHLCV + 布林三轨 + Chart Subpane（通达信 MACD/KDJ）。
@@ -1450,13 +1551,18 @@ def get_stock_bars_with_boll(
     """
     try:
         from backend.app.chart_subpane import apply_chart_subpanes
-        from backend.app.market_pipeline import COMPARE_LOOKBACK_DAYS, prepare_chart_bars
+        from backend.app.market_pipeline import (
+            COMPARE_LOOKBACK_DAYS,
+            prepare_chart_bars,
+            resolve_chart_forward_end,
+        )
 
         code = symbol.lower().strip()
         period_norm = (period or "daily").strip().lower()
         if period_norm not in ("daily", "weekly", "monthly"):
             return {"success": False, "data": None, "error": "period 须为 daily | weekly | monthly"}
         n_bars = int(lookback_bars if lookback_bars is not None else lookback_days)
+        n_forward_req = int(forward_bars or 0)
 
         if end_date:
             target = datetime.strptime(end_date, "%Y-%m-%d").date()
@@ -1467,13 +1573,26 @@ def get_stock_bars_with_boll(
             if not row or not row.get("d"):
                 return {"success": False, "data": None, "error": "该股票暂无行情数据"}
             target = row["d"] if isinstance(row["d"], date) else datetime.strptime(str(row["d"]), "%Y-%m-%d").date()
+            # 已是最新截止日时，forward 无意义
+            n_forward_req = 0
 
-        df_full = prepare_chart_bars(code, target, period=period_norm, lookback_bars=n_bars)
+        effective_end = target
+        actual_forward = 0
+        if n_forward_req > 0:
+            effective_end, actual_forward = resolve_chart_forward_end(
+                code,
+                target,
+                period=period_norm,  # type: ignore[arg-type]
+                forward_bars=n_forward_req,
+            )
+
+        n_display = n_bars + actual_forward
+        df_full = prepare_chart_bars(code, effective_end, period=period_norm, lookback_bars=n_display)
         if df_full.empty:
             return {"success": False, "data": None, "error": "行情数据不足"}
 
         df_full = apply_chart_subpanes(df_full)
-        df_out = df_full.tail(n_bars).copy().reset_index(drop=True)
+        df_out = df_full.tail(n_display).copy().reset_index(drop=True)
         if df_out.empty:
             return {"success": False, "data": None, "error": "行情数据不足"}
 
@@ -1482,9 +1601,11 @@ def get_stock_bars_with_boll(
             "success": True,
             "data": {
                 "code": code,
-                "end_date": target.isoformat(),
+                "end_date": effective_end.isoformat(),
+                "anchor_end_date": target.isoformat(),
                 "period": period_norm,
                 "lookback_bars": n_bars,
+                "forward_bars": actual_forward,
                 "bars": bars,
                 "calc_lookback_days": COMPARE_LOOKBACK_DAYS,
             },
@@ -1498,18 +1619,23 @@ def get_stock_bars_with_boll(
 @app.get("/api/stocks/{symbol}/boll-states")
 def get_stock_boll_states_api(
     symbol: str = Path(..., description="股票代码 (如 sz000002)"),
-    limit: int = Query(60, ge=1, le=500, description="返回最近多少个交易日状态"),
+    limit: int = Query(60, ge=1, le=500, description="返回最近多少根当前周期 K 的 zone"),
+    period: str = Query("daily", description="K 线周期：daily | weekly | monthly；日线读库，周/月现算"),
 ):
-    """单股 %B/zone 状态序列（验真用）。"""
+    """单股 %B/zone 状态序列（验真用）。边条件仍仅日线编排可配。"""
     try:
         from backend.app.boll_pattern.scanner import BollPatternScanner, get_stock_boll_states
+        period_norm = (period or "daily").strip().lower()
+        if period_norm not in ("daily", "weekly", "monthly"):
+            return {"success": False, "data": None, "error": "period 须为 daily | weekly | monthly"}
         BollPatternScanner().ensure_tables()
-        states = get_stock_boll_states(symbol, limit=limit)
+        states = get_stock_boll_states(symbol, limit=limit, period=period_norm)
         zones = "".join(s["zone"] for s in states)
         return {
             "success": True,
             "data": {
                 "code": symbol.lower().strip(),
+                "period": period_norm,
                 "states": states,
                 "state_string": zones,
             },

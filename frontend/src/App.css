@@ -14,7 +14,7 @@
   --color-secondary: #8b5cf6; /* 紫罗兰 */
   --color-gold: #f59e0b; /* 极品形态金色 */
   --color-success: #ef4444; /* A股经典红色：大涨 */
-  --color-danger: #10b981; /* A股经典绿色：大跌 */
+  --color-danger: #54ffff; /* 阴线绿 RGB(84,255,255) */
   --color-text-main: #e2e8f0;
   --color-text-muted: #94a3b8;
   
@@ -875,7 +875,7 @@ body {
 
 .terminal-dots .dot.red { background: #ef4444; }
 .terminal-dots .dot.yellow { background: #f59e0b; }
-.terminal-dots .dot.green { background: #10b981; }
+.terminal-dots .dot.green { background: #54ffff; }
 
 .terminal-title {
   font-size: 0.7rem;
@@ -994,58 +994,284 @@ body {
   transform: scale(0.96);
 }
 
-/* 个股走势 · 回看天数：显式 +/-，对齐表单高度 */
-.lookback-stepper__btn {
-  width: 2.2rem;
-  height: 2.35rem;
-  padding: 0;
-  border: 1px solid #60a5fa;
+/* 回看根数：与周期切换同风格的暗色分段控件 */
+.lookback-stepper {
+  display: inline-flex;
+  align-items: stretch;
+  height: 1.85rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
   border-radius: 6px;
-  background: linear-gradient(180deg, rgba(59, 130, 246, 0.55) 0%, rgba(37, 99, 235, 0.45) 100%);
-  color: #ffffff;
-  font-size: 1.2rem;
-  font-weight: 700;
+  overflow: hidden;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.lookback-stepper .lookback-stepper__btn {
+  appearance: none;
+  width: 1.7rem;
+  height: auto;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.95rem;
+  font-weight: 600;
   line-height: 1;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.2);
-  transition: background 0.15s, border-color 0.15s, opacity 0.15s, box-shadow 0.15s;
-}
-.lookback-stepper__btn:hover:not(:disabled) {
-  background: linear-gradient(180deg, rgba(96, 165, 250, 0.7) 0%, rgba(59, 130, 246, 0.6) 100%) !important;
-  border-color: #93c5fd !important;
-  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.28);
-}
-.lookback-stepper__btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
   box-shadow: none;
-}
-.form-group .lookback-stepper__input {
-  flex: 1;
-  min-width: 0;
-  text-align: center;
-  height: 2.35rem !important;
-  padding: 0.45rem 0.5rem !important;
-  font-size: 0.9rem !important;
-  font-variant-numeric: tabular-nums;
+  transition: background 0.15s, color 0.15s, opacity 0.15s;
 }
 
-.form-group .lookback-preset-select {
-  width: 4.6rem;
-  flex-shrink: 0;
-  height: 2.35rem;
-  padding: 0.35rem 0.35rem 0.35rem 0.45rem;
-  font-size: 0.85rem;
+.lookback-stepper .lookback-stepper__btn:hover:not(:disabled) {
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.45) !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+.lookback-stepper .lookback-stepper__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.lookback-stepper__input {
+  width: 2.75rem;
+  min-width: 0;
+  height: 100% !important;
+  margin: 0;
+  padding: 0 0.2rem !important;
+  border: none !important;
+  border-left: 1px solid rgba(148, 163, 184, 0.25) !important;
+  border-right: 1px solid rgba(148, 163, 184, 0.25) !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  color: #e2e8f0 !important;
+  text-align: center;
+  font-size: 0.78rem !important;
   font-variant-numeric: tabular-nums;
+  outline: none;
+  box-shadow: none !important;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.lookback-stepper__input::-webkit-outer-spin-button,
+.lookback-stepper__input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.lookback-stepper__input:focus {
+  background: rgba(59, 130, 246, 0.12) !important;
+}
+
+.lookback-stepper__input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.lookback-stepper__preset {
+  width: 3.35rem;
+  flex-shrink: 0;
+  height: 100%;
+  margin: 0;
+  padding: 0 0.15rem 0 0.3rem;
+  border: none;
+  border-left: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 0;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  outline: none;
+}
+
+.lookback-stepper__preset:hover:not(:disabled) {
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.35);
+}
+
+.lookback-stepper__preset:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.lookback-stepper__preset option {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+/* 表单区略增高，与截止日等控件对齐 */
+.form-group .lookback-stepper {
+  height: 2.35rem;
+  width: 100%;
+}
+
+.form-group .lookback-stepper .lookback-stepper__btn {
+  width: 2.1rem;
+  font-size: 1.05rem;
+}
+
+.form-group .lookback-stepper__input {
+  flex: 1;
+  width: auto;
+  font-size: 0.85rem !important;
+}
+
+.form-group .lookback-stepper__preset {
+  width: 4.2rem;
+  font-size: 0.8rem;
+}
+
+.boll-chart-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.boll-chart-toolbar__label {
+  font-size: 0.72rem;
+  color: #94a3b8;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+
+.boll-fav-star-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0.15rem;
+  margin: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.boll-fav-star-btn:hover:not(:disabled) {
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.boll-fav-star-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.boll-fav-action-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.55);
+  color: #94a3b8;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.boll-fav-action-btn:hover:not(:disabled) {
+  color: #e2e8f0;
+  border-color: rgba(251, 191, 36, 0.45);
+}
+
+.boll-fav-action-btn.is-on {
+  color: #fde68a;
+  border-color: rgba(251, 191, 36, 0.55);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.boll-fav-action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.boll-fav-note-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+  max-width: 28rem;
+}
+
+.boll-fav-note-input {
+  flex: 1;
+  min-width: 0;
+  height: 1.7rem;
+  padding: 0 0.55rem;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: rgba(15, 23, 42, 0.65);
+  color: #e2e8f0;
+  font-size: 0.75rem;
+  outline: none;
+}
+
+.boll-fav-note-input:focus {
+  border-color: rgba(59, 130, 246, 0.55);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+}
+
+.boll-fav-note-save {
+  appearance: none;
+  flex-shrink: 0;
+  height: 1.7rem;
+  padding: 0 0.65rem;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: rgba(51, 65, 85, 0.45);
+  color: #cbd5e1;
+  font-size: 0.72rem;
+  font-weight: 600;
   cursor: pointer;
 }
 
-.form-group .lookback-preset-select:disabled {
-  opacity: 0.5;
+.boll-fav-note-save:hover:not(:disabled) {
+  color: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.5);
+}
+
+.boll-fav-note-save:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 日期字段旁日历按钮：暗色描边，非厚蓝块 */
+.date-picker-field__btn {
+  width: 2.35rem;
+  height: 2.35rem;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.55);
+  color: #94a3b8;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.date-picker-field__btn:hover:not(:disabled) {
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.45);
+  border-color: rgba(148, 163, 184, 0.5);
+}
+
+.date-picker-field__btn:disabled {
+  opacity: 0.45;
   cursor: not-allowed;
 }
 

@@ -171,6 +171,8 @@ class BollPatternScanner:
             cur.execute(ENSURE_TABLES_SQL)
             _ensure_edge_hits_column(cur)
             conn.commit()
+        from backend.app.boll_pattern.favorites import ensure_favorite_table
+        ensure_favorite_table()
         seed_from_yaml(self.yaml_path)
         self.reload_config(self.scan_period)
 
@@ -824,28 +826,73 @@ def recent_bar_end_dates(period: str, n: int) -> list[date]:
     return ends
 
 
-def get_stock_boll_states(code: str, limit: int = 60) -> list[dict]:
-    """查询单股最近状态（验真 API 用）。"""
+def get_stock_boll_states(
+    code: str,
+    limit: int = 60,
+    period: str = "daily",
+) -> list[dict]:
+    """
+    查询单股最近 zone（验真 API）。
+    日线读 stock_state_daily；周/月按全局尺子现算，不落库。
+    """
     code = code.lower().strip()
+    period = normalize_bar_period(period)
+    limit = max(1, min(int(limit), 500))
+
+    if period == "daily":
+        with db.db_cursor(dict_cursor=True) as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT date, pct_b, zone
+                FROM stock_state_daily
+                WHERE code = %s
+                ORDER BY date DESC
+                LIMIT %s;
+                """,
+                (code, limit),
+            )
+            rows = cursor.fetchall()
+        out = []
+        for r in reversed(list(rows)):
+            pct = r["pct_b"]
+            out.append({
+                "date": r["date"].isoformat() if hasattr(r["date"], "isoformat") else str(r["date"]),
+                "pct_b": float(pct) if pct is not None else None,
+                "zone": r["zone"],
+            })
+        return out
+
     with db.db_cursor(dict_cursor=True) as (conn, cursor):
-        cursor.execute(
-            """
-            SELECT date, pct_b, zone
-            FROM stock_state_daily
-            WHERE code = %s
-            ORDER BY date DESC
-            LIMIT %s;
-            """,
-            (code, limit),
-        )
-        rows = cursor.fetchall()
-    out = []
-    for r in reversed(list(rows)):
-        pct = r["pct_b"]
+        cursor.execute("SELECT MAX(date) AS d FROM daily_bars WHERE code = %s;", (code,))
+        row = cursor.fetchone()
+    if not row or not row.get("d"):
+        return []
+    end = row["d"]
+    if not isinstance(end, date):
+        end = datetime.strptime(str(end), "%Y-%m-%d").date()
+
+    df_full = prepare_chart_bars(
+        code,
+        end,
+        period=period,  # type: ignore[arg-type]
+        lookback_bars=limit,
+    )
+    if df_full.empty or "pct_b" not in df_full.columns:
+        return []
+    df = df_full.tail(limit).copy().reset_index(drop=True)
+    if df.empty:
+        return []
+
+    thresholds = get_settings()["zone_thresholds"]
+    zones = zones_from_series(df["pct_b"], thresholds)
+    out: list[dict] = []
+    for idx in range(len(df)):
+        pct = df["pct_b"].iloc[idx]
+        d = df["date"].iloc[idx]
         out.append({
-            "date": r["date"].isoformat() if hasattr(r["date"], "isoformat") else str(r["date"]),
-            "pct_b": float(pct) if pct is not None else None,
-            "zone": r["zone"],
+            "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+            "pct_b": float(pct) if pct is not None and not pd.isna(pct) else None,
+            "zone": zones[idx],
         })
     return out
 
