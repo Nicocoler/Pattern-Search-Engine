@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS pattern_match_favorite (
     matched_states TEXT NOT NULL,
     score NUMERIC(10, 4),
     edge_hits JSONB NOT NULL DEFAULT '[]'::jsonb,
+    indicator_hits JSONB NOT NULL DEFAULT '[]'::jsonb,
     scan_date DATE,
     window_days INT,
     source_match_id BIGINT,
@@ -40,10 +41,16 @@ CREATE INDEX IF NOT EXISTS idx_pattern_match_favorite_at
 def ensure_favorite_table() -> None:
     with db.db_cursor(dict_cursor=False) as (conn, cur):
         cur.execute(ENSURE_FAVORITE_TABLE_SQL)
+        cur.execute(
+            """
+            ALTER TABLE pattern_match_favorite
+            ADD COLUMN IF NOT EXISTS indicator_hits JSONB NOT NULL DEFAULT '[]'::jsonb;
+            """
+        )
         conn.commit()
 
 
-def _parse_edge_hits(raw: Any) -> list:
+def _parse_json_list(raw: Any) -> list:
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -52,6 +59,10 @@ def _parse_edge_hits(raw: Any) -> list:
     if raw is None:
         return []
     return list(raw) if isinstance(raw, (list, tuple)) else []
+
+
+def _parse_edge_hits(raw: Any) -> list:
+    return _parse_json_list(raw)
 
 
 def _row_to_item(r: dict) -> dict:
@@ -67,6 +78,7 @@ def _row_to_item(r: dict) -> dict:
         "matched_states": r.get("matched_states") or "",
         "score": float(r["score"]) if r.get("score") is not None else None,
         "edge_hits": _parse_edge_hits(r.get("edge_hits")),
+        "indicator_hits": _parse_json_list(r.get("indicator_hits")),
         "scan_date": r["scan_date"].isoformat() if r.get("scan_date") else None,
         "window_days": r.get("window_days"),
         "source_match_id": r.get("source_match_id"),
@@ -89,7 +101,7 @@ def list_favorites(*, limit: int = 200, offset: int = 0) -> tuple[list[dict], in
             """
             SELECT id, code, name, pattern_id, pattern_name, period,
                    start_date, end_date, matched_states, score, edge_hits,
-                   scan_date, window_days, source_match_id, note,
+                   indicator_hits, scan_date, window_days, source_match_id, note,
                    favorited_at, updated_at
             FROM pattern_match_favorite
             ORDER BY favorited_at DESC, id DESC
@@ -116,6 +128,7 @@ def add_favorite(payload: dict) -> dict:
         period = "daily"
 
     edge_hits = payload.get("edge_hits") or []
+    indicator_hits = payload.get("indicator_hits") or []
     note = payload.get("note")
     score = payload.get("score")
 
@@ -125,12 +138,12 @@ def add_favorite(payload: dict) -> dict:
             INSERT INTO pattern_match_favorite (
                 code, name, pattern_id, pattern_name, period,
                 start_date, end_date, matched_states, score, edge_hits,
-                scan_date, window_days, source_match_id, note,
+                indicator_hits, scan_date, window_days, source_match_id, note,
                 favorited_at, updated_at
             ) VALUES (
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s, %s, %s, COALESCE(%s, ''),
+                %s, %s, %s, %s, COALESCE(%s, ''),
                 NOW(), NOW()
             )
             ON CONFLICT (code, pattern_id, start_date, end_date) DO UPDATE SET
@@ -140,6 +153,7 @@ def add_favorite(payload: dict) -> dict:
                 matched_states = EXCLUDED.matched_states,
                 score = EXCLUDED.score,
                 edge_hits = EXCLUDED.edge_hits,
+                indicator_hits = EXCLUDED.indicator_hits,
                 scan_date = EXCLUDED.scan_date,
                 window_days = EXCLUDED.window_days,
                 source_match_id = EXCLUDED.source_match_id,
@@ -151,7 +165,7 @@ def add_favorite(payload: dict) -> dict:
                 updated_at = NOW()
             RETURNING id, code, name, pattern_id, pattern_name, period,
                       start_date, end_date, matched_states, score, edge_hits,
-                      scan_date, window_days, source_match_id, note,
+                      indicator_hits, scan_date, window_days, source_match_id, note,
                       favorited_at, updated_at;
             """,
             (
@@ -165,6 +179,7 @@ def add_favorite(payload: dict) -> dict:
                 str(payload.get("matched_states") or ""),
                 float(score) if score is not None else None,
                 Json(edge_hits),
+                Json(indicator_hits),
                 payload.get("scan_date"),
                 payload.get("window_days"),
                 payload.get("source_match_id") or payload.get("id"),
@@ -215,7 +230,7 @@ def update_favorite_note(favorite_id: int, note: str) -> dict | None:
             WHERE id = %s
             RETURNING id, code, name, pattern_id, pattern_name, period,
                       start_date, end_date, matched_states, score, edge_hits,
-                      scan_date, window_days, source_match_id, note,
+                      indicator_hits, scan_date, window_days, source_match_id, note,
                       favorited_at, updated_at;
             """,
             (note if note is not None else "", int(favorite_id)),

@@ -13,6 +13,10 @@ from typing import Any
 from psycopg2.extras import Json
 
 from backend.app.boll_pattern.edges import normalize_edges, validate_pattern_edges
+from backend.app.boll_pattern.indicators import (
+    normalize_indicators,
+    validate_pattern_indicators,
+)
 from backend.app.boll_pattern.loader import (
     load_boll_patterns,
     normalize_zone_thresholds,
@@ -41,6 +45,7 @@ CREATE TABLE IF NOT EXISTS boll_patterns (
     zone_thresholds JSONB,
     denoise_min_len INT,
     edges JSONB NOT NULL DEFAULT '[]'::jsonb,
+    indicators JSONB NOT NULL DEFAULT '[]'::jsonb,
     period VARCHAR(16) NOT NULL DEFAULT 'daily',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -65,6 +70,12 @@ def ensure_pattern_tables() -> None:
             """
             ALTER TABLE boll_patterns
             ADD COLUMN IF NOT EXISTS edges JSONB NOT NULL DEFAULT '[]'::jsonb;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE boll_patterns
+            ADD COLUMN IF NOT EXISTS indicators JSONB NOT NULL DEFAULT '[]'::jsonb;
             """
         )
         cur.execute(
@@ -99,6 +110,14 @@ def _row_edges(raw: Any) -> list[dict[str, str]]:
         return []
 
 
+def _row_indicators(raw: Any) -> list[dict[str, Any]]:
+    """读路径轻量规范化；非法则 []。"""
+    try:
+        return normalize_indicators(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
 def _pattern_from_row(row: dict) -> dict[str, Any]:
     zt = row.get("zone_thresholds")
     try:
@@ -117,6 +136,7 @@ def _pattern_from_row(row: dict) -> dict[str, Any]:
             int(row["denoise_min_len"]) if row.get("denoise_min_len") is not None else None
         ),
         "edges": _row_edges(row.get("edges")),
+        "indicators": _row_indicators(row.get("indicators")),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -192,7 +212,8 @@ def list_patterns(include_disabled: bool = True) -> list[dict[str, Any]]:
     ensure_pattern_tables()
     sql = """
         SELECT id, name, regex, min_total_days, enabled, period,
-               zone_thresholds, denoise_min_len, edges, created_at, updated_at
+               zone_thresholds, denoise_min_len, edges, indicators,
+               created_at, updated_at
         FROM boll_patterns
     """
     if not include_disabled:
@@ -210,7 +231,8 @@ def get_pattern(pattern_id: str) -> dict[str, Any] | None:
         cur.execute(
             """
             SELECT id, name, regex, min_total_days, enabled, period,
-                   zone_thresholds, denoise_min_len, edges, created_at, updated_at
+                   zone_thresholds, denoise_min_len, edges, indicators,
+                   created_at, updated_at
             FROM boll_patterns WHERE id = %s;
             """,
             (pattern_id,),
@@ -247,6 +269,7 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
     validate_regex(regex)
     period = normalize_bar_period(payload.get("period"), default="daily")
     edges = _validate_edges_for_period(period, regex, payload.get("edges"))
+    indicators = validate_pattern_indicators(payload.get("indicators"))
     min_days = int(payload.get("min_total_days") or 0)
     enabled = bool(payload.get("enabled", True))
     zt_raw = payload.get("zone_thresholds")
@@ -259,8 +282,9 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO boll_patterns (
                 id, name, regex, min_total_days, enabled, period,
-                zone_thresholds, denoise_min_len, edges, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
+                zone_thresholds, denoise_min_len, edges, indicators,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
             """,
             (
                 pid,
@@ -272,6 +296,7 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
                 Json(thresholds_to_jsonable(zt)) if zt is not None else None,
                 dnl_val,
                 Json(edges),
+                Json(indicators),
             ),
         )
         conn.commit()
@@ -299,6 +324,10 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     else:
         # regex 变更时仍须与既有 edges 交叉校验
         edges = _validate_edges_for_period(period, regex, existing.get("edges") or [])
+    if "indicators" in payload:
+        indicators = validate_pattern_indicators(payload.get("indicators"))
+    else:
+        indicators = validate_pattern_indicators(existing.get("indicators") or [])
     min_days = (
         int(payload["min_total_days"])
         if "min_total_days" in payload
@@ -329,6 +358,7 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 zone_thresholds = %s,
                 denoise_min_len = %s,
                 edges = %s,
+                indicators = %s,
                 updated_at = NOW()
             WHERE id = %s;
             """,
@@ -340,6 +370,7 @@ def update_pattern(pattern_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 Json(thresholds_to_jsonable(zt)) if zt is not None else None,
                 dnl_val,
                 Json(edges),
+                Json(indicators),
                 pattern_id,
             ),
         )
@@ -422,6 +453,7 @@ def effective_config(pattern: dict[str, Any], settings: dict[str, Any] | None = 
         "zone_thresholds": zt,
         "denoise_min_len": dnl,
         "edges": list(pattern.get("edges") or []),
+        "indicators": list(pattern.get("indicators") or []),
     }
 
 
@@ -457,6 +489,7 @@ def serialize_pattern_for_api(pattern: dict[str, Any], settings: dict[str, Any] 
         ),
         "denoise_min_len": pattern.get("denoise_min_len"),
         "edges": list(pattern.get("edges") or []),
+        "indicators": list(pattern.get("indicators") or []),
         "effective": {
             "zone_thresholds": thresholds_to_jsonable(eff["zone_thresholds"]),
             "denoise_min_len": eff["denoise_min_len"],

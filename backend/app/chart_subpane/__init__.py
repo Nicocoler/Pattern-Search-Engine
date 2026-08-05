@@ -3,6 +3,7 @@
 Chart Subpane：通达信 MACD / KDJ 纯函数。
 
 不进入 Indicator Engine / Market Pipeline / technical_indicators（ADR 0003）。
+编排扫描可复用 apply_kdj 作硬过滤（ADR 0007），仍不落库。
 公式权威见 docs/research-tdx-macd-kdj.md。
 """
 

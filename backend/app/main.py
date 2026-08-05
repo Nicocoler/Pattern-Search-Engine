@@ -172,6 +172,10 @@ class BollPatternPreviewPayload(BaseModel):
         default=None,
         description="可选转移边条件，如 [{from:L,to:M,when:limit_up}]；空/省略=不启用；仅日线",
     )
+    indicators: list[dict] | None = Field(
+        default=None,
+        description="可选指标硬过滤，如 [{type:kdj_golden_cross},{type:j_above_kd,max_breach_bars:1}]；空/省略=不启用",
+    )
 
 class BollPatternCreatePayload(BaseModel):
     id: str = Field(..., description="编排唯一 id，创建后不可改")
@@ -183,6 +187,10 @@ class BollPatternCreatePayload(BaseModel):
     zone_thresholds: dict | None = Field(default=None, description="稀疏覆盖；null 用全局")
     denoise_min_len: int | None = Field(default=None, description="稀疏覆盖；null 用全局")
     edges: list[dict] | None = Field(default=None, description="转移边条件；null/[]=无；仅日线可配")
+    indicators: list[dict] | None = Field(
+        default=None,
+        description="指标硬过滤；null/[]=无；日/周/月均可",
+    )
 
 class BollPatternUpdatePayload(BaseModel):
     name: str | None = None
@@ -201,6 +209,10 @@ class BollPatternUpdatePayload(BaseModel):
         default=None,
         description="传入则整体替换；省略则保留原 edges（仍会与新 regex 交叉校验）",
     )
+    indicators: list[dict] | None = Field(
+        default=None,
+        description="传入则整体替换；省略则保留原 indicators",
+    )
     clear_zone_override: bool = Field(default=False, description="为 true 时清空 zone 覆盖")
     clear_denoise_override: bool = Field(default=False, description="为 true 时清空 denoise 覆盖")
 
@@ -217,6 +229,7 @@ class BollFavoriteCreatePayload(BaseModel):
     matched_states: str = ""
     score: float | None = None
     edge_hits: list | None = None
+    indicator_hits: list | None = None
     scan_date: str | None = None
     window_days: int | None = None
     source_match_id: int | None = None
@@ -1101,6 +1114,7 @@ def preview_boll_pattern(payload: BollPatternPreviewPayload):
             "zone_thresholds": zt,
             "denoise_min_len": int(payload.denoise_min_len or 0),
             "edges": payload.edges or [],
+            "indicators": payload.indicators or [],
         }
         data = BollPatternScanner().preview_one(
             code,
@@ -1405,7 +1419,7 @@ def get_boll_pattern_matches(
                    COALESCE(bp.name, m.pattern_name) AS pattern_name,
                    COALESCE(bp.period, 'daily') AS period,
                    m.start_date, m.end_date, m.matched_states, m.score,
-                   m.edge_hits, m.scan_date, m.window_days, m.updated_at,
+                   m.edge_hits, m.indicator_hits, m.scan_date, m.window_days, m.updated_at,
                    f.id AS favorite_id, COALESCE(f.note, '') AS favorite_note
             {join_sql}
             WHERE {where_sql}
@@ -1426,6 +1440,15 @@ def get_boll_pattern_matches(
                     edge_hits = []
             if edge_hits is None:
                 edge_hits = []
+            indicator_hits = r.get("indicator_hits")
+            if isinstance(indicator_hits, str):
+                import json as _json
+                try:
+                    indicator_hits = _json.loads(indicator_hits)
+                except Exception:
+                    indicator_hits = []
+            if indicator_hits is None:
+                indicator_hits = []
             fav_id = r.get("favorite_id")
             items.append({
                 "id": r["id"],
@@ -1439,6 +1462,7 @@ def get_boll_pattern_matches(
                 "matched_states": r["matched_states"],
                 "score": float(r["score"]) if r["score"] is not None else None,
                 "edge_hits": edge_hits,
+                "indicator_hits": indicator_hits,
                 "scan_date": r["scan_date"].isoformat() if r["scan_date"] else None,
                 "window_days": r["window_days"],
                 "updated_at": isoformat_beijing(r.get("updated_at")),

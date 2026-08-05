@@ -93,6 +93,20 @@ interface BollEdgeHit {
   idx?: number;
 }
 
+interface BollIndicatorHit {
+  type: string;
+  date?: string;
+  idx?: number;
+  max_breach_bars?: number;
+  breach_count?: number;
+  breach_dates?: string[];
+}
+
+interface BollPatternIndicator {
+  type: 'kdj_golden_cross' | 'j_above_kd' | string;
+  max_breach_bars?: number;
+}
+
 /** 看盘 / 编排共用 K 线周期（ADR 0005 / 0006） */
 type ChartPeriod = 'daily' | 'weekly' | 'monthly';
 
@@ -114,6 +128,7 @@ interface BollPatternMatch {
   matched_states: string;
   score: number | null;
   edge_hits?: BollEdgeHit[];
+  indicator_hits?: BollIndicatorHit[];
   scan_date: string | null;
   window_days: number;
   favorited?: boolean;
@@ -134,6 +149,7 @@ interface BollPatternFavorite {
   matched_states: string;
   score: number | null;
   edge_hits?: BollEdgeHit[];
+  indicator_hits?: BollIndicatorHit[];
   scan_date: string | null;
   window_days: number | null;
   source_match_id?: number | null;
@@ -151,6 +167,7 @@ interface BollPatternMeta {
   zone_thresholds?: Record<string, [string | number, string | number]> | null;
   denoise_min_len?: number | null;
   edges?: BollPatternEdge[];
+  indicators?: BollPatternIndicator[];
   effective?: {
     zone_thresholds: Record<string, [string | number, string | number]>;
     denoise_min_len: number;
@@ -768,6 +785,7 @@ export default function App() {
     bounds: { m: 0.35, h: 0.65, u: 0.95 },
     denoise: 0,
     edges: [] as BollPatternEdge[],
+    indicators: [] as BollPatternIndicator[],
   });
   const [bollGlobalDenoise, setBollGlobalDenoise] = useState(0);
   const [bollGlobalBounds, setBollGlobalBounds] = useState({ m: 0.35, h: 0.65, u: 0.95 });
@@ -1070,6 +1088,7 @@ export default function App() {
       bounds: { ...bollGlobalBounds },
       denoise: bollGlobalDenoise,
       edges: [],
+      indicators: [],
     });
     setBollShowManage(true);
     setBollFormBoundsInvalid(false);
@@ -1093,6 +1112,7 @@ export default function App() {
         ? Number(p.denoise_min_len)
         : Number(p.effective?.denoise_min_len ?? bollGlobalDenoise),
       edges: Array.isArray(p.edges) ? p.edges.map(e => ({ ...e })) : [],
+      indicators: Array.isArray(p.indicators) ? p.indicators.map(ind => ({ ...ind })) : [],
     });
     setBollShowManage(true);
     setBollFormBoundsInvalid(false);
@@ -1119,6 +1139,7 @@ export default function App() {
           min_total_days: bollForm.min_total_days,
           enabled: bollForm.enabled,
           edges: bollForm.period === 'daily' ? bollForm.edges : [],
+          indicators: bollForm.indicators,
           clear_zone_override: !bollForm.override_zone,
           clear_denoise_override: !bollForm.override_denoise,
         };
@@ -1154,6 +1175,7 @@ export default function App() {
             zone_thresholds: zonePayload,
             denoise_min_len: denoisePayload,
             edges: bollForm.period === 'daily' ? bollForm.edges : [],
+            indicators: bollForm.indicators,
           }),
         });
         const json = await res.json();
@@ -1251,6 +1273,7 @@ export default function App() {
     matched_states: f.matched_states,
     score: f.score,
     edge_hits: f.edge_hits || [],
+    indicator_hits: f.indicator_hits || [],
     scan_date: f.scan_date,
     window_days: f.window_days ?? 0,
     favorited: true,
@@ -1391,6 +1414,7 @@ export default function App() {
             matched_states: m.matched_states,
             score: m.score,
             edge_hits: m.edge_hits || [],
+            indicator_hits: m.indicator_hits || [],
             scan_date: m.scan_date,
             window_days: m.window_days,
             source_match_id: m.id,
@@ -1680,6 +1704,7 @@ export default function App() {
         zone_thresholds,
         denoise_min_len,
         edges: bollForm.period === 'daily' ? bollForm.edges : [],
+        indicators: bollForm.indicators,
       };
       if (bollTryAsOf.trim()) body.as_of = bollTryAsOf.trim();
 
@@ -1709,6 +1734,7 @@ export default function App() {
         matched_states: string;
         score: number | null;
         edge_hits?: BollEdgeHit[];
+        indicator_hits?: BollIndicatorHit[];
       }, i: number) => ({
         id: -(i + 1),
         code: data.code || code,
@@ -1720,6 +1746,7 @@ export default function App() {
         matched_states: m.matched_states,
         score: m.score,
         edge_hits: m.edge_hits || [],
+        indicator_hits: m.indicator_hits || [],
         scan_date: asOf || null,
         window_days: data.window_days ?? bollWindowDays,
       }));
@@ -4846,6 +4873,26 @@ export default function App() {
                           </div>
                         </div>
                       ) : null}
+                      {selectedBollMatch?.indicator_hits && selectedBollMatch.indicator_hits.length > 0 ? (
+                        <div style={{ marginBottom: '0.45rem' }}>
+                          <b style={{ color: '#93c5fd' }}>指标条件命中</b>
+                          <div style={{ fontFamily: 'monospace', marginTop: '0.2rem', lineHeight: 1.5 }}>
+                            {selectedBollMatch.indicator_hits.map((h, i) => (
+                              <div key={`${h.type}-${i}`}>
+                                {h.type === 'kdj_golden_cross'
+                                  ? `金叉 · ${h.date || '?'}`
+                                  : h.type === 'j_above_kd'
+                                    ? `J领先 · 违约${h.breach_count ?? 0}/${h.max_breach_bars ?? '?'}根${
+                                        h.breach_dates && h.breach_dates.length
+                                          ? `（${h.breach_dates.join(', ')}）`
+                                          : ''
+                                      }`
+                                    : `${h.type}`}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
                       {bollStateString && (
                         <div>
                           <b style={{ color: '#cbd5e1' }}>
@@ -5075,6 +5122,76 @@ export default function App() {
                         周/月编排不支持边条件（ADR 0006）
                       </p>
                     )}
+                    <div className="form-group">
+                      <label>指标条件（可选，KDJ）</label>
+                      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0 0 0.45rem', lineHeight: 1.45 }}>
+                        硬过滤：与 zone 正则（及边条件）AND。作用在整段命中区间；参数固定 (9,3,3)。日/周/月均可。
+                      </p>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.35rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={bollForm.indicators.some(i => i.type === 'kdj_golden_cross')}
+                          onChange={e => {
+                            const on = e.target.checked;
+                            setBollForm(f => {
+                              const rest = f.indicators.filter(i => i.type !== 'kdj_golden_cross');
+                              return {
+                                ...f,
+                                indicators: on
+                                  ? [...rest, { type: 'kdj_golden_cross' }]
+                                  : rest,
+                              };
+                            });
+                          }}
+                        />
+                        区间内出现 KDJ 金叉（K 上穿 D）
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.35rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={bollForm.indicators.some(i => i.type === 'j_above_kd')}
+                          onChange={e => {
+                            const on = e.target.checked;
+                            setBollForm(f => {
+                              const rest = f.indicators.filter(i => i.type !== 'j_above_kd');
+                              if (!on) return { ...f, indicators: rest };
+                              const prev = f.indicators.find(i => i.type === 'j_above_kd');
+                              return {
+                                ...f,
+                                indicators: [
+                                  ...rest,
+                                  {
+                                    type: 'j_above_kd',
+                                    max_breach_bars: prev?.max_breach_bars ?? 1,
+                                  },
+                                ],
+                              };
+                            });
+                          }}
+                        />
+                        区间内 J ≥ K 且 J ≥ D（允许少量违约）
+                      </label>
+                      {bollForm.indicators.some(i => i.type === 'j_above_kd') ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginLeft: '1.4rem', marginBottom: '0.35rem' }}>
+                          <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>max_breach_bars</span>
+                          <IntStepper
+                            min={0}
+                            value={
+                              bollForm.indicators.find(i => i.type === 'j_above_kd')?.max_breach_bars ?? 1
+                            }
+                            onChange={n => setBollForm(f => ({
+                              ...f,
+                              indicators: f.indicators.map(ind =>
+                                ind.type === 'j_above_kd'
+                                  ? { ...ind, max_breach_bars: n }
+                                  : ind,
+                              ),
+                            }))}
+                            title="最多允许违约根数"
+                          />
+                        </div>
+                      ) : null}
+                    </div>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.6rem' }}>
                       <input type="checkbox" checked={bollForm.enabled} onChange={e => setBollForm(f => ({ ...f, enabled: e.target.checked }))} />
                       启用（参与扫描）

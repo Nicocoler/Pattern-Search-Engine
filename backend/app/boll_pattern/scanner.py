@@ -16,6 +16,10 @@ import pandas as pd
 from psycopg2.extras import Json, execute_values
 
 from backend.app.boll_pattern.edges import apply_edge_filter_to_matches, validate_pattern_edges
+from backend.app.boll_pattern.indicators import (
+    apply_indicator_filter_to_matches,
+    validate_pattern_indicators,
+)
 from backend.app.boll_pattern.loader import normalize_zone_thresholds
 from backend.app.boll_pattern.matcher import find_patterns_with_dates
 from backend.app.boll_pattern.repository import (
@@ -27,6 +31,7 @@ from backend.app.boll_pattern.repository import (
 )
 from backend.app.boll_pattern.scoring import score_match_from_window
 from backend.app.boll_pattern.zone import apply_denoise_to_states, state_string, zones_from_series
+from backend.app.chart_subpane import apply_kdj
 from backend.app.core import db
 from backend.app.core.timeutil import today_beijing
 from backend.app.market_pipeline import (
@@ -127,6 +132,7 @@ CREATE TABLE IF NOT EXISTS pattern_match_result (
     matched_states TEXT NOT NULL,
     score NUMERIC(10, 4),
     edge_hits JSONB NOT NULL DEFAULT '[]'::jsonb,
+    indicator_hits JSONB NOT NULL DEFAULT '[]'::jsonb,
     scan_date DATE NOT NULL,
     window_days INT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -143,6 +149,15 @@ def _ensure_edge_hits_column(cur) -> None:
         """
         ALTER TABLE pattern_match_result
         ADD COLUMN IF NOT EXISTS edge_hits JSONB NOT NULL DEFAULT '[]'::jsonb;
+        """
+    )
+
+
+def _ensure_indicator_hits_column(cur) -> None:
+    cur.execute(
+        """
+        ALTER TABLE pattern_match_result
+        ADD COLUMN IF NOT EXISTS indicator_hits JSONB NOT NULL DEFAULT '[]'::jsonb;
         """
     )
 
@@ -170,6 +185,7 @@ class BollPatternScanner:
         with db.db_cursor(dict_cursor=False) as (conn, cur):
             cur.execute(ENSURE_TABLES_SQL)
             _ensure_edge_hits_column(cur)
+            _ensure_indicator_hits_column(cur)
             conn.commit()
         from backend.app.boll_pattern.favorites import ensure_favorite_table
         ensure_favorite_table()
@@ -361,6 +377,7 @@ class BollPatternScanner:
         for m in matches:
             score = m.get("score")
             edge_hits = m.get("edge_hits") or []
+            indicator_hits = m.get("indicator_hits") or []
             rows.append((
                 code,
                 m["pattern_id"],
@@ -370,13 +387,15 @@ class BollPatternScanner:
                 m["matched_states"],
                 float(score) if score is not None else None,
                 Json(edge_hits),
+                Json(indicator_hits),
                 scan_date,
                 window_days,
             ))
         sql = """
             INSERT INTO pattern_match_result (
                 code, pattern_id, pattern_name, start_date, end_date,
-                matched_states, score, edge_hits, scan_date, window_days, created_at, updated_at
+                matched_states, score, edge_hits, indicator_hits,
+                scan_date, window_days, created_at, updated_at
             )
             VALUES %s
             ON CONFLICT (code, pattern_id, start_date, end_date) DO UPDATE SET
@@ -384,6 +403,7 @@ class BollPatternScanner:
                 matched_states = EXCLUDED.matched_states,
                 score = EXCLUDED.score,
                 edge_hits = EXCLUDED.edge_hits,
+                indicator_hits = EXCLUDED.indicator_hits,
                 scan_date = EXCLUDED.scan_date,
                 window_days = EXCLUDED.window_days,
                 updated_at = NOW();
@@ -393,7 +413,7 @@ class BollPatternScanner:
                 cur,
                 sql,
                 rows,
-                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
                 page_size=200,
             )
             conn.commit()
@@ -420,12 +440,19 @@ class BollPatternScanner:
             state_df = self.build_state_frame(df_full)
             n_states = self.upsert_states(code, state_df)
 
+        need_kdj = any(bool(p.get("indicators")) for p in self.enabled_patterns)
+        if need_kdj:
+            apply_kdj(df_full)
+
         win = df_full.tail(int(window_days)).copy().reset_index(drop=True)
         if win.empty:
             return {"code": code, "states": n_states, "matches": 0, "skipped": False}
 
         dates = list(win["date"].tolist())
         closes = [float(x) for x in win["close"].tolist()]
+        ks = list(win["k"].tolist()) if "k" in win.columns else []
+        ds = list(win["d"].tolist()) if "d" in win.columns else []
+        js = list(win["j"].tolist()) if "j" in win.columns else []
         pct_series = win["pct_b"]
         all_matches: list[dict] = []
 
@@ -446,6 +473,25 @@ class BollPatternScanner:
                     dates=dates,
                     edges=edges,
                 )
+            else:
+                for m in hits:
+                    m.setdefault("edge_hits", [])
+            indicators = pat.get("indicators") or []
+            if indicators:
+                if not ks or len(ks) != len(dates):
+                    hits = []
+                else:
+                    hits = apply_indicator_filter_to_matches(
+                        hits,
+                        ks=ks,
+                        ds=ds,
+                        js=js,
+                        dates=dates,
+                        indicators=indicators,
+                    )
+            else:
+                for m in hits:
+                    m.setdefault("indicator_hits", [])
             win_for_score = win.copy()
             win_for_score["zone"] = match_zones
             for m in hits:
@@ -485,6 +531,7 @@ class BollPatternScanner:
         edges_raw = pattern.get("edges")
         if period_n != "daily" and edges_raw:
             raise ValueError("周/月编排试跑禁止 edges（ADR 0006）")
+        indicators = validate_pattern_indicators(pattern.get("indicators"))
 
         end = self.resolve_scan_date(as_of)
         df_full = self.prepare_pattern_frame(
@@ -507,9 +554,15 @@ class BollPatternScanner:
                 "message": "行情数据不足，无法试跑",
             }
 
+        if indicators:
+            apply_kdj(df_full)
+
         win = df_full.tail(int(window_days)).copy().reset_index(drop=True)
         dates = list(win["date"].tolist())
         closes = [float(x) for x in win["close"].tolist()]
+        ks = list(win["k"].tolist()) if "k" in win.columns else []
+        ds = list(win["d"].tolist()) if "d" in win.columns else []
+        js = list(win["j"].tolist()) if "j" in win.columns else []
         zt = normalize_zone_thresholds(pattern.get("zone_thresholds"))
         dnl = int(pattern.get("denoise_min_len") or 0)
         edges = validate_pattern_edges(regex, edges_raw) if period_n == "daily" else []
@@ -522,6 +575,7 @@ class BollPatternScanner:
             "zone_thresholds": zt,
             "denoise_min_len": dnl,
             "edges": edges,
+            "indicators": indicators,
         }
         raw_zones = zones_from_series(win["pct_b"], zt)
         match_zones = apply_denoise_to_states(raw_zones, dnl)
@@ -536,6 +590,24 @@ class BollPatternScanner:
                 dates=dates,
                 edges=edges,
             )
+        else:
+            for m in hits:
+                m.setdefault("edge_hits", [])
+        if indicators:
+            if not ks or len(ks) != len(dates):
+                hits = []
+            else:
+                hits = apply_indicator_filter_to_matches(
+                    hits,
+                    ks=ks,
+                    ds=ds,
+                    js=js,
+                    dates=dates,
+                    indicators=indicators,
+                )
+        else:
+            for m in hits:
+                m.setdefault("indicator_hits", [])
         win_for_score = win.copy()
         win_for_score["zone"] = match_zones
         out_matches: list[dict[str, Any]] = []
@@ -560,6 +632,7 @@ class BollPatternScanner:
                 "start_idx": int(m["start_idx"]),
                 "end_idx": int(m["end_idx"]),
                 "edge_hits": m.get("edge_hits") or [],
+                "indicator_hits": m.get("indicator_hits") or [],
                 "period": period_n,
             })
 
