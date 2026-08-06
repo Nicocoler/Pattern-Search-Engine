@@ -4,155 +4,287 @@
 -- 数据库名：stock_datas
 -- =============================================================================
 
--- 1. 尝试安装 TimescaleDB 扩展（如果不可用，后续 Python 驱动会捕获异常并降级为原生 PostgreSQL）
--- CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
-
--- 2. 股票基本面信息表
-CREATE TABLE IF NOT EXISTS stocks (
-    code VARCHAR(12) PRIMARY KEY,                       -- 股票代码（如: sh600519, sz000002）
-    name VARCHAR(64) NOT NULL,                          -- 股票名称
-    name_pinyin_abbr VARCHAR(64),                       -- 名称拼音首字母缩写（如: 思源电器→sydt，万科A→wka）
-    list_date DATE,                                     -- 上市日期
-    board VARCHAR(32),                                  -- 板块（主板/创业板/科创板/北交所）
-    industry VARCHAR(64),                               -- 行业分类
-    is_st BOOLEAN DEFAULT FALSE,                        -- 是否为ST/*ST股票
-    is_suspended BOOLEAN DEFAULT FALSE,                 -- 是否处于停牌状态
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()   -- 信息更新时间
+create table stocks
+(
+    code             varchar(12) not null
+        primary key,
+    name             varchar(64) not null,
+    list_date        date,
+    board            varchar(32),
+    industry         varchar(64),
+    is_st            boolean                  default false,
+    is_suspended     boolean                  default false,
+    updated_at       timestamp with time zone default now(),
+    name_pinyin_abbr varchar(64)
 );
 
--- 创建索引以加速基础筛选
-CREATE INDEX IF NOT EXISTS idx_stocks_board_st ON stocks(board, is_st) WHERE is_suspended = FALSE;
-CREATE INDEX IF NOT EXISTS idx_stocks_name_pinyin_abbr ON stocks(name_pinyin_abbr);
+alter table stocks
+    owner to postgres;
 
--- 3. 时序日K行情表（如果是 TimescaleDB，后续将被转化为分区超表）
-CREATE TABLE IF NOT EXISTS daily_bars (
-    code VARCHAR(12) NOT NULL,                          -- 股票代码（外键关联 stocks）
-    date DATE NOT NULL,                                 -- 交易日期
-    open NUMERIC(10, 4) NOT NULL,                       -- 开盘价（前复权）
-    high NUMERIC(10, 4) NOT NULL,                       -- 最高价（前复权）
-    low NUMERIC(10, 4) NOT NULL,                        -- 最低价（前复权）
-    close NUMERIC(10, 4) NOT NULL,                      -- 收盘价（前复权）
-    volume BIGINT NOT NULL,                             -- 成交量（股）
-    amount NUMERIC(20, 4) NOT NULL,                     -- 成交额（元）
-    factor NUMERIC(16, 6) NOT NULL,                     -- 复权因子（当日的前复权乘数系数）
-    PRIMARY KEY (code, date)                            -- 联合主键（在 TimescaleDB 中超表必须包含时间列作为主键之一）
+create index idx_stocks_board_st
+    on stocks (board, is_st)
+    where (is_suspended = false);
+
+create index idx_stocks_name_pinyin_abbr
+    on stocks (name_pinyin_abbr);
+
+create table daily_bars
+(
+    code   varchar(12)    not null,
+    date   date           not null,
+    open   numeric(10, 4) not null,
+    high   numeric(10, 4) not null,
+    low    numeric(10, 4) not null,
+    close  numeric(10, 4) not null,
+    volume bigint         not null,
+    amount numeric(20, 4) not null,
+    factor numeric(16, 6) not null,
+    primary key (code, date)
 );
 
--- 4. 脏因子重算缓冲池表（捕获除权除息差分）
-CREATE TABLE IF NOT EXISTS dirty_factors (
-    code VARCHAR(12) NOT NULL,                          -- 发生除权除息的股票代码
-    dirty_date DATE NOT NULL,                           -- 触发重算的时戳日期
-    is_processed BOOLEAN DEFAULT FALSE,                 -- 是否已重算处理完毕
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),  -- 记录写入时间
-    PRIMARY KEY (code, dirty_date)
+alter table daily_bars
+    owner to postgres;
+
+create index idx_daily_bars_date_code
+    on daily_bars (date desc, code asc);
+
+create table dirty_factors
+(
+    code         varchar(12) not null,
+    dirty_date   date        not null,
+    is_processed boolean                  default false,
+    updated_at   timestamp with time zone default now(),
+    primary key (code, dirty_date)
 );
 
--- 5. 形态/抽象模板配置表
-CREATE TABLE IF NOT EXISTS feature_templates (
-    id SERIAL PRIMARY KEY,                              -- 模板ID
-    name VARCHAR(128) NOT NULL UNIQUE,                  -- 模板名称（如: "经典布林回踩启动"）
-    type VARCHAR(32) NOT NULL,                          -- 模板类型: historical (历史股票切片) / abstract (抽象规则配置)
-    config JSONB NOT NULL,                              -- 具体的事件序列与筛选特征配置 Json
-    weights JSONB NOT NULL,                             -- 多维特征维度权重 Json（进行 L1 归一化自适应调整）
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+alter table dirty_factors
+    owner to postgres;
+
+create table feature_templates
+(
+    id         serial
+        primary key,
+    name       varchar(128) not null
+        unique,
+    type       varchar(32)  not null,
+    config     jsonb        not null,
+    weights    jsonb        not null,
+    created_at timestamp with time zone default now(),
+    updated_at timestamp with time zone default now()
 );
 
--- 6. 形态每日推荐落库表（用于前端研盘快速查询）
-CREATE TABLE IF NOT EXISTS scan_results (
-    id BIGSERIAL PRIMARY KEY,
-    date DATE NOT NULL,                                 -- 扫描推荐结果的对应交易日期
-    template_id INT NOT NULL,                           -- 对应的模板 ID
-    code VARCHAR(12) NOT NULL,                          -- 匹配的股票代码
-    similarity_score NUMERIC(6, 4) NOT NULL,            -- 匹配综合相似度评分 (0.0 ~ 1.0)
-    sub_scores JSONB NOT NULL,                          -- 各项指标与事件切片的分项评分 Json
-    explanation TEXT,                                   -- AI/系统可解释性对齐说明文本
-    risk_tips TEXT,                                     -- 该形态对应的潜在风险提示
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+alter table feature_templates
+    owner to postgres;
+
+create table scan_results
+(
+    id               bigserial
+        primary key,
+    date             date          not null,
+    template_id      integer       not null,
+    code             varchar(12)   not null,
+    similarity_score numeric(6, 4) not null,
+    sub_scores       jsonb         not null,
+    explanation      text,
+    risk_tips        text,
+    created_at       timestamp with time zone default now()
 );
 
--- 为推荐结果表建立高性能联合检索索引
-CREATE INDEX IF NOT EXISTS idx_scan_results_date_score ON scan_results(date, template_id, similarity_score DESC);
+alter table scan_results
+    owner to postgres;
 
--- 7. 历史形态滚动回测报告表
-CREATE TABLE IF NOT EXISTS backtest_reports (
-    id SERIAL PRIMARY KEY,
-    template_id INT NOT NULL,                           -- 回测的模板 ID
-    start_date DATE NOT NULL,                           -- 回测的起止历史时间
-    end_date DATE NOT NULL,
-    metrics JSONB NOT NULL,                             -- 汇总绩效指标 Json (胜率, 信号数, Alpha, 最大回撤等)
-    equity_curve JSONB NOT NULL,                        -- 持股组合累计净值与 benchmark 对比时序 Json
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+create index idx_scan_results_date_score
+    on scan_results (date asc, template_id asc, similarity_score desc);
+
+create table backtest_reports
+(
+    id           serial
+        primary key,
+    template_id  integer not null,
+    start_date   date    not null,
+    end_date     date    not null,
+    metrics      jsonb   not null,
+    equity_curve jsonb   not null,
+    created_at   timestamp with time zone default now()
 );
 
--- 8. 后台行情同步状态 KV 表（守护进程与 FastAPI 后台任务共用，幂等建表）
-CREATE TABLE IF NOT EXISTS data_sync_status (
-    key VARCHAR(32) PRIMARY KEY,                       -- 状态键（last_start_time / last_status / last_mode 等）
-    value TEXT,                                         -- 状态值
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+alter table backtest_reports
+    owner to postgres;
+
+create table user_feedback
+(
+    id         serial
+        primary key,
+    result_id  bigint      not null,
+    label      varchar(32) not null,
+    comment    text,
+    created_at timestamp with time zone default now()
 );
 
--- 9. 人工标注反馈记录表（API 端点内 CREATE TABLE IF NOT EXISTS 幂等兜底，此处一并声明）
-CREATE TABLE IF NOT EXISTS user_feedback (
-    id SERIAL PRIMARY KEY,
-    result_id BIGINT NOT NULL,                          -- 关联的 scan_results.id（应用层保证，未声明外键）
-    label VARCHAR(32) NOT NULL,                        -- 标注标签: good_match / bad_match / watchlist / ignore
-    comment TEXT,                                       -- 人工备注
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+alter table user_feedback
+    owner to postgres;
+
+create table technical_indicators
+(
+    symbol            varchar(16)                            not null,
+    trade_date        date                                   not null,
+    indicator_version varchar(32)                            not null,
+    ma5               numeric(18, 4),
+    ma10              numeric(18, 4),
+    ma20              numeric(18, 4),
+    ma60              numeric(18, 4),
+    ma120             numeric(18, 4),
+    boll_mid          numeric(18, 4),
+    boll_upper        numeric(18, 4),
+    boll_lower        numeric(18, 4),
+    boll_width        numeric(18, 6),
+    boll_width_delta  numeric(18, 6),
+    macd              numeric(18, 6),
+    rsi14             numeric(18, 6),
+    atr14             numeric(18, 6),
+    volume_ma20       numeric(20, 2),
+    volume_ratio_20   numeric(18, 6),
+    created_at        timestamp with time zone default now() not null,
+    primary key (symbol, trade_date, indicator_version)
 );
 
--- 10. 布林编排逐日状态表（%B + Zone，与 DTW 特征链路隔离）
-CREATE TABLE IF NOT EXISTS stock_state_daily (
-    code VARCHAR(12) NOT NULL,                          -- 股票代码
-    date DATE NOT NULL,                                 -- 交易日
-    pct_b NUMERIC(12, 6),                               -- %B = (close-lower)/(upper-lower)，带宽为0时为 NULL
-    zone VARCHAR(2) NOT NULL,                           -- 离散状态 L/M/H/U/NA
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (code, date)
+alter table technical_indicators
+    owner to postgres;
+
+create table feature_vectors
+(
+    symbol          varchar(16)                                  not null,
+    trade_date      date                                         not null,
+    feature_version varchar(32)                                  not null,
+    features        jsonb                                        not null,
+    quality_flags   jsonb                    default '{}'::jsonb not null,
+    created_at      timestamp with time zone default now()       not null,
+    primary key (symbol, trade_date, feature_version)
 );
 
-CREATE INDEX IF NOT EXISTS idx_stock_state_daily_date ON stock_state_daily (date DESC);
+alter table feature_vectors
+    owner to postgres;
 
--- 11. 布林编排命中结果表（自然键幂等 upsert）
-CREATE TABLE IF NOT EXISTS pattern_match_result (
-    id BIGSERIAL PRIMARY KEY,
-    code VARCHAR(12) NOT NULL,                          -- 股票代码
-    pattern_id VARCHAR(64) NOT NULL,                    -- 编排 YAML id
-    pattern_name VARCHAR(128) NOT NULL,                 -- 编排可读名称
-    start_date DATE NOT NULL,                           -- 匹配区间起
-    end_date DATE NOT NULL,                             -- 匹配区间止
-    matched_states TEXT NOT NULL,                       -- 命中的状态字符串（人工复核）
-    score NUMERIC(10, 4),                               -- 二次打分（第一期预留，可为 NULL）
-    scan_date DATE NOT NULL,                            -- 最近一次写入/更新的扫描日
-    window_days INT NOT NULL,                           -- 本次扫描使用的窗口长度
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE (code, pattern_id, start_date, end_date)
+create index idx_feature_vectors_features
+    on feature_vectors using gin (features);
+
+create table data_sync_status
+(
+    key        varchar(32) not null
+        primary key,
+    value      text,
+    updated_at timestamp with time zone default now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_pattern_match_scan_date ON pattern_match_result (scan_date DESC);
-CREATE INDEX IF NOT EXISTS idx_pattern_match_end_pattern ON pattern_match_result (end_date DESC, pattern_id);
+alter table data_sync_status
+    owner to postgres;
 
--- 12. 布林编排全局尺子（单行）
-CREATE TABLE IF NOT EXISTS boll_pattern_settings (
-    id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    zone_thresholds JSONB NOT NULL,
-    denoise_min_len INT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+create table stock_state_daily
+(
+    code       varchar(12) not null,
+    date       date        not null,
+    pct_b      numeric(12, 6),
+    zone       varchar(2)  not null,
+    updated_at timestamp with time zone default now(),
+    primary key (code, date)
 );
 
--- 13. 布林编排定义表（权威源；YAML 仅补缺种子）
-CREATE TABLE IF NOT EXISTS boll_patterns (
-    id VARCHAR(64) PRIMARY KEY,
-    name VARCHAR(128) NOT NULL,
-    regex TEXT NOT NULL,
-    min_total_days INT NOT NULL DEFAULT 0,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    zone_thresholds JSONB,                              -- 稀疏覆盖，NULL=用全局
-    denoise_min_len INT,                                -- 稀疏覆盖，NULL=用全局
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+alter table stock_state_daily
+    owner to postgres;
+
+create index idx_stock_state_daily_date
+    on stock_state_daily (date desc);
+
+create table pattern_match_result
+(
+    id             bigserial
+        primary key,
+    code           varchar(12)                                  not null,
+    pattern_id     varchar(64)                                  not null,
+    pattern_name   varchar(128)                                 not null,
+    start_date     date                                         not null,
+    end_date       date                                         not null,
+    matched_states text                                         not null,
+    score          numeric(10, 4),
+    scan_date      date                                         not null,
+    window_days    integer                                      not null,
+    created_at     timestamp with time zone default now(),
+    updated_at     timestamp with time zone default now(),
+    edge_hits      jsonb                    default '[]'::jsonb not null,
+    indicator_hits jsonb                    default '[]'::jsonb not null,
+    unique (code, pattern_id, start_date, end_date)
 );
 
--- 如果是普通 PostgreSQL 降级环境，创建日K线的极致检索联合索引以加速 DTW 切片提取
-CREATE INDEX IF NOT EXISTS idx_daily_bars_date_code ON daily_bars (date DESC, code);
+alter table pattern_match_result
+    owner to postgres;
+
+create index idx_pattern_match_scan_date
+    on pattern_match_result (scan_date desc);
+
+create index idx_pattern_match_end_pattern
+    on pattern_match_result (end_date desc, pattern_id asc);
+
+create table boll_pattern_settings
+(
+    id              integer                  default 1 not null
+        primary key
+        constraint boll_pattern_settings_id_check
+            check (id = 1),
+    zone_thresholds jsonb                              not null,
+    denoise_min_len integer                  default 0 not null,
+    updated_at      timestamp with time zone default now()
+);
+
+alter table boll_pattern_settings
+    owner to postgres;
+
+create table boll_patterns
+(
+    id              varchar(64)                                                 not null
+        primary key,
+    name            varchar(128)                                                not null,
+    regex           text                                                        not null,
+    min_total_days  integer                  default 0                          not null,
+    enabled         boolean                  default true                       not null,
+    zone_thresholds jsonb,
+    denoise_min_len integer,
+    created_at      timestamp with time zone default now(),
+    updated_at      timestamp with time zone default now(),
+    edges           jsonb                    default '[]'::jsonb                not null,
+    period          varchar(16)              default 'daily'::character varying not null,
+    indicators      jsonb                    default '[]'::jsonb                not null
+);
+
+alter table boll_patterns
+    owner to postgres;
+
+create table pattern_match_favorite
+(
+    id              bigserial
+        primary key,
+    code            varchar(12)                                                 not null,
+    name            varchar(64),
+    pattern_id      varchar(64)                                                 not null,
+    pattern_name    varchar(128)                                                not null,
+    period          varchar(16)              default 'daily'::character varying not null,
+    start_date      date                                                        not null,
+    end_date        date                                                        not null,
+    matched_states  text                                                        not null,
+    score           numeric(10, 4),
+    edge_hits       jsonb                    default '[]'::jsonb                not null,
+    scan_date       date,
+    window_days     integer,
+    source_match_id bigint,
+    note            text                     default ''::text                   not null,
+    favorited_at    timestamp with time zone default now(),
+    updated_at      timestamp with time zone default now(),
+    indicator_hits  jsonb                    default '[]'::jsonb                not null,
+    unique (code, pattern_id, start_date, end_date)
+);
+
+alter table pattern_match_favorite
+    owner to postgres;
+
+create index idx_pattern_match_favorite_at
+    on pattern_match_favorite (favorited_at desc);
+
