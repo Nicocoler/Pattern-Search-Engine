@@ -63,6 +63,7 @@ ENV/
 env.bak/
 venv.bak/
 tests
+docs/adr
 
 # PyCharm / IntelliJ settings
 .idea/
