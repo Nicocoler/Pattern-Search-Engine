@@ -609,7 +609,12 @@ export default function App() {
   // -----------------------------------------------------------------------------
   // 2. 状态管理 (State Management)
   // -----------------------------------------------------------------------------
-  const [apiBase, setApiBase] = useState('http://localhost:8000');
+  // 开发：直连本机后端；生产构建：同域相对路径（空字符串 → /api/...）
+  const [apiBase, setApiBase] = useState(
+    () =>
+      (import.meta.env.VITE_API_BASE as string | undefined) ??
+      (import.meta.env.DEV ? 'http://localhost:8000' : ''),
+  );
   const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern' | 'stock_view'>('boll_pattern');
   const [moreTabsOpen, setMoreTabsOpen] = useState(false);
   const moreTabsRef = useRef<HTMLDivElement>(null);

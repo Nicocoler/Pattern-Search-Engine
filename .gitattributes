@@ -1,0 +1,4 @@
+# 保证在 Windows 检出后，Linux 服务器上脚本仍是 LF
+*.sh text eol=lf
+Dockerfile* text eol=lf
+docker-compose.yml text eol=lf
