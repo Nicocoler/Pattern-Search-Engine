@@ -3406,6 +3406,18 @@ export default function App() {
           data: kLine,
           showSymbol: false,
           lineStyle: { color: '#e2e8f0', width: 1 },
+          // J 超 100 警示线（浅黄虚线，盖过默认 splitLine）
+          markLine: {
+            silent: true,
+            symbol: 'none',
+            label: { show: false },
+            data: [{ yAxis: 100 }],
+            lineStyle: {
+              color: 'rgba(253, 224, 71, 0.7)',
+              type: 'dashed',
+              width: 1,
+            },
+          },
         },
         {
           name: 'D',
