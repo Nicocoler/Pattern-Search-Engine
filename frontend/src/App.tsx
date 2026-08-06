@@ -3,7 +3,8 @@
 // 职责：实现极速扫描大PK、起始点归零百分比重合 Kline 绘制、高斯事件悬浮气泡标注、滚动无偏回测图表、自适应反馈闭环
 // =============================================================================
 
-import { useState, useEffect, useRef, type CSSProperties, type MouseEvent, type MutableRefObject } from 'react';
+import { useState, useEffect, useRef, type CSSProperties, type MutableRefObject } from 'react';
+import type { MouseEvent as ReactMouseEvent } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
   TrendingUp,
@@ -18,7 +19,6 @@ import {
   Award,
   Sliders,
   Sparkles,
-  Server,
   Database,
   Info,
   Search,
@@ -610,11 +610,9 @@ export default function App() {
   // 2. 状态管理 (State Management)
   // -----------------------------------------------------------------------------
   // 开发：直连本机后端；生产构建：同域相对路径（空字符串 → /api/...）
-  const [apiBase, setApiBase] = useState(
-    () =>
-      (import.meta.env.VITE_API_BASE as string | undefined) ??
-      (import.meta.env.DEV ? 'http://localhost:8000' : ''),
-  );
+  const apiBase =
+    (import.meta.env.VITE_API_BASE as string | undefined) ??
+    (import.meta.env.DEV ? 'http://localhost:8000' : '');
   const [activeTab, setActiveTab] = useState<'scan' | 'backtest' | 'templates' | 'settings' | 'boll_pattern' | 'stock_view'>('boll_pattern');
   const [moreTabsOpen, setMoreTabsOpen] = useState(false);
   const moreTabsRef = useRef<HTMLDivElement>(null);
@@ -1369,7 +1367,7 @@ export default function App() {
     );
   };
 
-  const handleToggleBollFavorite = async (m: BollPatternMatch, e?: MouseEvent) => {
+  const handleToggleBollFavorite = async (m: BollPatternMatch, e?: ReactMouseEvent) => {
     e?.stopPropagation();
     if (bollChartSource === 'preview' && !m.favorited) {
       showToast('试跑命中不支持收藏，请先扫描落库');
@@ -2420,7 +2418,7 @@ export default function App() {
   // 点击外部关闭「更多」下拉
   useEffect(() => {
     if (!moreTabsOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
+    const onPointerDown = (e: globalThis.MouseEvent) => {
       if (moreTabsRef.current && !moreTabsRef.current.contains(e.target as Node)) {
         setMoreTabsOpen(false);
       }
@@ -2676,7 +2674,7 @@ export default function App() {
 
   // 点击外部关闭搜索下拉
   useEffect(() => {
-    const onDocClick = (e: MouseEvent) => {
+    const onDocClick = (e: globalThis.MouseEvent) => {
       const target = e.target as Node;
       if (stockSearchWrapRef.current && !stockSearchWrapRef.current.contains(target)) {
         setStockSearchOpen(false);
