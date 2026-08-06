@@ -56,7 +56,7 @@ curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
 
 ## 3. GitHub Actions Secrets
 
-仓库 Settings → Secrets and variables → Actions：
+仓库 Settings → Secrets and variables → Actions → **Repository secrets**：
 
 | Secret | 含义 |
 |--------|------|
@@ -65,7 +65,15 @@ curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
 | `DEPLOY_SSH_KEY` | 对应 `deploy` 的**私钥**全文 |
 | `DEPLOY_PORT` | 可选，默认 22 |
 
-`main` 分支 push 后执行 `.github/workflows/deploy.yml`。也可在 Actions 页手动 `workflow_dispatch`。
+`main` 分支 push 后执行 `.github/workflows/deploy.yml`：
+
+1. 在 GitHub runner 上 `checkout`（不依赖服务器访问 GitHub）
+2. `rsync` 同步代码到 `/home/deploy/PSE`（**不会覆盖**服务器 `.env`）
+3. SSH 执行 `SKIP_GIT_PULL=1 bash scripts/deploy.sh`（仅 compose build/up）
+
+也可在 Actions 页手动 `workflow_dispatch`。
+
+若服务器能稳定访问 GitHub，仍可 SSH 后手动 `bash scripts/deploy.sh`（会 git pull）。
 
 ## 4. 宝塔计划任务（16:30）
 
