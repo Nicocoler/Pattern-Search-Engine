@@ -12,39 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      # 在 GitHub runner 拉代码（服务器常连不上 github.com）
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Sync code to server
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          PORT="${DEPLOY_PORT:-22}"
-          SSH_OPTS="-i ~/.ssh/deploy_key -p ${PORT} -o StrictHostKeyChecking=accept-new"
-          # 不覆盖服务器 .env；不删远端 logs
-          rsync -az --delete \
-            --exclude '.git/' \
-            --exclude '.venv/' \
-            --exclude 'venv/' \
-            --exclude 'node_modules/' \
-            --exclude 'frontend/node_modules/' \
-            --exclude 'frontend/dist/' \
-            --exclude 'logs/' \
-            --exclude '.env' \
-            --exclude '.codegraph/' \
-            --exclude '.cursor/' \
-            -e "ssh ${SSH_OPTS}" \
-            ./ "${DEPLOY_USER}@${DEPLOY_HOST}:/home/deploy/PSE/"
-
-      - name: Build and restart containers
+      - name: Pull latest code and restart containers
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -57,4 +25,4 @@ jobs:
             set -euo pipefail
             cd /home/deploy/PSE
             chmod +x scripts/*.sh
-            SKIP_GIT_PULL=1 bash scripts/deploy.sh
+            bash scripts/deploy.sh

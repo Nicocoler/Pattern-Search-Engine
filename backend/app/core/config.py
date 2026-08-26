@@ -42,7 +42,7 @@ class Settings:
     VERSION: str = "1.0.0"
 
     # 数据库连接配置：仅从环境变量/.env 读取，不再在源码中硬编码默认密码（凭据不进版本库）。
-    # 缺失时由连接池层在首次使用时抛出清晰错误，避免阻断 init_db.py 的交互式引导建库流程。
+    # 缺失时由连接池层在首次使用时抛出清晰错误。
     DATABASE_URL: str = os.getenv("DATABASE_URL")
 
     # 行情获取相关并发配置

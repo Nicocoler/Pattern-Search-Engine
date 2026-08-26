@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 服务器端一键部署：compose build/up
-# GitHub Actions 会先 rsync 代码再调用本脚本（SKIP_GIT_PULL=1），避免服务器访问 GitHub。
+# 服务器端一键部署：git pull + compose build/up
+# GitHub Actions 与 SSH 手动部署均直接调用本脚本。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +17,7 @@ if [[ "${SKIP_GIT_PULL:-0}" != "1" ]]; then
   git checkout main
   git pull --ff-only origin main
 else
-  echo "==> skip git pull (code already synced by CI)"
+  echo "==> skip git pull (SKIP_GIT_PULL=1)"
 fi
 
 echo "==> docker compose build && up"

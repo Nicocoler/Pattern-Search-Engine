@@ -44,7 +44,7 @@ def _get_pool() -> ThreadedConnectionPool:
             if not settings.DATABASE_URL:
                 raise RuntimeError(
                     "DATABASE_URL 未配置：请在项目根目录 .env 中设置 DATABASE_URL，"
-                    "或运行 `python init_db.py` 完成交互式建库引导。"
+                    "并确认 PostgreSQL 已就绪。"
                 )
             _pool = ThreadedConnectionPool(
                 minconn=_MIN_CONN,

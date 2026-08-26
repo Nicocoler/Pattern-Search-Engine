@@ -28,7 +28,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY backend ./backend
-COPY init_db.py init_db.sql ./
+COPY init_db.sql ./
 
 RUN mkdir -p logs
 
