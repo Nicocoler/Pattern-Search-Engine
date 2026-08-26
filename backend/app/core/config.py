@@ -47,8 +47,9 @@ class Settings:
 
     # 行情获取相关并发配置
     MAX_CONCURRENT_REQUESTS: int = 5     # 最大并发拉取线程数（防爬封锁限制）
-    REQUEST_RETRY_LIMIT: int = 1         # 单只个股请求失败重试上限
+    REQUEST_RETRY_LIMIT: int = 4         # 单只个股最大请求次数（含首次，即最多重试 3 次）
     REQUEST_BACKOFF_FACTOR: float = 1.0  # 指数退避倍率
+    BATCH_RETRY_COOLDOWN_SEC: float = 10.0  # 批量同步首轮失败后，补拉前的冷却秒数
 
     # 形态剪枝与除权检测阈值（集中管理，避免散落魔法数字）
     BOLL_PRUNE_THRESHOLD: float = 0.045      # 候选窗口内收盘距布林中轨最小绝对偏离，大于此值直接剪枝
