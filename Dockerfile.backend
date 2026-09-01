@@ -9,21 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 阿里云 Debian 源（国内机房访问 deb.debian.org 极慢）
-RUN set -eux; \
-    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-      sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
-      sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
-    fi; \
-    if [ -f /etc/apt/sources.list ]; then \
-      sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
-      sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
-    fi; \
-    apt-get update; \
-    # psycopg2-binary 自带 wheel，无需 libpq-dev；仅保留编译器供偶发需源码构建的包（如 dtaidistance）
-    apt-get install -y --no-install-recommends gcc g++; \
-    rm -rf /var/lib/apt/lists/*
-
+# 依赖均有 manylinux wheel（含 dtaidistance/numba），无需 gcc；省掉国内 apt 拉编译器的数分钟
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
