@@ -257,7 +257,7 @@ const CHART_PERIOD_OPTIONS: { value: ChartPeriod; label: string }[] = [
 ];
 
 const CHART_PERIOD_LOOKBACK_DEFAULTS: Record<ChartPeriod, number> = {
-  daily: 120,
+  daily: 60,
   weekly: 104,
   monthly: 60,
 };

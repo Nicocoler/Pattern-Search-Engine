@@ -26,11 +26,6 @@ from backend.app.core.timeutil import now_beijing, today_beijing
 # 不再调用 basicConfig 以免与主进程日志配置互相覆盖。
 logger = logging.getLogger("DataCenter")
 
-
-class TransientFetchError(Exception):
-    """行情接口瞬时失败（空响应、限流等），可触发重试。"""
-
-
 class DataCenterSync:
     # 全局运行世代 ID，用于支持最新参数热重载、上一任优雅退让停机
     CURRENT_GENERATION_ID = 0
@@ -69,10 +64,9 @@ class DataCenterSync:
         # 走统一连接池（普通 tuple 游标，向后兼容 row[0] 索引访问）
         return db.acquire(dict_cursor=False)
 
-    def fetch_with_retry(self, func, *args, reject_empty_df=False, **kwargs):
+    def fetch_with_retry(self, func, *args, **kwargs):
         """
-        网络拉取防护套：支持动态自适应随机休眠、并发信号量锁定、以及指数级退避重试。
-        reject_empty_df=True 时，将空 DataFrame 视为瞬时失败并参与重试（腾讯源限流时常返回空表）。
+        网络拉取防护套：支持动态自适应随机休眠、并发信号量锁定、以及指数级退避重试
         """
         retries = 0
         backoff = 1.0
@@ -84,120 +78,16 @@ class DataCenterSync:
                         time.sleep(random.uniform(self.delay_min, self.delay_max))
                     elif self.delay_max > 0:
                         time.sleep(self.delay_max)
-
-                    result = func(*args, **kwargs)
-                    if reject_empty_df and (result is None or getattr(result, "empty", False)):
-                        raise TransientFetchError("接口返回空数据")
-                    return result
+                        
+                    return func(*args, **kwargs)
                 except Exception as e:
                     retries += 1
                     if retries >= self.retry_limit:
                         raise e
                     sleep_time = backoff * settings.REQUEST_BACKOFF_FACTOR
-                    logger.warning(
-                        f"接口请求失败，正在进行第 {retries}/{self.retry_limit - 1} 次重试，"
-                        f"延时 {sleep_time}s... 错误: {e}"
-                    )
+                    logger.warning(f"接口请求失败，正在进行第 {retries}/{self.retry_limit} 次重试，延时 {sleep_time}s... 错误: {e}")
                     time.sleep(sleep_time)
-                    backoff *= 2  # 指数退避
-
-    def _fetch_stock_hist_tx(self, code, start_date, end_date):
-        """拉取腾讯前复权日 K，空响应走重试链路。"""
-        return self.fetch_with_retry(
-            ak.stock_zh_a_hist_tx,
-            symbol=code,
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-            reject_empty_df=True,
-        )
-
-    def _execute_batch_sync(self, codes, max_workers, task_label="行情"):
-        """批量同步，首轮结束后对失败个股降并发补拉一轮。"""
-        total_stocks = len(codes)
-        if total_stocks == 0:
-            return 0, 0, []
-
-        success_count = 0
-        failure_count = 0
-        failed_codes = []
-        start_time = time.time()
-        aborted = False
-
-        def _run_pool(pool_codes, workers, progress_offset=0, progress_total=None):
-            nonlocal success_count, failure_count, failed_codes, aborted
-            if progress_total is None:
-                progress_total = total_stocks
-            batch_failed = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_code = {
-                    executor.submit(self.sync_single_stock_daily_bars, code): code
-                    for code in pool_codes
-                }
-                for i, future in enumerate(as_completed(future_to_code), 1):
-                    if self.generation_id != DataCenterSync.get_generation_id():
-                        logger.info(
-                            f"[Sync Guard] 检测到有新世代任务启动，本{task_label}同步任务优雅退出。"
-                        )
-                        for pending in future_to_code:
-                            pending.cancel()
-                        aborted = True
-                        break
-
-                    code = future_to_code[future]
-                    try:
-                        success = future.result()
-                        if success:
-                            success_count += 1
-                        else:
-                            failure_count += 1
-                            batch_failed.append(code)
-                    except Exception as e:
-                        logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
-                        failure_count += 1
-                        batch_failed.append(code)
-
-                    done = progress_offset + i
-                    if done % 100 == 0 or done == progress_total:
-                        elapsed = time.time() - start_time
-                        speed = done / elapsed if elapsed > 0 else 0
-                        logger.info(
-                            f"{task_label}同步进度: {done}/{progress_total} "
-                            f"({done / progress_total * 100:.1f}%) | 成功: {success_count} | "
-                            f"失败: {failure_count} | 耗时: {elapsed:.1f}s | 速度: {speed:.1f}股/秒"
-                        )
-            failed_codes.extend(batch_failed)
-            return batch_failed
-
-        _run_pool(codes, max_workers)
-
-        if (
-            not aborted
-            and failed_codes
-            and self.generation_id == DataCenterSync.get_generation_id()
-        ):
-            retry_codes = list(failed_codes)
-            failed_codes = []
-            failure_count -= len(retry_codes)
-            logger.warning(
-                f"首轮{task_label}同步有 {len(retry_codes)} 只股票失败，"
-                f"{settings.BATCH_RETRY_COOLDOWN_SEC:.0f} 秒后降并发补拉..."
-            )
-            time.sleep(settings.BATCH_RETRY_COOLDOWN_SEC)
-            still_failed = _run_pool(
-                retry_codes,
-                min(2, max_workers),
-                progress_offset=total_stocks - len(retry_codes),
-                progress_total=total_stocks,
-            )
-            if still_failed:
-                sample = still_failed[:20]
-                suffix = "..." if len(still_failed) > 20 else ""
-                logger.error(
-                    f"补拉后仍失败 {len(still_failed)} 只股票: {sample}{suffix}"
-                )
-
-        return success_count, failure_count, failed_codes
+                    backoff *= 2 # 指数退避
 
     def sync_stock_list(self):
         """
@@ -206,7 +96,7 @@ class DataCenterSync:
         logger.info("🚀 正在从国证 A 股源一键拉取沪深京全市场股票大名单...")
         df_spot = None
         try:
-            df_code_name = self.fetch_with_retry(ak.stock_info_a_code_name, reject_empty_df=True)
+            df_code_name = self.fetch_with_retry(ak.stock_info_a_code_name)
             if df_code_name is not None and not df_code_name.empty:
                 # 对齐国证字段为系统标准字段，100% 兼容后续的交易所板块分类及 UPSERT 逻辑！
                 df_spot = pd.DataFrame()
@@ -296,10 +186,29 @@ class DataCenterSync:
             return row[0], float(row[1])
         return None, None
 
-    def sync_single_stock_daily_bars(self, code, force_rebuild=False):
+    @staticmethod
+    def calendar_expected_latest(as_of: date | None = None) -> date:
+        """日历启发式应有最新交易日（周末回退到周五；法定节假日靠市场水位兜底）。"""
+        d = as_of or today_beijing()
+        weekday = d.weekday()
+        if weekday == 5:
+            return d - timedelta(days=1)
+        if weekday == 6:
+            return d - timedelta(days=2)
+        return d
+
+    def get_market_max_bar_date(self):
+        """全市场 daily_bars 已落库的最大日期（用于识别落后个股）。"""
+        with db.db_cursor() as (conn, cursor):
+            cursor.execute("SELECT MAX(date) FROM daily_bars;")
+            row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+
+    def sync_single_stock_daily_bars(self, code, force_rebuild=False, expected_latest=None, market_max_date=None):
         """
         同步单只股票的前复权历史日 K 线
-        支持：自适应增量同步、除权因子突变差分拦截与全历史强制重算触发
+        支持：自适应增量同步、除权因子突变差分拦截与全历史强制重算触发。
+        增量起点为本地 max_date，会自动补齐中间缺失交易日（停牌日源端无K则无法伪造）。
         """
         # 0. 世代代差检测，若已被更新一代任务废黜，主动优雅退位让出写锁和带宽
         if self.generation_id != DataCenterSync.get_generation_id():
@@ -311,26 +220,13 @@ class DataCenterSync:
         
         # 2. 查询本地的最大日期及最新的复权因子
         max_date, last_factor = self.get_stock_max_date_and_factor(code)
+        if expected_latest is None:
+            expected_latest = self.calendar_expected_latest()
         
-        # 2.5 极致智能秒传自愈拦截：如果本地 max_date 已经是今天，或者今天是周末且 max_date 已经是上周五
-        # 证明该个股今日数据已经绝对落库，100% 连网络请求都不要发，免去网络IO和随机休眠，秒速跳转下一只！
-        if max_date and not force_rebuild:
-            today_dt = today_beijing()
-            weekday = today_dt.weekday() # 0=周一, 5=周六, 6=周日
-            is_already_latest = False
-            
-            if max_date == today_dt:
-                is_already_latest = True
-            elif weekday == 5: # 周六，最大日期只要是周五(昨天)就说明已满
-                if max_date == today_dt - timedelta(days=1):
-                    is_already_latest = True
-            elif weekday == 6: # 周日，最大日期只要是周五(前天)就说明已满
-                if max_date == today_dt - timedelta(days=2):
-                    is_already_latest = True
-                    
-            if is_already_latest:
-                logger.debug(f"[{code}] 🛡️ 本地最大日期 {max_date} 已是最新，全自动触发【微秒级冷避秒传跳过】！")
-                return True
+        # 2.5 已追上期望日则跳过网络请求
+        if max_date and not force_rebuild and max_date >= expected_latest:
+            logger.debug(f"[{code}] 本地最大日期 {max_date} 已达期望日 {expected_latest}，跳过。")
+            return True
         
         # 3. 决定同步开始日期与重算条件
         if force_rebuild or not max_date:
@@ -338,36 +234,53 @@ class DataCenterSync:
             logger.debug(f"[{code}] 本地无数据，将拉取其全历史日 K 线...")
         else:
             # 增量拉取，从本地最大日期往前移 2 天开始拉取（重合 2~3 天用于除权自交叉比对，
-            # 同时规避周末/非交易日缺失导致起点跳空）
+            # 同时规避周末/非交易日缺失导致起点跳空）。end=today 会一次拉齐中间缺口。
             start_date = (max_date - timedelta(days=2)).strftime("%Y%m%d")
 
-        # 4. 腾讯 ak.stock_zh_a_hist_tx；日期格式 YYYYMMDD（与 AkShare 文档一致）
+        # 4. 直接唯一对接腾讯 ak.stock_zh_a_hist_tx 接口，弃用易断开且不稳定的东财源，极大提升成功率与抓取速度
         df_hist = None
         try:
-            tx_start = start_date
-            tx_end = today_beijing().strftime("%Y%m%d")
+            # 转换开始日期格式 (从 YYYYMMDD 转为 YYYY-MM-DD，腾讯接口格式要求)
+            tx_start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+            tx_end = now_beijing().strftime("%Y-%m-%d")
 
-            df_tx = self._fetch_stock_hist_tx(code, tx_start, tx_end)
+            df_tx = self.fetch_with_retry(
+                ak.stock_zh_a_hist_tx,
+                symbol=code, # 腾讯源必须带 sh/sz 前缀，如 sz000002
+                start_date=tx_start,
+                end_date=tx_end,
+                adjust="qfq" # 强制前复权
+            )
 
-            # 转换腾讯字段为契约兼容字段，完美无缝合入后续除权检查和批量 UPSERT！
-            df_hist = pd.DataFrame()
-            df_hist['日期'] = df_tx['date']
-            df_hist['开盘'] = df_tx['open']
-            df_hist['收盘'] = df_tx['close']
-            df_hist['最高'] = df_tx['high']
-            df_hist['最低'] = df_tx['low']
-            # 腾讯 API 返回的 amount 实际代表成交量（单位：手），转换为股数（1手 = 100股）
-            df_hist['成交量'] = df_tx['amount'].astype(float) * 100
-            # 估算成交额：用当日均价 (开+高+低+收)/4 * 成交量（比单收盘价更接近真实成交额，仍为近似）
-            avg_price = (df_tx['open'] + df_tx['high'] + df_tx['low'] + df_tx['close']) / 4.0
-            df_hist['成交额'] = df_hist['成交量'] * avg_price
-            logger.debug(f"✅ 成功通过腾讯源同步个股 [{code}] 行情！")
+            if df_tx is not None and not df_tx.empty:
+                # 转换腾讯字段为契约兼容字段，完美无缝合入后续除权检查和批量 UPSERT！
+                df_hist = pd.DataFrame()
+                df_hist['日期'] = df_tx['date']
+                df_hist['开盘'] = df_tx['open']
+                df_hist['收盘'] = df_tx['close']
+                df_hist['最高'] = df_tx['high']
+                df_hist['最低'] = df_tx['low']
+                # 腾讯 API 返回的 amount 实际代表成交量（单位：手），转换为股数（1手 = 100股）
+                df_hist['成交量'] = df_tx['amount'].astype(float) * 100
+                # 估算成交额：用当日均价 (开+高+低+收)/4 * 成交量（比单收盘价更接近真实成交额，仍为近似）
+                avg_price = (df_tx['open'] + df_tx['high'] + df_tx['low'] + df_tx['close']) / 4.0
+                df_hist['成交额'] = df_hist['成交量'] * avg_price
+                logger.debug(f"✅ 成功通过腾讯源同步个股 [{code}] 行情！")
+            else:
+                logger.error(f"❌ 腾讯源未返回个股 [{code}] 的任何行情。")
+                return False
         except Exception as e:
             logger.error(f"❌ 腾讯行情源拉取个股 [{code}] 失败: {e}")
             return False
 
         if df_hist is None or df_hist.empty:
-            return True # 今日未开盘或暂无更新
+            # 同伴已有更新日K，本股却拉空 → 视为未补齐，避免假成功长期停在旧日期
+            if market_max_date and max_date and max_date < market_max_date:
+                logger.warning(
+                    f"[{code}] 行情为空，本地停在 {max_date}，落后市场水位 {market_max_date}，记为未补齐。"
+                )
+                return False
+            return True  # 全市场也尚无更新（节假日/未收盘）
 
         # 映射字段：日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
         # 注意：AkShare 的前复权结果中不直接含有“复权因子（factor）”。
@@ -425,7 +338,12 @@ class DataCenterSync:
                             cursor_dirty.close()
 
                         # 触发“脏复权重算流程”：强制清除该股全历史，拉取完整全历史
-                        rebuild_ok = self.sync_single_stock_daily_bars(code, force_rebuild=True)
+                        rebuild_ok = self.sync_single_stock_daily_bars(
+                            code,
+                            force_rebuild=True,
+                            expected_latest=expected_latest,
+                            market_max_date=market_max_date,
+                        )
                         if rebuild_ok:
                             # 重算成功，消费 dirty 标记，避免脏记录只增不减
                             with db.db_conn() as conn_mark:
@@ -464,6 +382,12 @@ class DataCenterSync:
             ))
 
         if not bars_to_insert:
+            if market_max_date and max_date and max_date < market_max_date:
+                logger.warning(
+                    f"[{code}] 源端无新于 {max_date} 的K线，仍落后市场水位 {market_max_date}"
+                    f"（停牌/退市/源缺失），记为未补齐。"
+                )
+                return False
             return True
 
         # 批量 UPSERT 入库
@@ -484,7 +408,8 @@ class DataCenterSync:
         try:
             execute_values(cursor, upsert_query, bars_to_insert)
             conn.commit()
-            logger.debug(f"[{code}] 成功同步并落库 {len(bars_to_insert)} 根日 K 线。")
+            new_max = bars_to_insert[-1][1]
+            logger.debug(f"[{code}] 成功同步并落库 {len(bars_to_insert)} 根日 K 线，最新至 {new_max}。")
         except Exception as e:
             conn.rollback()
             logger.error(f"[{code}] 批量写入 daily_bars 失败: {e}")
@@ -516,10 +441,54 @@ class DataCenterSync:
             return
 
         total_stocks = len(codes)
+        expected_latest = self.calendar_expected_latest()
+        market_max_date = self.get_market_max_bar_date()
         logger.info(f"🔥 行情同步任务分发完成：共计 {total_stocks} 只个股。线程池规模：{max_workers}，并发限流限制：{settings.MAX_CONCURRENT_REQUESTS}。")
 
+        success_count = 0
+        failure_count = 0
+        
         start_time = time.time()
-        success_count, failure_count, _ = self._execute_batch_sync(codes, max_workers, task_label="全市场")
+
+        # 2. 线程池分发任务
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 建立 Future 映射：{future: code}
+            future_to_code = {
+                executor.submit(
+                    self.sync_single_stock_daily_bars,
+                    code,
+                    False,
+                    expected_latest,
+                    market_max_date,
+                ): code
+                for code in codes
+            }
+
+            for i, future in enumerate(as_completed(future_to_code), 1):
+                # 0. 世代比对：一旦检测到最新世代已经起飞，上一任进程立刻优雅 break 自行解散！
+                if self.generation_id != DataCenterSync.get_generation_id():
+                    logger.info("🔓 [Sync Guard] 🏳️ 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步任务优雅自行解散，让出跑道！")
+                    # 尽可能取消尚未开始的 future（已在执行的 in-flight 任务仍会跑完，ThreadPoolExecutor 限制）
+                    for pending in future_to_code:
+                        pending.cancel()
+                    break
+
+                code = future_to_code[future]
+                try:
+                    success = future.result()
+                    if success:
+                        success_count += 1
+                    else:
+                        failure_count += 1
+                except Exception as e:
+                    logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
+                    failure_count += 1
+
+                # 每隔 100 只股票打印一次全局进度，保持盯盘感
+                if i % 100 == 0 or i == total_stocks:
+                    elapsed = time.time() - start_time
+                    speed = i / elapsed if elapsed > 0 else 0
+                    logger.info(f"📊 同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | 成功: {success_count} | 失败: {failure_count} | 耗时: {elapsed:.1f}s | 均速: {speed:.1f}股/秒")
 
         total_elapsed = time.time() - start_time
         logger.info("="*60)
@@ -531,9 +500,14 @@ class DataCenterSync:
         logger.info("="*60)
 
     def sync_today_data(self, max_workers=8):
-        """同步当日最新股票行情数据。预查询已落库当日数据的股票，仅对缺失的个股执行增量抓取。"""
-        logger.info("开始同步当日最新股票行情数据...")
-        today = today_beijing()
+        """
+        增量同步至期望交易日，并自动补齐落后个股的中间缺口。
+        选股规则：个股本地 MAX(date) < 日历期望日（周末按上周五），
+        不再仅看“是否有日历今天这一行”——避免周末误判，并强制追平长期落后股。
+        """
+        logger.info("开始同步当日最新股票行情数据（含落后个股缺口补齐）...")
+        expected_latest = self.calendar_expected_latest()
+        market_max_date = self.get_market_max_bar_date()
         codes = self.sync_stock_list()
         if not codes:
             with db.db_cursor() as (conn, cursor):
@@ -543,28 +517,148 @@ class DataCenterSync:
         if not codes:
             logger.error("无可用股票代码，当日数据同步中止。")
             return
+
         with db.db_cursor() as (conn, cursor):
-            cursor.execute("SELECT DISTINCT code FROM daily_bars WHERE date = %s;", (today,))
-            today_has_data_codes = set(row[0] for row in cursor.fetchall())
-        stocks_to_sync = [code for code in codes if code not in today_has_data_codes]
+            cursor.execute(
+                "SELECT code, MAX(date) AS max_d FROM daily_bars WHERE code = ANY(%s) GROUP BY code;",
+                (codes,),
+            )
+            max_map = {row[0]: row[1] for row in cursor.fetchall()}
+
+        stocks_to_sync = []
+        for code in codes:
+            md = max_map.get(code)
+            if md is None or md < expected_latest:
+                stocks_to_sync.append(code)
+
         skipped_count = len(codes) - len(stocks_to_sync)
-        logger.info(f"当日数据同步预检结果：共 {len(codes)} 只活跃股票 | 已落库当日数据 {skipped_count} 只 | 需要同步 {len(stocks_to_sync)} 只")
+        lagging_vs_market = 0
+        if market_max_date:
+            lagging_vs_market = sum(
+                1 for code in stocks_to_sync
+                if (max_map.get(code) is None) or (max_map.get(code) < market_max_date)
+            )
+        logger.info(
+            f"当日数据同步预检：活跃 {len(codes)} | 期望最新日 {expected_latest} | "
+            f"市场水位 {market_max_date or 'N/A'} | 已对齐跳过 {skipped_count} | "
+            f"需同步 {len(stocks_to_sync)}（其中落后市场水位 {lagging_vs_market}）"
+        )
         if not stocks_to_sync:
-            logger.info("所有股票已落库当日数据，无需同步。")
+            logger.info("所有股票已对齐期望最新日，无需同步。")
             return
+
         total_stocks = len(stocks_to_sync)
         logger.info(f"当日行情同步任务分发完成：共计 {total_stocks} 只个股需要同步。线程池规模：{max_workers}。")
+        success_count = 0
+        failure_count = 0
+        failed_codes = []
         start_time = time.time()
-        success_count, failure_count, _ = self._execute_batch_sync(
-            stocks_to_sync, max_workers, task_label="当日"
-        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_code = {
+                executor.submit(
+                    self.sync_single_stock_daily_bars,
+                    code,
+                    False,
+                    expected_latest,
+                    market_max_date,
+                ): code
+                for code in stocks_to_sync
+            }
+            for i, future in enumerate(as_completed(future_to_code), 1):
+                if self.generation_id != DataCenterSync.get_generation_id():
+                    logger.info("[Sync Guard] 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步工作任务优雅自行解散，让出跑道。")
+                    for pending in future_to_code:
+                        pending.cancel()
+                    break
+                code = future_to_code[future]
+                try:
+                    success = future.result()
+                    if success:
+                        success_count += 1
+                    else:
+                        failure_count += 1
+                        failed_codes.append(code)
+                except Exception as e:
+                    logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
+                    failure_count += 1
+                    failed_codes.append(code)
+                if i % 100 == 0 or i == total_stocks:
+                    elapsed = time.time() - start_time
+                    speed = i / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        f"当日同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | "
+                        f"成功: {success_count} | 失败: {failure_count} | "
+                        f"耗时: {elapsed:.1f}s | 速度: {speed:.1f}股/秒"
+                    )
+
+        # 失败个股再扫一轮（网络抖动/限流常见），尽量补齐缺口
+        if failed_codes and self.generation_id == DataCenterSync.get_generation_id():
+            retry_codes = list(dict.fromkeys(failed_codes))
+            logger.info(f"对 {len(retry_codes)} 只失败个股进行第二轮补齐重试...")
+            market_max_date = self.get_market_max_bar_date() or market_max_date
+            retry_ok = 0
+            still_failed = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_code = {
+                    executor.submit(
+                        self.sync_single_stock_daily_bars,
+                        code,
+                        False,
+                        expected_latest,
+                        market_max_date,
+                    ): code
+                    for code in retry_codes
+                }
+                for future in as_completed(future_to_code):
+                    code = future_to_code[future]
+                    try:
+                        if future.result():
+                            retry_ok += 1
+                            success_count += 1
+                            failure_count -= 1
+                        else:
+                            still_failed.append(code)
+                    except Exception as e:
+                        logger.error(f"重试股票 [{code}] 异常: {e}")
+                        still_failed.append(code)
+            failed_codes = still_failed
+            logger.info(f"第二轮重试完成：挽回 {retry_ok} 只，仍失败 {len(failed_codes)} 只")
+
+        # 收尾水位报告：仍落后市场的个股（便于运维发现长期停更）
+        still_lagging = []
+        final_market_max = self.get_market_max_bar_date() or market_max_date
+        if final_market_max:
+            with db.db_cursor() as (conn, cursor):
+                cursor.execute(
+                    """
+                    SELECT code, MAX(date) AS max_d
+                    FROM daily_bars
+                    WHERE code = ANY(%s)
+                    GROUP BY code
+                    HAVING MAX(date) < %s
+                    ORDER BY MAX(date) ASC
+                    LIMIT 30;
+                    """,
+                    (codes, final_market_max),
+                )
+                still_lagging = [(row[0], row[1]) for row in cursor.fetchall()]
+
         total_elapsed = time.time() - start_time
         logger.info("=" * 60)
         logger.info("当日行情同步完成！")
+        logger.info(f"   - 期望最新日: {expected_latest}")
+        logger.info(f"   - 市场水位: {final_market_max or 'N/A'}")
         logger.info(f"   - 需要同步股票数: {total_stocks}")
         logger.info(f"   - 同步成功数: {success_count}")
         logger.info(f"   - 同步失败数: {failure_count}")
-        logger.info(f"   - 跳过已有当日数据股票: {skipped_count}")
+        logger.info(f"   - 跳过已对齐股票: {skipped_count}")
+        if still_lagging:
+            sample = ", ".join(f"{c}@{d}" for c, d in still_lagging[:10])
+            logger.warning(
+                f"   - 仍落后市场水位的个股约 {len(still_lagging)}+ 只（抽样）: {sample}"
+            )
+        if failed_codes:
+            logger.warning(f"   - 最终失败代码抽样: {', '.join(failed_codes[:20])}")
         logger.info(f"   - 总共耗时: {total_elapsed:.1f}秒(约 {total_elapsed/60:.1f}分钟)")
         logger.info("=" * 60)
 

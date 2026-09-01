@@ -73,6 +73,8 @@ def acquire(dict_cursor: bool = False):
         conn.commit()
         if dict_cursor:
             conn.cursor_factory = RealDictCursor
+        else:
+            conn.cursor_factory = None
         return conn
     except Exception:
         try:

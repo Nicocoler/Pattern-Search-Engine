@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 宝塔计划任务：每天 16:30 增量同步当日行情
+# 宝塔计划任务：每天 16:30 增量同步当日行情（含落后个股中间交易日缺口补齐）
 # 推荐以 deploy 用户执行；若用 root 跑宝塔任务，请用：
 #   su - deploy -c '/home/deploy/PSE/scripts/sync_today.sh'
 set -euo pipefail
