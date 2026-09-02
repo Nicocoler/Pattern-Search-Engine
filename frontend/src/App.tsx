@@ -4933,11 +4933,8 @@ export default function App() {
 
             {/* 编排管理：全局尺子 + CRUD */}
             <div className="data-card" style={{ padding: '1rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.8rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+              <div style={{ marginBottom: '0.8rem' }}>
                 <h2 className="panel-title" style={{ margin: 0 }}>编排管理（自定义）</h2>
-                <button className="btn-primary" onClick={openNewBollForm}>
-                  <Sparkles size={14} /> 新建编排
-                </button>
               </div>
 
               <div
@@ -4980,7 +4977,12 @@ export default function App() {
                       例：设为 2 会吃掉只持续 1 天的尖刺；过大可能抹掉真实短促突破。不确定时保持 0。
                     </p>
                   </div>
-                  <button className="btn-primary" onClick={handleSaveBollSettings}>保存全局尺子</button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.85rem', flexWrap: 'wrap' }}>
+                    <button className="btn-primary" onClick={handleSaveBollSettings}>保存全局尺子</button>
+                    <button className="btn-primary" onClick={openNewBollForm}>
+                      <Sparkles size={14} /> 新建编排
+                    </button>
+                  </div>
                   {bollSettings && (
                     <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '0.4rem' }}>
                       当前 denoise={bollSettings.denoise_min_len}
