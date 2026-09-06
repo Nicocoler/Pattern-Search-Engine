@@ -13,9 +13,6 @@ from typing import Any, Mapping, Sequence
 ALLOWED_ZONES = frozenset({"L", "M", "H", "U"})
 ALLOWED_WHEN = frozenset({"limit_up"})
 
-# 涨停判定容差（绝对小数）：主板 10% 用 >= 0.099
-LIMIT_UP_EPS = 0.001
-
 _SIMPLE_ZONE_REGEX = re.compile(
     r"^([LMHU](\+|\*|\?|\{\d+,\d+\}|\{\d+,\}|\{\d+\})?)+$"
 )
@@ -32,8 +29,13 @@ def get_limit_pct(code: str) -> float:
     return 0.10
 
 
+def limit_up_price(code: str, pre_close: float) -> float:
+    """A 股涨停价：前收 × (1+限额) 后四舍五入到分。"""
+    return round(float(pre_close) * (1.0 + get_limit_pct(code)), 2)
+
+
 def is_limit_up(code: str, close: float, pre_close: float) -> bool:
-    """(close/pre_close - 1) >= limit_pct - ε。"""
+    """收盘价 >= 涨停价（按分位四舍五入），避免低价股 9.88% 被 9.9% 阈值误杀。"""
     try:
         c = float(close)
         p = float(pre_close)
@@ -41,7 +43,7 @@ def is_limit_up(code: str, close: float, pre_close: float) -> bool:
         return False
     if p <= 0 or c != c or p != p:  # NaN check
         return False
-    return (c / p - 1.0) >= (get_limit_pct(code) - LIMIT_UP_EPS)
+    return c >= limit_up_price(code, p)
 
 
 def normalize_edges(raw: Any) -> list[dict[str, str]]:
