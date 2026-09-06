@@ -42,7 +42,7 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  padding: 1.5rem 3.5rem; /* 增加左右内边距至 3.5rem，确保在大宽屏下拥有饱满的呼吸边界感 */
+  padding: 0.85rem 3.5rem 1.5rem; /* 顶部收紧，左右保持呼吸感 */
   width: 100%;
   max-width: 100%;
   margin: 0;
@@ -53,16 +53,16 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding-bottom: 1.5rem;
+  padding-bottom: 0.55rem;
   border-bottom: 1px solid var(--border-color);
-  margin-bottom: 1.5rem;
+  margin-bottom: 0.75rem;
 }
 
 .header-left h1 {
-  font-size: 1.8rem;
+  font-size: 1.55rem;
   font-weight: 800;
-  line-height: 1.35;
-  padding-bottom: 0.12em;
+  line-height: 1.25;
+  padding-bottom: 0;
   overflow: visible;
   background: linear-gradient(135deg, #3b82f6 0%, #a78bfa 100%);
   -webkit-background-clip: text;
@@ -70,7 +70,7 @@ body {
   -webkit-text-fill-color: transparent;
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.4rem;
 }
 
 .header-left p {
@@ -298,6 +298,20 @@ body {
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+}
+
+/* 紧凑主按钮：扫描等操作区 */
+.btn-primary.btn-sm {
+  padding: 0.4rem 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  gap: 0.35rem;
+  border-radius: 5px;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.28);
+}
+
+.btn-primary.btn-sm:hover:not(:disabled) {
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.38);
 }
 
 /* Main Display Area */

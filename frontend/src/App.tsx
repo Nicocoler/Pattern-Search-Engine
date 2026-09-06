@@ -4028,7 +4028,7 @@ export default function App() {
       {/* 6.2 Header */}
       <header className="dashboard-header">
         <div className="header-left">
-          <h1><Sparkles size={24} color="#f59e0b" /> 形态选股工作台</h1>
+          <h1><Sparkles size={20} color="#f59e0b" /> 形态选股工作台</h1>
         </div>
       </header>
 
@@ -4616,17 +4616,17 @@ export default function App() {
                     <option value={104}>104</option>
                   </select>
                 </div>
-                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.8rem' }}>
-                  <button className="btn-primary" onClick={handleTriggerBollScan} disabled={bollScanning}>
-                    <Play size={14} /> {bollScanning ? '扫描进行中...' : '触发编排扫描'}
+                <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.15rem', marginBottom: '0.75rem' }}>
+                  <button className="btn-primary btn-sm" onClick={handleTriggerBollScan} disabled={bollScanning}>
+                    <Play size={13} /> {bollScanning ? '扫描进行中...' : '触发编排扫描'}
                   </button>
                   <button
-                    className="btn-primary"
+                    className="btn-primary btn-sm"
                     style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
                     onClick={() => { void fetchBollMatches(); }}
                     disabled={bollLoading}
                   >
-                    <RotateCcw size={14} /> 刷新列表
+                    <RotateCcw size={13} /> 刷新列表
                   </button>
                 </div>
                 {(bollScanning || (bollScanProgress && bollScanProgress.phase !== 'idle')) && bollScanProgress && (
@@ -5582,7 +5582,7 @@ export default function App() {
                         borderTop: '1px solid var(--border-color)',
                         paddingTop: '0.7rem',
                         marginTop: '0.35rem',
-                        marginBottom: '0.75rem',
+                        marginBottom: '0.55rem',
                       }}
                     >
                       <h4 style={{ fontSize: '0.8rem', margin: '0 0 0.5rem', color: 'var(--color-text-main)' }}>
@@ -5655,21 +5655,13 @@ export default function App() {
                           截止日：假装这一天是「今天」。系统只使用该日及之前的行情，回看 window_days（左侧扫描窗口）根交易日做匹配。留空则用库里最新交易日。
                         </p>
                       </div>
-                      <button
-                        className="btn-primary"
-                        onClick={() => { void handleBollTryRun(); }}
-                        disabled={bollTryRunning}
-                        style={{ marginBottom: '0.5rem' }}
-                      >
-                        {bollTryRunning ? '试跑中…' : '试跑'}
-                      </button>
                       {bollTryMessage && (
-                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', margin: '0 0 0.4rem' }}>
+                        <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0.2rem' }}>
                           {bollTryMessage} · 窗口 {bollWindowDays} 日
                         </p>
                       )}
                       {bollTryHits.length > 0 && (
-                        <div className="table-wrapper" style={{ maxHeight: '140px', overflow: 'auto' }}>
+                        <div className="table-wrapper" style={{ maxHeight: '140px', overflow: 'auto', marginTop: '0.35rem' }}>
                           <table className="scan-table">
                             <thead>
                               <tr>
@@ -5711,11 +5703,31 @@ export default function App() {
                       )}
                     </div>
 
-                    <div style={{ display: 'flex', gap: '0.5rem' }}>
-                      <button className="btn-primary" onClick={handleSaveBollPattern}>保存</button>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center', marginTop: '0.15rem' }}>
                       <button
                         className="btn-primary"
-                        style={{ background: 'transparent', border: '1px solid var(--border-color)', boxShadow: 'none' }}
+                        onClick={() => { void handleBollTryRun(); }}
+                        disabled={bollTryRunning}
+                        style={{ padding: '0.45rem 0.9rem', fontSize: '0.82rem' }}
+                      >
+                        {bollTryRunning ? '试跑中…' : '试跑'}
+                      </button>
+                      <button
+                        className="btn-primary"
+                        onClick={handleSaveBollPattern}
+                        style={{ padding: '0.45rem 0.9rem', fontSize: '0.82rem' }}
+                      >
+                        保存
+                      </button>
+                      <button
+                        className="btn-primary"
+                        style={{
+                          padding: '0.45rem 0.9rem',
+                          fontSize: '0.82rem',
+                          background: 'transparent',
+                          border: '1px solid var(--border-color)',
+                          boxShadow: 'none',
+                        }}
                         onClick={() => setBollShowManage(false)}
                       >
                         取消
