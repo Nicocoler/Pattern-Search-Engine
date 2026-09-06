@@ -1390,9 +1390,10 @@ def get_boll_pattern_matches(
     """查询编排命中；end_within 按 period 的 Bar 根数计（ADR 0006）。"""
     conn = get_db_connection()
     cursor = conn.cursor()
+    discard_conn = False
     try:
-        from backend.app.boll_pattern.scanner import BollPatternScanner, recent_bar_end_dates
-        BollPatternScanner().ensure_tables()
+        from backend.app.boll_pattern.scanner import recent_bar_end_dates
+        # 读路径不跑 ensure_tables/seed，避免与扫描写库抢连接、DDL 失败拖垮列表
 
         period_n = None
         if period:
@@ -1428,8 +1429,6 @@ def get_boll_pattern_matches(
             order_sql = "m.score DESC NULLS LAST, m.end_date DESC, m.code ASC"
 
         # JOIN boll_patterns 以支持 period 过滤与展示；收藏表标星
-        from backend.app.boll_pattern.favorites import ensure_favorite_table
-        ensure_favorite_table()
         join_sql = """
             FROM pattern_match_result m
             LEFT JOIN stocks s ON s.code = m.code
@@ -1515,11 +1514,17 @@ def get_boll_pattern_matches(
             "error": None,
         }
     except Exception as e:
+        import psycopg2
+        if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            discard_conn = True
         logger.error(f"查询布林编排命中异常: {e}")
         return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
     finally:
-        cursor.close()
-        db.release(conn)
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        db.release(conn, discard=discard_conn)
 
 
 @app.get("/api/boll-pattern-favorites")
@@ -1680,11 +1685,10 @@ def get_stock_boll_states_api(
 ):
     """单股 %B/zone 状态序列（验真用）。边条件仍仅日线编排可配。"""
     try:
-        from backend.app.boll_pattern.scanner import BollPatternScanner, get_stock_boll_states
+        from backend.app.boll_pattern.scanner import get_stock_boll_states
         period_norm = (period or "daily").strip().lower()
         if period_norm not in ("daily", "weekly", "monthly"):
             return {"success": False, "data": None, "error": "period 须为 daily | weekly | monthly"}
-        BollPatternScanner().ensure_tables()
         states = get_stock_boll_states(symbol, limit=limit, period=period_norm)
         zones = "".join(s["zone"] for s in states)
         return {

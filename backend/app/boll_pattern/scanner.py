@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Sequence
 
@@ -33,11 +34,13 @@ from backend.app.boll_pattern.scoring import score_match_from_window
 from backend.app.boll_pattern.zone import apply_denoise_to_states, state_string, zones_from_series
 from backend.app.chart_subpane import apply_kdj
 from backend.app.core import db
+from backend.app.core.config import settings
 from backend.app.core.timeutil import today_beijing
 from backend.app.market_pipeline import (
     CHART_WARMUP_BARS,
     aggregate_ohlcv,
     prepare_chart_bars,
+    prepare_scan_bars,
 )
 
 logger = logging.getLogger("BollPatternScanner")
@@ -201,14 +204,14 @@ class BollPatternScanner:
         window_bars: int = 60,
     ) -> pd.DataFrame:
         """
-        扫描/试跑用帧：含暖机的完整序列（indicators + pct_b）。
-        日/周/月均走 prepare_chart_bars（周月现算不落 zone 表）。
+        扫描/试跑用帧：含暖机的完整序列（轻量 BOLL + pct_b）。
+        日/周/月均走 prepare_scan_bars（周月现算不落 zone 表）。
         """
         period = normalize_bar_period(period)
         need = int(window_bars) + CHART_WARMUP_BARS
-        # 日线至少保证与 compare 同款暖机量级
+        # 周/月略多留一点，保证聚合后根数够暖机
         lookback = max(need, 120 if period != "daily" else need)
-        return prepare_chart_bars(
+        return prepare_scan_bars(
             code,
             end_date,
             period=period,  # type: ignore[arg-type]
@@ -289,9 +292,20 @@ class BollPatternScanner:
                 pct_val = None
             else:
                 pct_val = float(pct)
-            rows.append((code, r["date"], pct_val, str(r["zone"])))
+            d = r["date"]
+            if hasattr(d, "date") and not isinstance(d, date):
+                d = d.date()
+            rows.append((code, d, pct_val, str(r["zone"])))
         if not rows:
             return 0
+
+        def _pct_same(a, b) -> bool:
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
+                return False
+            return abs(float(a) - float(b)) < 1e-6
+
         sql = """
             INSERT INTO stock_state_daily (code, date, pct_b, zone, updated_at)
             VALUES %s
@@ -301,15 +315,32 @@ class BollPatternScanner:
                 updated_at = NOW();
         """
         with db.db_cursor(dict_cursor=False) as (conn, cur):
+            dates = [r[1] for r in rows]
+            cur.execute(
+                """
+                SELECT date, pct_b, zone
+                FROM stock_state_daily
+                WHERE code = %s AND date = ANY(%s);
+                """,
+                (code, dates),
+            )
+            existing = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+            delta = []
+            for row in rows:
+                prev = existing.get(row[1])
+                if prev is None or (not _pct_same(prev[0], row[2])) or str(prev[1]) != row[3]:
+                    delta.append(row)
+            if not delta:
+                return 0
             execute_values(
                 cur,
                 sql,
-                rows,
+                delta,
                 template="(%s, %s, %s, %s, NOW())",
                 page_size=500,
             )
             conn.commit()
-        return len(rows)
+        return len(delta)
 
     def load_states_window(self, code: str, end_date: date, window_days: int) -> pd.DataFrame:
         with db.db_cursor(dict_cursor=True) as (conn, cursor):
@@ -670,6 +701,7 @@ class BollPatternScanner:
         scan_date: date | None = None,
         period: str = "daily",
         on_progress: Callable[[dict[str, Any]], None] | None = None,
+        max_workers: int | None = None,
     ) -> dict[str, Any]:
         from backend.app.core.timeutil import isoformat_beijing, now_beijing
 
@@ -691,6 +723,10 @@ class BollPatternScanner:
         if window_days <= 0:
             raise ValueError("window_days 必须 > 0")
 
+        workers = int(max_workers) if max_workers is not None else int(settings.BOLL_SCAN_WORKERS)
+        # 2 核+同机 PG：默认 3，硬夹在 1～4，避免把本机库打满
+        workers = max(1, min(4, workers))
+
         started = isoformat_beijing(now_beijing())
         _emit(
             running=True,
@@ -705,7 +741,7 @@ class BollPatternScanner:
             period=period_n,
             scan_date=None,
             current_code=None,
-            message=f"准备扫描池与编排配置（{period_n}）…",
+            message=f"准备扫描池与编排配置（{period_n}，workers={workers}）…",
             started_at=started,
             finished_at=None,
             summary=None,
@@ -729,6 +765,7 @@ class BollPatternScanner:
                 "match_rows_upserted": 0,
                 "match_rows_cleared": 0,
                 "patterns": [],
+                "workers": workers,
                 "message": f"无启用的 {period_n} 编排，已跳过",
             }
             _emit(
@@ -745,8 +782,8 @@ class BollPatternScanner:
             codes=None if codes is None else pool,
         )
         logger.info(
-            "布林编排扫描开始: period=%s scan_date=%s window_days=%s stocks=%d patterns=%d cleared=%d",
-            period_n, end, window_days, len(pool), len(self.enabled_patterns), cleared,
+            "布林编排扫描开始: period=%s scan_date=%s window_days=%s stocks=%d patterns=%d cleared=%d workers=%d",
+            period_n, end, window_days, len(pool), len(self.enabled_patterns), cleared, workers,
         )
 
         total_states = 0
@@ -760,37 +797,48 @@ class BollPatternScanner:
             phase="scanning",
             total=n_pool,
             scan_date=end.isoformat(),
-            message=f"扫描中 0/{n_pool}（{period_n}）",
+            message=f"扫描中 0/{n_pool}（{period_n}，workers={workers}）",
         )
 
         try:
-            for i, code in enumerate(pool, start=1):
-                try:
-                    result = self.process_one(
-                        code, end, window_days=window_days, period=period_n,
-                    )
-                    if result.get("skipped"):
-                        skipped += 1
-                    else:
-                        scanned += 1
-                        total_states += int(result.get("states") or 0)
-                        total_matches += int(result.get("matches") or 0)
-                except Exception as ex:
-                    errors += 1
-                    logger.error("布林编排扫描失败 code=%s: %s", code, ex)
+            def _process(code: str) -> tuple[str, dict[str, Any]]:
+                return code, self.process_one(
+                    code, end, window_days=window_days, period=period_n,
+                )
 
-                if i % 200 == 0 or i == n_pool or i == 1:
-                    logger.info("布林编排扫描进度 %d/%d period=%s", i, n_pool, period_n)
-                if i % 5 == 0 or i == n_pool or i == 1:
-                    _emit(
-                        current=i,
-                        scanned=scanned,
-                        skipped=skipped,
-                        errors=errors,
-                        matches=total_matches,
-                        current_code=code,
-                        message=f"扫描中 {i}/{n_pool}（{period_n}）",
-                    )
+            done_i = 0
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_process, code): code for code in pool}
+                for fut in as_completed(futures):
+                    code = futures[fut]
+                    done_i += 1
+                    try:
+                        _code, result = fut.result()
+                        if result.get("skipped"):
+                            skipped += 1
+                        else:
+                            scanned += 1
+                            total_states += int(result.get("states") or 0)
+                            total_matches += int(result.get("matches") or 0)
+                    except Exception as ex:
+                        errors += 1
+                        logger.error("布林编排扫描失败 code=%s: %s", code, ex)
+
+                    if done_i % 200 == 0 or done_i == n_pool or done_i == 1:
+                        logger.info(
+                            "布林编排扫描进度 %d/%d period=%s workers=%d",
+                            done_i, n_pool, period_n, workers,
+                        )
+                    if done_i % 5 == 0 or done_i == n_pool or done_i == 1:
+                        _emit(
+                            current=done_i,
+                            scanned=scanned,
+                            skipped=skipped,
+                            errors=errors,
+                            matches=total_matches,
+                            current_code=code,
+                            message=f"扫描中 {done_i}/{n_pool}（{period_n}）",
+                        )
 
             summary = {
                 "scan_date": end.isoformat(),
@@ -804,6 +852,7 @@ class BollPatternScanner:
                 "match_rows_upserted": total_matches,
                 "match_rows_cleared": cleared,
                 "patterns": pattern_ids,
+                "workers": workers,
             }
             finished = isoformat_beijing(now_beijing())
             _emit(

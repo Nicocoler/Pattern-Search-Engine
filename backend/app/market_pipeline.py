@@ -13,10 +13,12 @@ from typing import Literal
 
 import pandas as pd
 
+import numpy as np
+
 from backend.app.boll_pattern.pct_b import calc_pct_b
 from backend.app.core import db
 from backend.app.feature_engine.engine import calculate_features
-from backend.app.indicator_engine.engine import calculate_indicators
+from backend.app.indicator_engine.engine import apply_boll, calculate_indicators
 
 # 与 /api/compare/template/.../stock/... 中 lookback_days=250 锁死一致
 COMPARE_LOOKBACK_DAYS = 250
@@ -165,6 +167,64 @@ def prepare_chart_bars(
     df = df.copy()
     if "boll_upper" in df.columns and "boll_lower" in df.columns:
         df["pct_b"] = calc_pct_b(df["close"], df["boll_upper"], df["boll_lower"])
+    return df.reset_index(drop=True)
+
+
+def scan_load_calendar_days(period: ChartPeriod, lookback_bars: int) -> int:
+    """
+    编排扫描用日历回看：按窗口+暖机估算，不强制对齐 compare 的 250 日。
+    """
+    need = max(1, int(lookback_bars))
+    factor = _PERIOD_CALENDAR_FACTOR.get(period, 2)
+    return max(need * factor, need + 20)
+
+
+def prepare_scan_indicators(df_bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    扫描专用轻量指标：停牌平滑 + BOLL + pct_b（不算 MA/RSI/ATR/量比）。
+    KDJ 由调用方按需 apply_kdj。
+    """
+    if df_bars is None or df_bars.empty:
+        return pd.DataFrame()
+
+    df = df_bars.sort_values("date").reset_index(drop=True).copy()
+    is_suspended = df["volume"] == 0
+    df.loc[is_suspended, ["open", "high", "low", "close"]] = np.nan
+    for col in ("close", "open", "high", "low"):
+        df[col] = df[col].ffill().bfill()
+
+    apply_boll(df)
+    df["pct_b"] = calc_pct_b(df["close"], df["boll_upper"], df["boll_lower"])
+    return df
+
+
+def prepare_scan_bars(
+    code: str,
+    end_date: date,
+    *,
+    period: ChartPeriod = "daily",
+    lookback_bars: int = 100,
+) -> pd.DataFrame:
+    """
+    编排扫描/试跑用帧：轻量指标 + 按窗口估算回看（不拉满 compare 250 日）。
+    返回含暖机的完整序列；匹配侧再 `.tail(window_bars)`。
+    """
+    code = code.lower().strip()
+    period = period if period in ("daily", "weekly", "monthly") else "daily"
+    lookback_bars = max(1, int(lookback_bars))
+
+    cal = scan_load_calendar_days(period, lookback_bars)
+    df_raw = load_stock_bars(code, end_date, lookback_days=cal)
+    if df_raw.empty:
+        return pd.DataFrame()
+
+    df_agg = aggregate_ohlcv(df_raw, period)
+    if df_agg.empty:
+        return pd.DataFrame()
+
+    df = prepare_scan_indicators(df_agg)
+    if df.empty:
+        return pd.DataFrame()
     return df.reset_index(drop=True)
 
 

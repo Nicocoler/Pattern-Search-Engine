@@ -10,6 +10,7 @@ PSE - 统一数据库连接池管理 (DB Pool)
    dict cursor 或普通 tuple cursor，向后兼容现有各模块的 row 访问语义（RealDictRow / 索引）。
 3. db_cursor 上下文管理器统一封装 acquire / cur / release，finally 保证归还连接，
    一并解决历史代码中缺失 try/finally 导致的连接泄漏。
+4. OperationalError / InterfaceError 时丢弃坏连接，避免「server closed」后脏连接回池连环失败。
 注意：跨进程不可见，仅适用于单 worker 部署（跨进程需 Redis/DB 行锁，见 docs）。
 """
 
@@ -18,6 +19,7 @@ import threading
 from contextlib import contextmanager
 
 import psycopg2
+from psycopg2 import extensions as pg_ext
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
@@ -55,6 +57,17 @@ def _get_pool() -> ThreadedConnectionPool:
     return _pool
 
 
+def _conn_looks_broken(conn) -> bool:
+    """判断连接是否已不可复用。"""
+    try:
+        if conn is None or conn.closed:
+            return True
+        # 非 IDLE 的事务态（含 aborted）归还前若 rollback 失败，视为坏连接
+        return False
+    except Exception:
+        return True
+
+
 def acquire(dict_cursor: bool = False):
     """
     从池中取出一条连接。
@@ -66,35 +79,59 @@ def acquire(dict_cursor: bool = False):
     """
     from backend.app.core.timeutil import BEIJING_TZ_NAME
 
-    conn = _get_pool().getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SET TIME ZONE %s;", (BEIJING_TZ_NAME,))
-        conn.commit()
-        if dict_cursor:
-            conn.cursor_factory = RealDictCursor
-        else:
-            conn.cursor_factory = None
-        return conn
-    except Exception:
+    last_err: Exception | None = None
+    # 坏连接回池后，最多再取一次新连接
+    for _ in range(2):
+        conn = _get_pool().getconn()
         try:
-            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute("SET TIME ZONE %s;", (BEIJING_TZ_NAME,))
+            conn.commit()
+            if dict_cursor:
+                conn.cursor_factory = RealDictCursor
+            else:
+                conn.cursor_factory = None
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as ex:
+            last_err = ex
+            logger.warning("acquire 拿到坏连接，已丢弃并重试: %s", ex)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                _get_pool().putconn(conn, close=True)
+            except Exception:
+                pass
         except Exception:
-            pass
-        try:
-            _get_pool().putconn(conn, close=True)
-        except Exception:
-            pass
-        raise
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                _get_pool().putconn(conn, close=True)
+            except Exception:
+                pass
+            raise
+    raise last_err or psycopg2.OperationalError("无法从连接池获取可用连接")
 
 
-def release(conn) -> None:
-    """归还连接到池。连接异常时关闭后归还，避免脏连接复用。"""
+def release(conn, *, discard: bool = False) -> None:
+    """归还连接到池。discard=True 或连接已关闭时关闭丢弃，避免脏连接复用。"""
+    if conn is None:
+        return
     pool = _get_pool()
+    broken = discard or _conn_looks_broken(conn)
+    if not broken:
+        try:
+            status = conn.get_transaction_status()
+            if status != pg_ext.TRANSACTION_STATUS_IDLE:
+                conn.rollback()
+        except Exception:
+            broken = True
     try:
-        pool.putconn(conn)
+        pool.putconn(conn, close=broken)
     except Exception:
-        # 连接已损坏，直接关闭并丢弃，防止脏连接回到池中
         try:
             conn.close()
         except Exception:
@@ -116,14 +153,22 @@ def db_cursor(dict_cursor: bool = False):
     """
     conn = acquire(dict_cursor=dict_cursor)
     cur = conn.cursor()
+    discard = False
     try:
         yield conn, cur
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        discard = True
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         try:
             cur.close()
         except Exception:
             pass
-        release(conn)
+        release(conn, discard=discard)
 
 
 @contextmanager
@@ -133,10 +178,18 @@ def db_conn(dict_cursor: bool = False):
     finally 保证归还连接。
     """
     conn = acquire(dict_cursor=dict_cursor)
+    discard = False
     try:
         yield conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        discard = True
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        release(conn)
+        release(conn, discard=discard)
 
 
 def closeall() -> None:

@@ -1368,8 +1368,11 @@ export default function App() {
       } else {
         showToast('拉取编排命中失败：' + (json.error || ''));
       }
-    } catch {
-      showToast('拉取编排命中异常，请检查后端。');
+    } catch (err) {
+      const msg = err instanceof TypeError
+        ? '无法连接后端（本机未起 API 或 VITE_API_BASE 未指向服务器）'
+        : '拉取编排命中异常，请检查后端。';
+      showToast(msg);
     } finally {
       setBollLoading(false);
     }

@@ -51,6 +51,12 @@ class Settings:
     REQUEST_BACKOFF_FACTOR: float = 1.0  # 指数退避倍率
     BATCH_RETRY_COOLDOWN_SEC: float = 10.0  # 批量同步首轮失败后，补拉前的冷却秒数
 
+    # 布林编排全市场扫描并发（2 核+同机 PG 建议 2～4；默认 3）
+    try:
+        BOLL_SCAN_WORKERS: int = int(os.getenv("BOLL_SCAN_WORKERS", "3") or "3")
+    except ValueError:
+        BOLL_SCAN_WORKERS: int = 3
+
     # 形态剪枝与除权检测阈值（集中管理，避免散落魔法数字）
     BOLL_PRUNE_THRESHOLD: float = 0.045      # 候选窗口内收盘距布林中轨最小绝对偏离，大于此值直接剪枝
     DIRTY_FACTOR_PRICE_DIFF: float = 0.015   # 前复权收盘价自交叉比对差分阈值，超过视为发生除权
