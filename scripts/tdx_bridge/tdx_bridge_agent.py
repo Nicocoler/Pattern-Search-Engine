@@ -18,11 +18,13 @@ import argparse
 import json
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 GBK = "gbk"
 RECORD_SIZE = 120
@@ -45,6 +47,8 @@ DEFAULT_CONFIG = {
     "block_name": "PSE布林",
     "block_abbr": "PSE",
     "poll_sec": 2,
+    # https 用 IP 访问时证书域名对不上，需关闭校验；域名备案正常后可改 true
+    "ssl_verify": True,
 }
 
 
@@ -221,6 +225,7 @@ def run_setup(cfg: dict) -> dict:
     print("直接回车 = 保持当前值\n")
 
     cfg["api_base"] = _prompt("服务器地址 api_base", str(cfg.get("api_base") or "")).rstrip("/")
+    print("  (云端若域名 HTTPS 失败，可填 https://服务器公网IP ，例如 https://47.103.82.155)")
     cfg["bridge_token"] = _prompt("桥接口令 bridge_token", str(cfg.get("bridge_token") or ""))
 
     detected = detect_tdx_root()
@@ -244,14 +249,44 @@ def run_setup(cfg: dict) -> dict:
     return cfg
 
 
-def _request(method: str, url: str, token: str, body: dict | None = None) -> dict:
+def _is_ip_host(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").strip()
+    except Exception:
+        return False
+    if not host:
+        return False
+    # IPv4
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+        return True
+    # bare IPv6 in brackets already stripped by urlparse
+    if ":" in host:
+        return True
+    return False
+
+
+def _request(
+    method: str,
+    url: str,
+    token: str,
+    body: dict | None = None,
+    *,
+    ssl_verify: bool = True,
+) -> dict:
     data = None
     headers = {"X-TDX-Bridge-Token": token, "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as resp:
+
+    # 域名未备案时，SNI=域名会被掐断；用 IP + 关闭证书校验可直连
+    need_insecure = (not ssl_verify) or _is_ip_host(url)
+    ctx = None
+    if url.lower().startswith("https://") and need_insecure:
+        ctx = ssl._create_unverified_context()
+
+    with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -276,12 +311,20 @@ def run_loop(cfg: dict) -> int:
     print(f"[tdx-bridge] 配置: {config_path()}")
     print(f"[tdx-bridge] api={api_base}")
     print(f"[tdx-bridge] tdx_root={tdx_root}")
+    ssl_verify = bool(cfg.get("ssl_verify", True))
+    if _is_ip_host(api_base) or not ssl_verify:
+        print("[tdx-bridge] https: 已对 IP/关闭校验 使用 insecure SSL（证书域名不校验）")
     print(f"[tdx-bridge] poll={poll_sec}s  |  改设置: --setup  |  Ctrl+C 退出")
 
     last_id: str | None = None
     while True:
         try:
-            raw = _request("GET", f"{api_base}/api/tdx/bridge/pull", token)
+            raw = _request(
+                "GET",
+                f"{api_base}/api/tdx/bridge/pull",
+                token,
+                ssl_verify=ssl_verify,
+            )
             if not raw.get("success"):
                 print(f"[tdx-bridge] pull 失败: {raw.get('error')}")
             else:
@@ -301,6 +344,7 @@ def run_loop(cfg: dict) -> int:
                         f"{api_base}/api/tdx/bridge/ack",
                         token,
                         {"id": job["id"]},
+                        ssl_verify=ssl_verify,
                     )
                     last_id = job["id"]
                     print(
