@@ -4,5 +4,5 @@
   "tdx_root": "D:\\SoftInstall\\new_tdx",
   "block_name": "PSE布林",
   "block_abbr": "PSE",
-  "poll_sec": 2
+  "poll_sec": 10.0
 }

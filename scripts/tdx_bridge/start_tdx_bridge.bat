@@ -1,56 +1,40 @@
 @echo off
-chcp 65001 >nul
 cd /d "%~dp0"
 
 echo ========================================
-echo   é€šè¾¾ä¿¡åŒæ­¥åŠ©æ‰‹
-echo   é…ç½®æ–‡ä»¶: tdx_bridge_config.json
+echo   Tongdaxin Sync Helper
+echo   config: tdx_bridge_config.json
 echo ========================================
-echo   [1] å¼€å§‹åŒæ­¥
-echo   [2] ä¿®æ”¹è®¾ç½®ï¼ˆæœåŠ¡å™¨åœ°å€ / å£ä»¤ç­‰ï¼‰
-echo   [3] ç”¨è®°äº‹æœ¬æ‰“å¼€é…ç½®æ–‡ä»¶
+echo   [1] ¿ªÊ¼Í¬²½
+echo   [2] ĞŞ¸ÄÉèÖÃ
+echo   [3] ¼ÇÊÂ±¾´ò¿ªÅäÖÃ
 echo ========================================
-set /p choice=è¯·é€‰æ‹© (1/2/3ï¼Œé»˜è®¤1): 
+set /p choice=ÇëÑ¡Ôñ 1/2/3 Ä¬ÈÏ1: 
 
 set "EXE=%~dp0tdx_bridge_agent.exe"
 set "PY=%~dp0tdx_bridge_agent.py"
 
-if exist "%EXE%" (
-  set "RUN=%EXE%"
-) else if exist "%PY%" (
-  set "RUN=python "%PY%""
-) else (
-  echo æœªæ‰¾åˆ° tdx_bridge_agent.exe / .py
+if not exist "%EXE%" if not exist "%PY%" (
+  echo Î´ÕÒµ½ tdx_bridge_agent.exe »ò .py
   pause
   exit /b 1
 )
 
-if "%choice%"=="2" (
-  if exist "%EXE%" (
-    "%EXE%" --setup
-  ) else (
-    python "%PY%" --setup
-  )
-  goto end
-)
-if "%choice%"=="3" (
-  if not exist "%~dp0tdx_bridge_config.json" (
-    if exist "%EXE%" (
-      "%EXE%" --setup
-    ) else (
-      python "%PY%" --setup
-    )
-  ) else (
-    notepad "%~dp0tdx_bridge_config.json"
-  )
-  goto end
-)
+if "%choice%"=="2" goto do_setup
+if "%choice%"=="3" goto do_edit
+goto do_run
 
-if exist "%EXE%" (
-  "%EXE%"
-) else (
-  python "%PY%"
-)
+:do_setup
+if exist "%EXE%" ("%EXE%" --setup) else (python "%PY%" --setup)
+goto do_end
 
-:end
+:do_edit
+if not exist "%~dp0tdx_bridge_config.json" goto do_setup
+notepad "%~dp0tdx_bridge_config.json"
+goto do_end
+
+:do_run
+if exist "%EXE%" ("%EXE%") else (python "%PY%")
+
+:do_end
 pause
