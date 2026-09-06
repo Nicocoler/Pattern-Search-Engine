@@ -23,7 +23,8 @@ import {
   Info,
   Search,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  GripVertical
 } from 'lucide-react';
 import './App.css';
 import { DatePickerField } from './components/DatePickerField';
@@ -168,6 +169,7 @@ interface BollPatternMeta {
   denoise_min_len?: number | null;
   edges?: BollPatternEdge[];
   indicators?: BollPatternIndicator[];
+  sort_order?: number;
   effective?: {
     zone_thresholds: Record<string, [string | number, string | number]>;
     denoise_min_len: number;
@@ -786,6 +788,11 @@ export default function App() {
   const bollAxisTooltipPosRef = useRef<{ key: string; index: number; pos: [number, number] } | null>(null);
   const stockViewAxisTooltipPosRef = useRef<{ key: string; index: number; pos: [number, number] } | null>(null);
   const [bollShowManage, setBollShowManage] = useState(false);
+  const [bollManageOnlyEnabled, setBollManageOnlyEnabled] = useState(
+    () => localStorage.getItem('boll_manage_only_enabled') === '1',
+  );
+  const [bollReorderBusy, setBollReorderBusy] = useState(false);
+  const [bollDragId, setBollDragId] = useState<string | null>(null);
   const [bollEditId, setBollEditId] = useState<string | null>(null);
   const [bollForm, setBollForm] = useState({
     id: '',
@@ -1172,16 +1179,15 @@ export default function App() {
         }
         showToast('编排已更新');
       } else {
-        if (!bollForm.id.trim()) {
-          showToast('请填写编排 id');
+        if (!bollForm.name.trim()) {
+          showToast('请填写编排名称');
           return;
         }
         const res = await fetch(`${apiBase}/api/boll-patterns`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            id: bollForm.id,
-            name: bollForm.name,
+            name: bollForm.name.trim(),
             regex: bollForm.regex,
             period: bollForm.period,
             min_total_days: bollForm.min_total_days,
@@ -1206,21 +1212,6 @@ export default function App() {
     }
   };
 
-  const handleDisableBollPattern = async (id: string) => {
-    try {
-      const res = await fetch(`${apiBase}/api/boll-patterns/${id}/disable`, { method: 'POST' });
-      const json = await res.json();
-      if (!json.success) {
-        showToast('禁用失败：' + (json.error || ''));
-        return;
-      }
-      showToast('已软禁用编排（历史命中保留）');
-      void fetchBollPatterns();
-    } catch {
-      showToast('禁用编排异常');
-    }
-  };
-
   const handleToggleBollEnabled = async (p: BollPatternMeta, enabled: boolean) => {
     try {
       const res = await fetch(`${apiBase}/api/boll-patterns/${p.id}`, {
@@ -1237,6 +1228,60 @@ export default function App() {
     } catch {
       showToast('更新启用状态异常');
     }
+  };
+
+  const persistBollPatternOrder = async (next: BollPatternMeta[]) => {
+    const prev = bollPatterns;
+    setBollPatterns(next);
+    setBollReorderBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/boll-patterns/reorder`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ordered_ids: next.map(p => p.id) }),
+      });
+      const json = await res.json();
+      if (!json.success) {
+        setBollPatterns(prev);
+        showToast('调整顺序失败：' + (json.error || ''));
+        return;
+      }
+      if (Array.isArray(json.data?.patterns)) {
+        setBollPatterns(json.data.patterns);
+      }
+    } catch {
+      setBollPatterns(prev);
+      showToast('调整顺序异常');
+    } finally {
+      setBollReorderBusy(false);
+    }
+  };
+
+  const moveBollPattern = (id: string, delta: -1 | 1) => {
+    if (bollReorderBusy || bollManageOnlyEnabled) return;
+    const idx = bollPatterns.findIndex(p => p.id === id);
+    if (idx < 0) return;
+    const target = idx + delta;
+    if (target < 0 || target >= bollPatterns.length) return;
+    const next = [...bollPatterns];
+    const [row] = next.splice(idx, 1);
+    next.splice(target, 0, row);
+    void persistBollPatternOrder(next);
+  };
+
+  const handleBollPatternDrop = (targetId: string) => {
+    if (bollReorderBusy || bollManageOnlyEnabled || !bollDragId || bollDragId === targetId) {
+      setBollDragId(null);
+      return;
+    }
+    const from = bollPatterns.findIndex(p => p.id === bollDragId);
+    const to = bollPatterns.findIndex(p => p.id === targetId);
+    setBollDragId(null);
+    if (from < 0 || to < 0 || from === to) return;
+    const next = [...bollPatterns];
+    const [row] = next.splice(from, 1);
+    next.splice(to, 0, row);
+    void persistBollPatternOrder(next);
   };
 
   const handleSaveBollSettings = async () => {
@@ -3966,6 +4011,11 @@ export default function App() {
   // -----------------------------------------------------------------------------
   // 6. UI 主结构渲染 (Main JSX Render)
   // -----------------------------------------------------------------------------
+  const bollPatternsForManage = bollManageOnlyEnabled
+    ? bollPatterns.filter(p => p.enabled)
+    : bollPatterns;
+  const bollReorderLocked = bollReorderBusy || bollManageOnlyEnabled;
+
   return (
     <div className="dashboard-container">
 
@@ -4967,8 +5017,206 @@ export default function App() {
 
             {/* 编排管理：全局尺子 + CRUD */}
             <div className="data-card" style={{ padding: '1rem' }}>
-              <div style={{ marginBottom: '0.8rem' }}>
+              <div style={{ marginBottom: '0.8rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
                 <h2 className="panel-title" style={{ margin: 0 }}>编排管理（自定义）</h2>
+                <button className="btn-primary" onClick={openNewBollForm}>
+                  <Sparkles size={14} /> 新建编排
+                </button>
+              </div>
+
+              <div className="table-wrapper" style={{ maxHeight: '480px', overflow: 'auto', marginBottom: '1rem' }}>
+                <table className="scan-table">
+                  <thead>
+                    <tr>
+                      <th style={{ width: 88, padding: '0.8rem 0.5rem' }}>顺序</th>
+                      <th>id</th>
+                      <th>名称</th>
+                      <th style={{ whiteSpace: 'nowrap' }}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          启用
+                          <label
+                            title={
+                              bollManageOnlyEnabled
+                                ? `仅已启用（显示 ${bollPatternsForManage.length}/${bollPatterns.length}，筛选中不可调序）`
+                                : `仅已启用（显示 ${bollPatternsForManage.length}/${bollPatterns.length}）`
+                            }
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 3,
+                              fontSize: '0.72rem',
+                              fontWeight: 500,
+                              color: 'var(--color-text-muted)',
+                              cursor: 'pointer',
+                              userSelect: 'none',
+                            }}
+                            onClick={e => e.stopPropagation()}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={bollManageOnlyEnabled}
+                              onChange={e => {
+                                const on = e.target.checked;
+                                setBollManageOnlyEnabled(on);
+                                localStorage.setItem('boll_manage_only_enabled', on ? '1' : '0');
+                              }}
+                            />
+                            仅已启用
+                          </label>
+                        </span>
+                      </th>
+                      <th>尺子</th>
+                      <th>regex / 走势</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bollPatternsForManage.map((p, idx) => (
+                      <tr
+                        key={p.id}
+                        onDragOver={(e) => { e.preventDefault(); }}
+                        onDrop={() => handleBollPatternDrop(p.id)}
+                        style={{
+                          opacity: bollDragId === p.id ? 0.55 : 1,
+                        }}
+                      >
+                        <td style={{ padding: '0.5rem', verticalAlign: 'middle' }}>
+                          <div
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 2,
+                            }}
+                          >
+                            <span
+                              draggable={!bollReorderLocked}
+                              title={bollManageOnlyEnabled ? '显示全部后可调整顺序' : '拖拽调整顺序'}
+                              onDragStart={(e) => {
+                                if (bollReorderLocked) {
+                                  e.preventDefault();
+                                  return;
+                                }
+                                e.dataTransfer.effectAllowed = 'move';
+                                e.dataTransfer.setData('text/plain', p.id);
+                                setBollDragId(p.id);
+                              }}
+                              onDragEnd={() => setBollDragId(null)}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                width: 22,
+                                height: 28,
+                                color: 'var(--color-text-muted)',
+                                cursor: bollReorderLocked ? 'default' : 'grab',
+                                borderRadius: 4,
+                                opacity: bollManageOnlyEnabled ? 0.4 : 1,
+                              }}
+                            >
+                              <GripVertical size={14} />
+                            </span>
+                            <button
+                              type="button"
+                              title={bollManageOnlyEnabled ? '显示全部后可调整顺序' : '上移'}
+                              disabled={bollReorderLocked || idx === 0}
+                              onClick={() => moveBollPattern(p.id, -1)}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                width: 22,
+                                height: 22,
+                                padding: 0,
+                                margin: 0,
+                                color: 'var(--color-text-muted)',
+                                background: 'transparent',
+                                border: '1px solid var(--border-color)',
+                                borderRadius: 4,
+                                cursor: bollReorderLocked || idx === 0 ? 'not-allowed' : 'pointer',
+                                opacity: bollManageOnlyEnabled || idx === 0 ? 0.35 : 1,
+                              }}
+                            >
+                              <ChevronUp size={12} />
+                            </button>
+                            <button
+                              type="button"
+                              title={bollManageOnlyEnabled ? '显示全部后可调整顺序' : '下移'}
+                              disabled={bollReorderLocked || idx === bollPatternsForManage.length - 1}
+                              onClick={() => moveBollPattern(p.id, 1)}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                width: 22,
+                                height: 22,
+                                padding: 0,
+                                margin: 0,
+                                color: 'var(--color-text-muted)',
+                                background: 'transparent',
+                                border: '1px solid var(--border-color)',
+                                borderRadius: 4,
+                                cursor: bollReorderLocked || idx === bollPatternsForManage.length - 1 ? 'not-allowed' : 'pointer',
+                                opacity: bollManageOnlyEnabled || idx === bollPatternsForManage.length - 1 ? 0.35 : 1,
+                              }}
+                            >
+                              <ChevronDown size={12} />
+                            </button>
+                          </div>
+                        </td>
+                        <td style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{p.id}</td>
+                        <td>
+                          {p.name}
+                          <span style={{ marginLeft: 6, color: '#94a3b8', fontSize: '0.68rem' }}>
+                            {CHART_PERIOD_LABEL[(p.period as ChartPeriod) || 'daily']}
+                          </span>
+                        </td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={p.enabled}
+                            onChange={e => { void handleToggleBollEnabled(p, e.target.checked); }}
+                          />
+                        </td>
+                        <td style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+                          {p.zone_thresholds != null || p.denoise_min_len != null ? '自定义' : '全局'}
+                        </td>
+                        <td style={{ fontSize: '0.7rem', maxWidth: 260 }}>
+                          <div style={{ fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {p.regex}
+                          </div>
+                          {(() => {
+                            const d = describeBollRegex(p.regex || '');
+                            return (
+                              <div
+                                style={{
+                                  marginTop: '0.2rem',
+                                  color: bollRegexDescribeColor(d.kind),
+                                  lineHeight: 1.35,
+                                  display: '-webkit-box',
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: 'vertical',
+                                  overflow: 'hidden',
+                                }}
+                                title={d.text}
+                              >
+                                {d.text}
+                              </div>
+                            );
+                          })()}
+                        </td>
+                        <td>
+                          <button
+                            className="btn-primary"
+                            style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+                            onClick={() => openEditBollForm(p)}
+                          >
+                            编辑
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
 
               <div
@@ -5013,9 +5261,6 @@ export default function App() {
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.85rem', flexWrap: 'wrap' }}>
                     <button className="btn-primary" onClick={handleSaveBollSettings}>保存全局尺子</button>
-                    <button className="btn-primary" onClick={openNewBollForm}>
-                      <Sparkles size={14} /> 新建编排
-                    </button>
                   </div>
                   {bollSettings && (
                     <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '0.4rem' }}>
@@ -5027,17 +5272,17 @@ export default function App() {
                 {bollShowManage && (
                   <div style={{ minWidth: 0 }}>
                     <h3 style={{ fontSize: '0.85rem', marginBottom: '0.5rem' }}>
-                      {bollEditId ? `编辑编排（id 不可改）` : '新建编排'}
+                      {bollEditId ? '编辑编排' : '新建编排'}
                     </h3>
-                    {!bollEditId && (
+                    {bollEditId && (
                       <div className="form-group">
-                        <label>id</label>
-                        <input value={bollForm.id} onChange={e => setBollForm(f => ({ ...f, id: e.target.value.trim() }))} placeholder="my_pattern_id" />
+                        <label>id（系统生成，不可改）</label>
+                        <input value={bollEditId} disabled style={{ fontFamily: 'monospace', opacity: 0.75 }} />
                       </div>
                     )}
                     <div className="form-group">
                       <label>名称</label>
-                      <input value={bollForm.name} onChange={e => setBollForm(f => ({ ...f, name: e.target.value }))} />
+                      <input value={bollForm.name} onChange={e => setBollForm(f => ({ ...f, name: e.target.value }))} placeholder="如 中轨突破回落横盘" />
                     </div>
                     <div className="form-group">
                       <label>周期（创建后不可改）</label>
@@ -5477,85 +5722,6 @@ export default function App() {
                 )}
               </div>
 
-              <div className="table-wrapper" style={{ maxHeight: '480px', overflow: 'auto' }}>
-                <table className="scan-table">
-                  <thead>
-                    <tr>
-                      <th>id</th>
-                      <th>名称</th>
-                      <th>启用</th>
-                      <th>尺子</th>
-                      <th>regex / 走势</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bollPatterns.map(p => (
-                      <tr key={p.id}>
-                        <td style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{p.id}</td>
-                        <td>
-                          {p.name}
-                          <span style={{ marginLeft: 6, color: '#94a3b8', fontSize: '0.68rem' }}>
-                            {CHART_PERIOD_LABEL[(p.period as ChartPeriod) || 'daily']}
-                          </span>
-                        </td>
-                        <td>
-                          <input
-                            type="checkbox"
-                            checked={p.enabled}
-                            onChange={e => { void handleToggleBollEnabled(p, e.target.checked); }}
-                          />
-                        </td>
-                        <td style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
-                          {p.zone_thresholds != null || p.denoise_min_len != null ? '自定义' : '全局'}
-                        </td>
-                        <td style={{ fontSize: '0.7rem', maxWidth: 260 }}>
-                          <div style={{ fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {p.regex}
-                          </div>
-                          {(() => {
-                            const d = describeBollRegex(p.regex || '');
-                            return (
-                              <div
-                                style={{
-                                  marginTop: '0.2rem',
-                                  color: bollRegexDescribeColor(d.kind),
-                                  lineHeight: 1.35,
-                                  display: '-webkit-box',
-                                  WebkitLineClamp: 2,
-                                  WebkitBoxOrient: 'vertical',
-                                  overflow: 'hidden',
-                                }}
-                                title={d.text}
-                              >
-                                {d.text}
-                              </div>
-                            );
-                          })()}
-                        </td>
-                        <td>
-                          <button
-                            className="btn-primary"
-                            style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', marginRight: '0.3rem' }}
-                            onClick={() => openEditBollForm(p)}
-                          >
-                            编辑
-                          </button>
-                          {p.enabled && (
-                            <button
-                              className="btn-primary"
-                              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', background: 'rgba(239,68,68,0.2)', boxShadow: 'none' }}
-                              onClick={() => { void handleDisableBollPattern(p.id); }}
-                            >
-                              禁用
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
             </div>
             </div>
           )}

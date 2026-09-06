@@ -178,8 +178,11 @@ class BollPatternPreviewPayload(BaseModel):
     )
 
 class BollPatternCreatePayload(BaseModel):
-    id: str = Field(..., description="编排唯一 id，创建后不可改")
-    name: str = Field(...)
+    id: str | None = Field(
+        default=None,
+        description="可选；省略则服务端自动生成 bp_xxxxxxxx；创建后不可改",
+    )
+    name: str = Field(..., description="编排名称（必填）")
     regex: str = Field(...)
     period: str = Field(default="daily", description="Bar Period：daily|weekly|monthly；创建后不可改")
     min_total_days: int = Field(default=0)
@@ -244,6 +247,10 @@ class BollFavoriteNotePayload(BaseModel):
 class BollPatternSettingsPayload(BaseModel):
     zone_thresholds: dict | None = None
     denoise_min_len: int | None = None
+
+
+class BollPatternReorderPayload(BaseModel):
+    ordered_ids: list[str] = Field(..., description="全部编排 id 的新全局顺序")
 
 # 辅助数据库连接（走统一连接池，返回字典游标）
 def get_db_connection():
@@ -1146,6 +1153,31 @@ def create_boll_pattern(payload: BollPatternCreatePayload):
         return {"success": False, "data": None, "error": str(e)}
     except Exception as e:
         logger.error(f"创建布林编排异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.post("/api/boll-patterns/reorder")
+def reorder_boll_patterns(payload: BollPatternReorderPayload):
+    """按有序 id 列表重写全局 sort_order；影响管理表与扫描下拉。"""
+    try:
+        from backend.app.boll_pattern.repository import (
+            get_settings,
+            reorder_patterns,
+            serialize_pattern_for_api,
+        )
+        rows = reorder_patterns(payload.ordered_ids)
+        settings = get_settings()
+        return {
+            "success": True,
+            "data": {
+                "patterns": [serialize_pattern_for_api(p, settings) for p in rows],
+            },
+            "error": None,
+        }
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"重排布林编排异常: {e}")
         return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
 
 

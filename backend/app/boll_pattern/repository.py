@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 from psycopg2.extras import Json
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS boll_patterns (
     edges JSONB NOT NULL DEFAULT '[]'::jsonb,
     indicators JSONB NOT NULL DEFAULT '[]'::jsonb,
     period VARCHAR(16) NOT NULL DEFAULT 'daily',
+    sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -91,6 +93,88 @@ def ensure_pattern_tables() -> None:
             WHERE period IS NULL OR TRIM(period) = '' OR period NOT IN ('daily', 'weekly', 'monthly');
             """
         )
+        cur.execute(
+            """
+            ALTER TABLE boll_patterns
+            ADD COLUMN IF NOT EXISTS sort_order INT;
+            """
+        )
+        # 存量按当前 id ASC 回填，保持升级前列表观感
+        cur.execute(
+            """
+            WITH ordered AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY id ASC) AS rn
+                FROM boll_patterns
+                WHERE sort_order IS NULL
+            )
+            UPDATE boll_patterns p
+            SET sort_order = o.rn
+            FROM ordered o
+            WHERE p.id = o.id;
+            """
+        )
+        cur.execute(
+            """
+            UPDATE boll_patterns
+            SET sort_order = 0
+            WHERE sort_order IS NULL;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE boll_patterns
+            ALTER COLUMN sort_order SET DEFAULT 0,
+            ALTER COLUMN sort_order SET NOT NULL;
+            """
+        )
+        conn.commit()
+    _migrate_legacy_pattern_ids()
+
+
+_AUTO_PATTERN_ID_RE = re.compile(r"^bp_[0-9a-f]{12}$")
+
+
+def _migrate_legacy_pattern_ids() -> None:
+    """将手填/中文等旧 id 改为 bp_xxxxxxxxxxxx，并同步命中与收藏引用。"""
+    with db.db_cursor(dict_cursor=False) as (conn, cur):
+        cur.execute("SELECT id FROM boll_patterns;")
+        rows = cur.fetchall() or []
+        existing = {str(r[0]) for r in rows}
+        legacy = [pid for pid in existing if not _AUTO_PATTERN_ID_RE.match(pid)]
+        if not legacy:
+            return
+
+        def _alloc() -> str:
+            for _ in range(8):
+                cand = f"bp_{uuid.uuid4().hex[:12]}"
+                if cand not in existing:
+                    existing.add(cand)
+                    return cand
+            raise RuntimeError("无法生成唯一编排 id")
+
+        mapping = [(old, _alloc()) for old in legacy]
+
+        cur.execute("SELECT to_regclass('public.pattern_match_result');")
+        has_matches = bool(cur.fetchone()[0])
+        cur.execute("SELECT to_regclass('public.pattern_match_favorite');")
+        has_favorites = bool(cur.fetchone()[0])
+
+        for old_id, new_id in mapping:
+            if has_matches:
+                cur.execute(
+                    "UPDATE pattern_match_result SET pattern_id = %s WHERE pattern_id = %s;",
+                    (new_id, old_id),
+                )
+            if has_favorites:
+                cur.execute(
+                    "UPDATE pattern_match_favorite SET pattern_id = %s WHERE pattern_id = %s;",
+                    (new_id, old_id),
+                )
+            cur.execute(
+                "UPDATE boll_patterns SET id = %s WHERE id = %s;",
+                (new_id, old_id),
+            )
+            logger.info("编排 id 迁移: %s -> %s", old_id, new_id)
         conn.commit()
 
 
@@ -137,6 +221,7 @@ def _pattern_from_row(row: dict) -> dict[str, Any]:
         ),
         "edges": _row_edges(row.get("edges")),
         "indicators": _row_indicators(row.get("indicators")),
+        "sort_order": int(row["sort_order"] or 0) if row.get("sort_order") is not None else 0,
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -213,12 +298,12 @@ def list_patterns(include_disabled: bool = True) -> list[dict[str, Any]]:
     sql = """
         SELECT id, name, regex, min_total_days, enabled, period,
                zone_thresholds, denoise_min_len, edges, indicators,
-               created_at, updated_at
+               sort_order, created_at, updated_at
         FROM boll_patterns
     """
     if not include_disabled:
         sql += " WHERE enabled = TRUE"
-    sql += " ORDER BY id ASC;"
+    sql += " ORDER BY sort_order ASC, id ASC;"
     with db.db_cursor(dict_cursor=True) as (conn, cur):
         cur.execute(sql)
         rows = cur.fetchall()
@@ -232,13 +317,43 @@ def get_pattern(pattern_id: str) -> dict[str, Any] | None:
             """
             SELECT id, name, regex, min_total_days, enabled, period,
                    zone_thresholds, denoise_min_len, edges, indicators,
-                   created_at, updated_at
+                   sort_order, created_at, updated_at
             FROM boll_patterns WHERE id = %s;
             """,
             (pattern_id,),
         )
         row = cur.fetchone()
     return _pattern_from_row(dict(row)) if row else None
+
+
+def _next_sort_order(cur) -> int:
+    cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM boll_patterns;")
+    row = cur.fetchone()
+    if row is None:
+        return 1
+    if isinstance(row, dict):
+        return int(row.get("n") or 1)
+    return int(row[0] or 1)
+
+
+def reorder_patterns(ordered_ids: list[str]) -> list[dict[str, Any]]:
+    """按有序 id 列表重写全局 sort_order（须覆盖全部编排）。"""
+    ensure_pattern_tables()
+    ids = [str(x).strip() for x in ordered_ids if str(x).strip()]
+    if len(ids) != len(set(ids)):
+        raise ValueError("ordered_ids 含重复 id")
+    existing = list_patterns(include_disabled=True)
+    existing_ids = {p["id"] for p in existing}
+    if set(ids) != existing_ids:
+        raise ValueError("ordered_ids 必须包含且仅包含全部编排 id")
+    with db.db_cursor(dict_cursor=False) as (conn, cur):
+        for i, pid in enumerate(ids, start=1):
+            cur.execute(
+                "UPDATE boll_patterns SET sort_order = %s WHERE id = %s;",
+                (i, pid),
+            )
+        conn.commit()
+    return list_patterns(include_disabled=True)
 
 
 def validate_regex(regex: str) -> None:
@@ -257,14 +372,23 @@ def _validate_edges_for_period(period: str, regex: str, edges_raw: Any) -> list[
     return edges
 
 
+def _generate_pattern_id() -> str:
+    """新建编排默认 id：bp_ + 12 位十六进制（碰撞则重试）。"""
+    for _ in range(8):
+        pid = f"bp_{uuid.uuid4().hex[:12]}"
+        if not get_pattern(pid):
+            return pid
+    raise RuntimeError("无法生成唯一编排 id")
+
+
 def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
     ensure_pattern_tables()
-    pid = str(payload.get("id", "")).strip()
-    if not pid:
-        raise ValueError("id 不能为空")
-    if get_pattern(pid):
-        raise ValueError(f"编排 id 已存在: {pid}")
-    name = str(payload.get("name") or pid).strip()
+    raw_id = str(payload.get("id") or "").strip()
+    if raw_id and get_pattern(raw_id):
+        raise ValueError(f"编排 id 已存在: {raw_id}")
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("名称不能为空")
     regex = str(payload.get("regex") or "").strip()
     validate_regex(regex)
     period = normalize_bar_period(payload.get("period"), default="daily")
@@ -278,13 +402,15 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
     dnl_val = int(dnl) if dnl is not None else None
 
     with db.db_cursor(dict_cursor=False) as (conn, cur):
+        pid = raw_id or _generate_pattern_id()
+        sort_order = _next_sort_order(cur)
         cur.execute(
             """
             INSERT INTO boll_patterns (
                 id, name, regex, min_total_days, enabled, period,
                 zone_thresholds, denoise_min_len, edges, indicators,
-                created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
+                sort_order, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
             """,
             (
                 pid,
@@ -297,6 +423,7 @@ def create_pattern(payload: dict[str, Any]) -> dict[str, Any]:
                 dnl_val,
                 Json(edges),
                 Json(indicators),
+                sort_order,
             ),
         )
         conn.commit()
@@ -490,6 +617,7 @@ def serialize_pattern_for_api(pattern: dict[str, Any], settings: dict[str, Any] 
         "denoise_min_len": pattern.get("denoise_min_len"),
         "edges": list(pattern.get("edges") or []),
         "indicators": list(pattern.get("indicators") or []),
+        "sort_order": int(pattern.get("sort_order") or 0),
         "effective": {
             "zone_thresholds": thresholds_to_jsonable(eff["zone_thresholds"]),
             "denoise_min_len": eff["denoise_min_len"],
