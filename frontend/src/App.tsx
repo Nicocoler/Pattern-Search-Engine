@@ -296,6 +296,17 @@ function formatZoneBound(n: number): string {
   return String(Number(n.toFixed(4)));
 }
 
+/** 与 backend zone.py 一致：左闭右开 L/M/H/U；无效 → N */
+function zoneFromPctB(pctB: number | null | undefined, bounds: ZoneBounds): string {
+  if (pctB == null || Number.isNaN(Number(pctB))) return 'N';
+  const x = Number(pctB);
+  if (!Number.isFinite(x)) return 'N';
+  if (x < bounds.m) return 'L';
+  if (x < bounds.h) return 'M';
+  if (x < bounds.u) return 'H';
+  return 'U';
+}
+
 const BOLL_ZONE_LABEL: Record<string, string> = {
   L: '中轨下方',
   M: '贴中轨',
@@ -3073,6 +3084,8 @@ export default function App() {
     hasHighlight?: boolean;
     edgeHits?: BollEdgeHit[];
     candleName?: string;
+    /** 编排分区尺子；传入则悬浮框在 %B 旁显示 L/M/H/U */
+    zoneBounds?: ZoneBounds;
   }) => {
     const {
       bars,
@@ -3084,6 +3097,7 @@ export default function App() {
       hasHighlight = false,
       edgeHits = [],
       candleName = '日K',
+      zoneBounds,
     } = args;
     if (!bars.length) return {};
 
@@ -3188,6 +3202,14 @@ export default function App() {
               ? 'N/A'
               : Number(b.pct_b).toFixed(3);
           html += `%B: <b style="color:#38bdf8;font-family:monospace;">${pctB}</b>`;
+          if (zoneBounds) {
+            const z = zoneFromPctB(b.pct_b, zoneBounds);
+            html += `　分区 <b style="color:#a78bfa;font-family:monospace;">${z}</b>`;
+            const zLabel = BOLL_ZONE_LABEL[z];
+            if (zLabel) {
+              html += `<span style="color:#64748b;">（${zLabel}）</span>`;
+            }
+          }
           html += `</div>`;
           html += `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">`;
           html += `<div style="color:#64748b;font-size:10px;margin-bottom:2px;">MACD(12,26,9)</div>`;
@@ -3466,11 +3488,22 @@ export default function App() {
       highlightEnd &&
       selectedBollMatch.matched_states
     );
+    // 试跑用表单/全局草稿尺子；扫描命中用该编排 effective（含覆盖）
+    let zoneBounds: ZoneBounds = bollGlobalBounds;
+    if (bollChartSource === 'preview') {
+      zoneBounds = bollForm.override_zone ? bollForm.bounds : bollGlobalBounds;
+    } else if (selectedBollMatch?.pattern_id) {
+      const p = bollPatterns.find((x) => x.id === selectedBollMatch.pattern_id);
+      if (p) {
+        zoneBounds = parseZoneBounds(p.zone_thresholds ?? p.effective?.zone_thresholds);
+      }
+    }
+    const zbKey = `${zoneBounds.m}:${zoneBounds.h}:${zoneBounds.u}`;
     return buildKlineBollSubpaneOption({
       bars: bollBars,
       tooltipCacheKey: selectedBollMatch
-        ? `${selectedBollMatch.id}:${chartPeriod}`
-        : `preview:${bollPreviewMeta?.code || 'na'}:${chartPeriod}`,
+        ? `${selectedBollMatch.id}:${chartPeriod}:${zbKey}`
+        : `preview:${bollPreviewMeta?.code || 'na'}:${chartPeriod}:${zbKey}`,
       tooltipCacheRef: bollAxisTooltipCacheRef,
       tooltipPosRef: bollAxisTooltipPosRef,
       highlightStart,
@@ -3479,6 +3512,7 @@ export default function App() {
       // 边命中打点仅日线（ADR 0005）
       edgeHits: chartPeriod === 'daily' ? (selectedBollMatch?.edge_hits || []) : [],
       candleName: `${CHART_PERIOD_LABEL[chartPeriod]}K`,
+      zoneBounds,
     });
   };
 
