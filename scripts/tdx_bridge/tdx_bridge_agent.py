@@ -8,8 +8,10 @@
   - 或直接改 JSON 后重启助手
 
 用法:
-  python tdx_bridge_agent.py          # 按配置开始同步
-  python tdx_bridge_agent.py --setup  # 修改服务器地址 / 口令等
+  python tdx_bridge_agent.py             # 按配置开始同步
+  python tdx_bridge_agent.py --setup     # 修改服务器地址 / 口令等
+  tdx_bridge_agent.exe                   # 托盘后台运行（打包后）
+  tdx_bridge_agent.exe --console         # 前台控制台（调试）
 """
 
 from __future__ import annotations
@@ -20,9 +22,10 @@ import os
 import re
 import ssl
 import sys
-import time
+import threading
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,6 +33,8 @@ GBK = "gbk"
 RECORD_SIZE = 120
 NAME_SIZE = 50
 ABBR_SIZE = 70
+_STOP = threading.Event()
+_LOG_LOCK = threading.Lock()
 
 _DEFAULT_ROOT_CANDIDATES = (
     r"D:\SoftInstall\new_tdx",
@@ -40,10 +45,19 @@ _DEFAULT_ROOT_CANDIDATES = (
     r"D:\tdx",
 )
 
+_DEFAULT_GTJA_CANDIDATES = (
+    r"D:\SoftInstall\GTJA\RichEZ\newVer\newVer",
+    r"D:\SoftInstall\GTJA\RichEZ",
+    r"C:\GTJA\RichEZ\newVer\newVer",
+    r"D:\GTJA\RichEZ\newVer\newVer",
+)
+
 DEFAULT_CONFIG = {
     "api_base": "http://127.0.0.1:8000",
     "bridge_token": "pse-tdx-bridge",
     "tdx_root": "",
+    # 国泰海通富易（通达信内核，同样写 T0002/blocknew/*.blk）；空=不写
+    "gtja_root": "",
     "block_name": "PSE布林",
     "block_abbr": "PSE",
     "poll_sec": 2,
@@ -61,6 +75,74 @@ def app_dir() -> Path:
 
 def config_path() -> Path:
     return app_dir() / "tdx_bridge_config.json"
+
+
+def log_path() -> Path:
+    return app_dir() / "tdx_bridge.log"
+
+
+def log(msg: str) -> None:
+    """写日志；有控制台时同步打印。"""
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    with _LOG_LOCK:
+        try:
+            with log_path().open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+    try:
+        if sys.stdout and hasattr(sys.stdout, "write"):
+            print(msg, flush=True)
+    except Exception:
+        pass
+
+
+def ensure_console() -> None:
+    """无窗口 exe 下做 --setup 时分配控制台。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        if ctypes.windll.kernel32.GetConsoleWindow():
+            return
+        ctypes.windll.kernel32.AllocConsole()
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+        sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+        sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def message_box(text: str, title: str = "通达信同步助手") -> None:
+    if sys.platform != "win32":
+        print(f"{title}: {text}")
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
+    except Exception:
+        pass
+
+
+def open_path(path: Path) -> None:
+    try:
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    except Exception as e:
+        log(f"[tdx-bridge] 无法打开 {path}: {e}")
+
+
+def make_tray_image():
+    """生成简单托盘图标（蓝底白字 T）。"""
+    from PIL import Image, ImageDraw
+
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((2, 2, size - 3, size - 3), radius=12, fill=(30, 104, 210, 255))
+    draw.text((22, 14), "T", fill=(255, 255, 255, 255))
+    return img
 
 
 # ---- 通达信 .blk 写出（自包含，不依赖 PSE 仓库）----
@@ -108,6 +190,18 @@ def detect_tdx_root(extra: list[str] | None = None) -> str | None:
         p = Path(c)
         if (p / "T0002" / "blocknew").is_dir():
             return str(p.resolve())
+    return None
+
+
+def detect_gtja_root(extra: list[str] | None = None) -> str | None:
+    """国泰海通富易安装根（含 T0002/blocknew 的目录）。"""
+    for c in list(extra or []) + list(_DEFAULT_GTJA_CANDIDATES):
+        p = Path(c)
+        if (p / "T0002" / "blocknew").is_dir():
+            return str(p.resolve())
+        # 有时用户指到 newVer 上一级
+        if (p / "newVer" / "T0002" / "blocknew").is_dir():
+            return str((p / "newVer").resolve())
     return None
 
 
@@ -193,7 +287,7 @@ def load_config() -> dict:
             if isinstance(raw, dict):
                 cfg.update({k: raw[k] for k in DEFAULT_CONFIG if k in raw})
         except Exception as e:
-            print(f"[tdx-bridge] 配置文件损坏，将重建: {e}")
+            log(f"[tdx-bridge] 配置文件损坏，将重建: {e}")
     # 环境变量可临时覆盖（可选）
     if os.getenv("PSE_API_BASE"):
         cfg["api_base"] = os.environ["PSE_API_BASE"].strip()
@@ -201,6 +295,8 @@ def load_config() -> dict:
         cfg["bridge_token"] = os.environ["TDX_BRIDGE_TOKEN"].strip()
     if os.getenv("TDX_ROOT"):
         cfg["tdx_root"] = os.environ["TDX_ROOT"].strip()
+    if os.getenv("GTJA_ROOT"):
+        cfg["gtja_root"] = os.environ["GTJA_ROOT"].strip()
     return cfg
 
 
@@ -208,7 +304,7 @@ def save_config(cfg: dict) -> None:
     path = config_path()
     out = {k: cfg.get(k, DEFAULT_CONFIG[k]) for k in DEFAULT_CONFIG}
     path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"[tdx-bridge] 已保存配置: {path}")
+    log(f"[tdx-bridge] 已保存配置: {path}")
 
 
 def _prompt(label: str, current: str) -> str:
@@ -233,6 +329,15 @@ def run_setup(cfg: dict) -> dict:
         cfg["tdx_root"] = detected
         print(f"  (已自动探测通达信: {detected})")
     cfg["tdx_root"] = _prompt("通达信目录 tdx_root", str(cfg.get("tdx_root") or ""))
+
+    gtja_detected = detect_gtja_root()
+    if not cfg.get("gtja_root") and gtja_detected:
+        cfg["gtja_root"] = gtja_detected
+        print(f"  (已自动探测富易: {gtja_detected})")
+    cfg["gtja_root"] = _prompt(
+        "国泰海通富易目录 gtja_root (空=不同步富易)",
+        str(cfg.get("gtja_root") or ""),
+    )
 
     cfg["block_name"] = _prompt("板块显示名", str(cfg.get("block_name") or "PSE布林"))
     cfg["block_abbr"] = _prompt("板块简称(.blk名)", str(cfg.get("block_abbr") or "PSE")).upper()
@@ -290,34 +395,75 @@ def _request(
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _export_to_targets(
+    codes: list[str],
+    *,
+    tdx_root: str,
+    gtja_root: str,
+    block_name: str,
+    block_abbr: str,
+) -> list[dict]:
+    """写入通达信 / 富易（同格式 .blk）；返回成功结果列表。"""
+    results: list[dict] = []
+    targets: list[tuple[str, str]] = []
+    if tdx_root.strip():
+        targets.append(("通达信", tdx_root.strip()))
+    if gtja_root.strip():
+        targets.append(("富易", gtja_root.strip()))
+    if not targets:
+        raise ValueError("tdx_root 与 gtja_root 均为空，无处可写")
+
+    for label, root in targets:
+        try:
+            info = export_block(
+                root,
+                codes,
+                block_name=block_name,
+                block_abbr=block_abbr,
+            )
+            info["target"] = label
+            results.append(info)
+            log(
+                f"[tdx-bridge] [{label}] 已写入 {info['blk_path']} · {info['code_count']} 只"
+                + (" · 新建板块(需重启软件可见)" if info.get("cfg_created") else "")
+            )
+        except Exception as e:
+            log(f"[tdx-bridge] [{label}] 写入失败: {type(e).__name__}: {e}")
+    if not results:
+        raise RuntimeError("所有目标均写入失败")
+    return results
+
+
 def run_loop(cfg: dict) -> int:
     api_base = str(cfg.get("api_base") or "").rstrip("/")
     token = str(cfg.get("bridge_token") or "")
     tdx_root = str(cfg.get("tdx_root") or "") or (detect_tdx_root() or "")
+    gtja_root = str(cfg.get("gtja_root") or "") or (detect_gtja_root() or "")
     poll_sec = float(cfg.get("poll_sec") or 2)
     default_name = str(cfg.get("block_name") or "PSE布林")
     default_abbr = str(cfg.get("block_abbr") or "PSE")
 
     if not api_base:
-        print("ERROR: 未设置服务器地址，请先 --setup")
+        log("ERROR: 未设置服务器地址，请先 --setup")
         return 1
     if not token:
-        print("ERROR: 未设置桥接口令，请先 --setup")
+        log("ERROR: 未设置桥接口令，请先 --setup")
         return 1
-    if not tdx_root:
-        print("ERROR: 未找到通达信目录，请先 --setup 填写 tdx_root")
+    if not tdx_root and not gtja_root:
+        log("ERROR: 通达信与富易目录均为空，请先 --setup")
         return 1
 
-    print(f"[tdx-bridge] 配置: {config_path()}")
-    print(f"[tdx-bridge] api={api_base}")
-    print(f"[tdx-bridge] tdx_root={tdx_root}")
+    log(f"[tdx-bridge] 配置: {config_path()}")
+    log(f"[tdx-bridge] api={api_base}")
+    log(f"[tdx-bridge] tdx_root={tdx_root or '(跳过)'}")
+    log(f"[tdx-bridge] gtja_root={gtja_root or '(跳过)'}")
     ssl_verify = bool(cfg.get("ssl_verify", True))
     if _is_ip_host(api_base) or not ssl_verify:
-        print("[tdx-bridge] https: 已对 IP/关闭校验 使用 insecure SSL（证书域名不校验）")
-    print(f"[tdx-bridge] poll={poll_sec}s  |  改设置: --setup  |  Ctrl+C 退出")
+        log("[tdx-bridge] https: 已对 IP/关闭校验 使用 insecure SSL（证书域名不校验）")
+    log(f"[tdx-bridge] poll={poll_sec}s  | 托盘右键可退出 | 日志: {log_path()}")
 
     last_id: str | None = None
-    while True:
+    while not _STOP.is_set():
         try:
             raw = _request(
                 "GET",
@@ -326,16 +472,17 @@ def run_loop(cfg: dict) -> int:
                 ssl_verify=ssl_verify,
             )
             if not raw.get("success"):
-                print(f"[tdx-bridge] pull 失败: {raw.get('error')}")
+                log(f"[tdx-bridge] pull 失败: {raw.get('error')}")
             else:
                 job = (raw.get("data") or {}).get("job")
                 if job and job.get("id") and job["id"] != last_id:
                     name = job.get("block_name") or default_name
                     abbr = job.get("block_abbr") or default_abbr
                     codes = job.get("codes") or []
-                    info = export_block(
-                        tdx_root,
+                    infos = _export_to_targets(
                         codes,
+                        tdx_root=tdx_root,
+                        gtja_root=gtja_root,
                         block_name=name,
                         block_abbr=abbr,
                     )
@@ -347,39 +494,108 @@ def run_loop(cfg: dict) -> int:
                         ssl_verify=ssl_verify,
                     )
                     last_id = job["id"]
-                    print(
-                        f"[tdx-bridge] 已写入 {info['blk_path']} · {info['code_count']} 只"
-                        f" · ack={ack.get('success')}"
+                    n = infos[0]["code_count"] if infos else 0
+                    log(
+                        f"[tdx-bridge] 完成 · {n} 只 · 目标 {len(infos)} 处 · ack={ack.get('success')}"
                     )
         except urllib.error.HTTPError as e:
-            print(f"[tdx-bridge] HTTP {e.code}: {e.reason}")
+            log(f"[tdx-bridge] HTTP {e.code}: {e.reason}")
         except urllib.error.URLError as e:
-            print(f"[tdx-bridge] 无法连接后端: {e.reason}")
+            log(f"[tdx-bridge] 无法连接后端: {e.reason}")
         except Exception as e:
-            print(f"[tdx-bridge] {type(e).__name__}: {e}")
-        time.sleep(max(0.5, poll_sec))
+            log(f"[tdx-bridge] {type(e).__name__}: {e}")
+        _STOP.wait(max(0.5, poll_sec))
+    log("[tdx-bridge] 已停止")
+    return 0
+
+
+def run_tray(cfg: dict) -> int:
+    try:
+        import pystray
+        from pystray import MenuItem as Item
+    except ImportError:
+        log("[tdx-bridge] 未安装 pystray，改为前台运行。pip install pystray pillow")
+        return run_loop(cfg)
+
+    def on_open_config(icon, item):  # noqa: ARG001
+        open_path(config_path())
+
+    def on_open_log(icon, item):  # noqa: ARG001
+        if not log_path().is_file():
+            log_path().write_text("", encoding="utf-8")
+        open_path(log_path())
+
+    def on_exit(icon, item):  # noqa: ARG001
+        _STOP.set()
+        icon.stop()
+
+    def on_ready(icon):
+        icon.visible = True
+        try:
+            icon.notify("已在后台运行", "通达信同步助手\n右键托盘图标可打开配置/日志/退出")
+        except Exception:
+            pass
+
+    icon = pystray.Icon(
+        "tdx_bridge",
+        make_tray_image(),
+        "通达信同步助手",
+        menu=pystray.Menu(
+            Item("打开配置", on_open_config),
+            Item("打开日志", on_open_log),
+            Item("退出", on_exit),
+        ),
+    )
+
+    worker = threading.Thread(target=run_loop, args=(cfg,), daemon=True)
+    worker.start()
+    icon.run(setup=on_ready)
+    _STOP.set()
+    worker.join(timeout=5)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="通达信同步助手")
     parser.add_argument("--setup", action="store_true", help="交互修改服务器地址、口令等")
+    parser.add_argument(
+        "--console",
+        action="store_true",
+        help="前台控制台运行（调试用；打包 exe 默认托盘后台）",
+    )
     args = parser.parse_args(argv)
+
+    frozen = bool(getattr(sys, "frozen", False))
+    use_tray = frozen and not args.console and not args.setup
 
     cfg = load_config()
     path = config_path()
     first_run = not path.is_file()
 
-    if args.setup or first_run:
+    if args.setup or (first_run and not use_tray):
+        ensure_console()
         if first_run:
-            print("[tdx-bridge] 首次运行，请先完成设置。\n")
+            log("[tdx-bridge] 首次运行，请先完成设置。\n")
             save_config(cfg)
         cfg = run_setup(cfg)
         if args.setup and not first_run:
-            # 仅改设置时询问是否立刻开始同步
             ans = input("是否立即开始同步？[Y/n]: ").strip().lower()
             if ans in ("n", "no"):
                 return 0
 
+    if first_run and use_tray:
+        save_config(cfg)
+        message_box(
+            "首次运行：已生成配置文件。\n"
+            "请填写 api_base / bridge_token / tdx_root 后保存，\n"
+            "然后重新双击运行本程序。\n\n"
+            f"配置路径:\n{config_path()}",
+        )
+        open_path(config_path())
+        return 0
+
+    if use_tray:
+        return run_tray(cfg)
     return run_loop(cfg)
 
 
@@ -387,5 +603,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\n[tdx-bridge] 已退出")
+        _STOP.set()
+        log("\n[tdx-bridge] 已退出")
         raise SystemExit(0)

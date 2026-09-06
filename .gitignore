@@ -81,3 +81,7 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
+*.exe
+# tdx bridge: local PyInstaller outputs (rebuild via build_tdx_bridge_exe.bat)
+scripts/tdx_bridge/build/
+scripts/tdx_bridge/dist/

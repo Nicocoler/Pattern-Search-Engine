@@ -1,9 +1,0 @@
-{
-  "api_base": "https://47.103.82.155",
-  "bridge_token": "pse-tdx-bridge",
-  "tdx_root": "D:\\SoftInstall\\new_tdx",
-  "block_name": "PSE布林",
-  "block_abbr": "PSE",
-  "poll_sec": 2,
-  "ssl_verify": false
-}

@@ -2,7 +2,9 @@
   "api_base": "https://47.103.82.155",
   "bridge_token": "pse-tdx-bridge",
   "tdx_root": "D:\\SoftInstall\\new_tdx",
+  "gtja_root": "D:\\SoftInstall\\GTJA\\RichEZ\\newVer\\newVer",
   "block_name": "PSE布林",
   "block_abbr": "PSE",
-  "poll_sec": 10.0
+  "poll_sec": 10.0,
+  "ssl_verify": false
 }

@@ -3137,7 +3137,7 @@ export default function App() {
               />
               <span className="form-item-tip">
                 与服务器 .env 的 TDX_BRIDGE_TOKEN、本机助手配置一致。其它电脑拷贝 scripts\tdx_bridge 下的
-                tdx_bridge_agent.exe + start_tdx_bridge.bat，选「修改设置」或编辑 tdx_bridge_config.json。
+                tdx_bridge_agent.exe + start_tdx_bridge.bat；助手可同时写入通达信与国泰海通富易（gtja_root）。
               </span>
             </div>
 
