@@ -4,7 +4,7 @@ Pattern Search Engine (PSE) - FastAPI 核心接口微服务
 职责：提供面向前端/客户端的模板管理、全市场扫描、形态对齐比对、历史无偏回测等完整的 RESTful API 黄金通道。
 """
 
-from fastapi import FastAPI, HTTPException, Query, Path, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, Path, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, date, timedelta
@@ -73,8 +73,11 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("⚡ PSE API 接口微服务正在启动，启动预先初始化检查...")
-    tpl_manager = TemplateManager()
-    tpl_manager.init_default_templates()
+    try:
+        tpl_manager = TemplateManager()
+        tpl_manager.init_default_templates()
+    except Exception as ex:
+        logger.warning("预设模板初始化跳过（库瞬时不可用）: %s", ex)
     try:
         from backend.app.boll_pattern.repository import seed_from_yaml
         seed_info = seed_from_yaml()
@@ -251,6 +254,24 @@ class BollPatternSettingsPayload(BaseModel):
 
 class BollPatternReorderPayload(BaseModel):
     ordered_ids: list[str] = Field(..., description="全部编排 id 的新全局顺序")
+
+
+class TdxExportPayload(BaseModel):
+    codes: list[str] = Field(..., description="股票代码列表（6 位或带市场前缀）")
+    tdx_root: str = Field(..., description="通达信安装根目录，或 T0002/blocknew 路径")
+    block_name: str = Field("PSE布林", description="自定义板块显示名")
+    block_abbr: str = Field("PSE", description="板块简称兼 .blk 文件名")
+
+
+class TdxBridgePushPayload(BaseModel):
+    codes: list[str] = Field(..., description="股票代码列表")
+    block_name: str = Field("PSE布林", description="自定义板块显示名")
+    block_abbr: str = Field("PSE", description="板块简称兼 .blk 文件名")
+
+
+class TdxBridgeAckPayload(BaseModel):
+    id: str = Field(..., description="任务 id")
+
 
 # 辅助数据库连接（走统一连接池，返回字典游标）
 def get_db_connection():
@@ -1848,6 +1869,131 @@ def get_stock_fundamental_details(symbol: str = Path(..., description="股票代
     finally:
         cursor.close()
         db.release(conn)
+
+
+# -------------------------------------------------------------------------
+# 4.9 通达信自定义板块导出
+# -------------------------------------------------------------------------
+@app.get("/api/tdx/detect")
+def detect_tdx_install():
+    """探测本机常见通达信安装根目录。"""
+    try:
+        from backend.app.tdx_export import detect_tdx_root, resolve_blocknew_dir
+
+        root = detect_tdx_root()
+        if not root:
+            return {"success": True, "data": {"tdx_root": None, "block_dir": None}, "error": None}
+        block_dir = resolve_blocknew_dir(root)
+        return {
+            "success": True,
+            "data": {
+                "tdx_root": root,
+                "block_dir": str(block_dir) if block_dir.is_dir() else None,
+            },
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"探测通达信路径异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.post("/api/tdx/export-block")
+def export_tdx_block(payload: TdxExportPayload):
+    """将代码列表写入通达信自定义板块 .blk，并注册/更新 blocknew.cfg。"""
+    try:
+        from backend.app.tdx_export import export_block
+
+        if not payload.codes:
+            return {"success": False, "data": None, "error": "codes 不能为空"}
+        result = export_block(
+            payload.tdx_root,
+            payload.codes,
+            block_name=payload.block_name,
+            block_abbr=payload.block_abbr,
+        )
+        return {"success": True, "data": result, "error": None}
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except FileNotFoundError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"通达信板块导出异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}: {e}"}
+
+
+@app.get("/api/tdx/bridge/status")
+def tdx_bridge_status():
+    """桥接队列状态（不含口令明文）。"""
+    try:
+        from backend.app.tdx_bridge import status
+
+        return {"success": True, "data": status(), "error": None}
+    except Exception as e:
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.post("/api/tdx/bridge/push")
+def tdx_bridge_push(
+    payload: TdxBridgePushPayload,
+    x_tdx_bridge_token: str | None = Header(None, alias="X-TDX-Bridge-Token"),
+    token: str | None = Query(None),
+):
+    """网页端推送待导入任务；本机助手 pull 后写入通达信。"""
+    try:
+        from backend.app.tdx_bridge import check_token, push_job
+
+        auth = x_tdx_bridge_token or token
+        if not check_token(auth):
+            return {"success": False, "data": None, "error": "桥接口令无效，请检查系统设置中的 TDX 桥接口令"}
+        data = push_job(
+            payload.codes,
+            block_name=payload.block_name,
+            block_abbr=payload.block_abbr,
+        )
+        return {"success": True, "data": data, "error": None}
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"通达信桥接 push 异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.get("/api/tdx/bridge/pull")
+def tdx_bridge_pull(
+    x_tdx_bridge_token: str | None = Header(None, alias="X-TDX-Bridge-Token"),
+    token: str | None = Query(None),
+):
+    """本机助手拉取待写入任务（不消费；ack 后清除）。"""
+    try:
+        from backend.app.tdx_bridge import check_token, peek_job
+
+        auth = x_tdx_bridge_token or token
+        if not check_token(auth):
+            return {"success": False, "data": None, "error": "桥接口令无效"}
+        return {"success": True, "data": {"job": peek_job()}, "error": None}
+    except Exception as e:
+        logger.error(f"通达信桥接 pull 异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.post("/api/tdx/bridge/ack")
+def tdx_bridge_ack(
+    payload: TdxBridgeAckPayload,
+    x_tdx_bridge_token: str | None = Header(None, alias="X-TDX-Bridge-Token"),
+    token: str | None = Query(None),
+):
+    """本机助手确认已写入，清除队列任务。"""
+    try:
+        from backend.app.tdx_bridge import ack_job, check_token
+
+        auth = x_tdx_bridge_token or token
+        if not check_token(auth):
+            return {"success": False, "data": None, "error": "桥接口令无效"}
+        ok = ack_job(payload.id)
+        return {"success": True, "data": {"acked": ok}, "error": None}
+    except Exception as e:
+        logger.error(f"通达信桥接 ack 异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 
 # -------------------------------------------------------------------------

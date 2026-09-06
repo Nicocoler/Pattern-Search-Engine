@@ -7,6 +7,8 @@ Pattern Search Engine (PSE) - 模板管理系统 (Template Manager)
 import json
 import logging
 
+import psycopg2
+
 from backend.app.core import db
 
 logger = logging.getLogger("TemplateManager")
@@ -85,8 +87,16 @@ class TemplateManager:
                 conn.commit()
                 logger.info("系统默认模板 [%s] (ID: %s) 初始化注册就绪！", template_name, new_id)
                 return new_id
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                # 交由 db_conn 丢弃坏连接；勿在此吞掉，否则已关闭连接会回池
+                logger.error("注册预设模板失败（数据库连接中断）: %s", e)
+                raise
             except Exception as e:
-                conn.rollback()
+                try:
+                    if conn is not None and getattr(conn, "closed", 1) == 0:
+                        conn.rollback()
+                except Exception:
+                    pass
                 logger.error("注册预设模板失败: %s", e)
                 return None
             finally:

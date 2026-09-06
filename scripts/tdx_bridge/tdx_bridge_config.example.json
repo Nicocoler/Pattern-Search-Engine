@@ -1,0 +1,8 @@
+{
+  "api_base": "http://127.0.0.1:8000",
+  "bridge_token": "pse-tdx-bridge",
+  "tdx_root": "D:\\SoftInstall\\new_tdx",
+  "block_name": "PSE布林",
+  "block_abbr": "PSE",
+  "poll_sec": 2
+}

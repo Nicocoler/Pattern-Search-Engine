@@ -24,7 +24,8 @@ import {
   Search,
   ChevronDown,
   ChevronUp,
-  GripVertical
+  GripVertical,
+  Download
 } from 'lucide-react';
 import './App.css';
 import { DatePickerField } from './components/DatePickerField';
@@ -641,6 +642,14 @@ export default function App() {
   const [delayMax, setDelayMax] = useState(() => Number(localStorage.getItem('delay_max') || '300'));
   const [retryLimit, setRetryLimit] = useState(() => Number(localStorage.getItem('retry_limit') || '3'));
   const [learningRate, setLearningRate] = useState(() => Number(localStorage.getItem('learning_rate') || '0.05'));
+  /** 通达信自定义板块自动导入 */
+  const [tdxRoot, setTdxRoot] = useState(() => localStorage.getItem('tdx_root') || '');
+  const [tdxBlockName, setTdxBlockName] = useState(() => localStorage.getItem('tdx_block_name') || 'PSE布林');
+  const [tdxBlockAbbr, setTdxBlockAbbr] = useState(() => localStorage.getItem('tdx_block_abbr') || 'PSE');
+  const [tdxBridgeToken, setTdxBridgeToken] = useState(
+    () => localStorage.getItem('tdx_bridge_token') || 'pse-tdx-bridge',
+  );
+  const [tdxExporting, setTdxExporting] = useState(false);
 
   // 数据库及同步日志全局状态
   const [dbStats, setDbStats] = useState({ total_stocks: 0, total_bars: 0, latest_bar_date: 'N/A' });
@@ -2471,7 +2480,99 @@ export default function App() {
     localStorage.setItem('delay_max', String(delayMax));
     localStorage.setItem('retry_limit', String(retryLimit));
     localStorage.setItem('learning_rate', String(learningRate));
+    localStorage.setItem('tdx_root', tdxRoot.trim());
+    localStorage.setItem('tdx_block_name', tdxBlockName.trim() || 'PSE布林');
+    localStorage.setItem('tdx_block_abbr', (tdxBlockAbbr.trim() || 'PSE').toUpperCase());
+    localStorage.setItem('tdx_bridge_token', tdxBridgeToken.trim() || 'pse-tdx-bridge');
     showToast('⚙️ 系统配置参数一键持久化成功！已应用到全模块。');
+  };
+
+  const ensureTdxRoot = async (): Promise<string | null> => {
+    const existing = tdxRoot.trim();
+    if (existing) return existing;
+    try {
+      const res = await fetch(`${apiBase}/api/tdx/detect`);
+      const json = await res.json();
+      const detected = json?.data?.tdx_root as string | undefined;
+      if (json.success && detected) {
+        setTdxRoot(detected);
+        localStorage.setItem('tdx_root', detected);
+        return detected;
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  };
+
+  /** 导入通达信：优先桥接推送（云部署+本机助手）；本机后端可顺带直写 */
+  const handleExportToTdx = async () => {
+    const source = bollListMode === 'favorites' ? bollFavorites : bollMatches;
+    const codes = Array.from(new Set(source.map((x) => String(x.code || '').trim()).filter(Boolean)));
+    if (codes.length === 0) {
+      showToast(bollListMode === 'favorites' ? '收藏夹为空，无法导入通达信' : '命中列表为空，无法导入通达信');
+      return;
+    }
+    setTdxExporting(true);
+    try {
+      const abbr = (tdxBlockAbbr.trim() || 'PSE').toUpperCase();
+      const name = tdxBlockName.trim() || 'PSE布林';
+      const bridgeToken = tdxBridgeToken.trim() || 'pse-tdx-bridge';
+
+      const pushRes = await fetch(`${apiBase}/api/tdx/bridge/push`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-TDX-Bridge-Token': bridgeToken,
+        },
+        body: JSON.stringify({ codes, block_name: name, block_abbr: abbr }),
+      });
+      const pushJson = await pushRes.json();
+      if (!pushJson.success) {
+        showToast('推送失败：' + (pushJson.error || '未知错误'));
+        return;
+      }
+
+      localStorage.setItem('tdx_block_name', name);
+      localStorage.setItem('tdx_block_abbr', abbr);
+      localStorage.setItem('tdx_bridge_token', bridgeToken);
+
+      // 本机后端若能直写，额外写一次（助手未开也能用）
+      let localWrote = false;
+      const root = await ensureTdxRoot();
+      if (root) {
+        try {
+          const res = await fetch(`${apiBase}/api/tdx/export-block`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              codes,
+              tdx_root: root,
+              block_name: name,
+              block_abbr: abbr,
+            }),
+          });
+          const json = await res.json();
+          if (json.success) {
+            localWrote = true;
+            localStorage.setItem('tdx_root', root);
+          }
+        } catch {
+          /* 云端后端直写失败属正常 */
+        }
+      }
+
+      const n = pushJson.data?.code_count ?? codes.length;
+      if (localWrote) {
+        showToast(`已写入通达信「${name}」· ${n} 只（本机直写）。若软件已开，请重新打开该板块。`);
+      } else {
+        showToast(`已推送 ${n} 只到桥接队列。请保持本机「通达信助手」运行，约 2 秒内自动写入。`);
+      }
+    } catch {
+      showToast('导入通达信异常，请检查后端与桥接口令');
+    } finally {
+      setTdxExporting(false);
+    }
   };
 
   // 点击外部关闭「更多」下拉
@@ -2965,6 +3066,79 @@ export default function App() {
                 max={0.5}
               />
               <span className="form-item-tip">人工 👍极品 / 👎不像 标签对模板特征权重的微调偏置步伐大小。</span>
+            </div>
+
+            <div className="form-item">
+              <label>通达信安装目录</label>
+              <div style={{ display: 'flex', gap: '0.4rem' }}>
+                <input
+                  type="text"
+                  value={tdxRoot}
+                  onChange={(e) => setTdxRoot(e.target.value)}
+                  placeholder="例如 D:\SoftInstall\new_tdx"
+                  style={{ flex: 1 }}
+                />
+                <button
+                  type="button"
+                  className="btn-primary btn-sm"
+                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid var(--border-color)', boxShadow: 'none', whiteSpace: 'nowrap' }}
+                  onClick={() => { void (async () => {
+                    try {
+                      const res = await fetch(`${apiBase}/api/tdx/detect`);
+                      const json = await res.json();
+                      if (json.success && json.data?.tdx_root) {
+                        setTdxRoot(json.data.tdx_root);
+                        showToast('已探测到：' + json.data.tdx_root);
+                      } else {
+                        showToast('未自动找到通达信，请手动填写安装目录');
+                      }
+                    } catch {
+                      showToast('探测失败，请确认后端在本机运行');
+                    }
+                  })(); }}
+                >
+                  自动探测
+                </button>
+              </div>
+              <span className="form-item-tip">
+                仅本机后端直写时需要。云部署请忽略此项，改跑本机助手 scripts\tdx_bridge\start_tdx_bridge.bat。
+              </span>
+            </div>
+
+            <div className="form-item">
+              <label>通达信板块显示名 / 简称</label>
+              <div style={{ display: 'flex', gap: '0.4rem' }}>
+                <input
+                  type="text"
+                  value={tdxBlockName}
+                  onChange={(e) => setTdxBlockName(e.target.value)}
+                  placeholder="PSE布林"
+                  style={{ flex: 1 }}
+                />
+                <input
+                  type="text"
+                  value={tdxBlockAbbr}
+                  onChange={(e) => setTdxBlockAbbr(e.target.value.toUpperCase())}
+                  placeholder="PSE"
+                  style={{ width: 88 }}
+                  title="简称兼 .blk 文件名，仅 A-Z0-9_"
+                />
+              </div>
+              <span className="form-item-tip">简称即文件名（如 PSE.blk）。每次导入会覆盖该板块成分股。</span>
+            </div>
+
+            <div className="form-item">
+              <label>通达信桥接口令（云部署用）</label>
+              <input
+                type="text"
+                value={tdxBridgeToken}
+                onChange={(e) => setTdxBridgeToken(e.target.value)}
+                placeholder="pse-tdx-bridge"
+              />
+              <span className="form-item-tip">
+                与服务器 .env 的 TDX_BRIDGE_TOKEN、本机助手配置一致。其它电脑拷贝 scripts\tdx_bridge 下的
+                tdx_bridge_agent.exe + start_tdx_bridge.bat，选「修改设置」或编辑 tdx_bridge_config.json。
+              </span>
             </div>
 
             <button
@@ -4628,6 +4802,15 @@ export default function App() {
                   >
                     <RotateCcw size={13} /> 刷新列表
                   </button>
+                  <button
+                    className="btn-primary btn-sm"
+                    style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
+                    onClick={() => { void handleExportToTdx(); }}
+                    disabled={tdxExporting || bollMatches.length === 0}
+                    title="写入通达信自定义板块（覆盖该板块成分）"
+                  >
+                    <Download size={13} /> {tdxExporting ? '导入中…' : '导入通达信'}
+                  </button>
                 </div>
                 {(bollScanning || (bollScanProgress && bollScanProgress.phase !== 'idle')) && bollScanProgress && (
                   <div className="boll-scan-progress" style={{ marginBottom: '0.8rem' }}>
@@ -4757,6 +4940,15 @@ export default function App() {
                         disabled={bollLoading}
                       >
                         <RotateCcw size={14} /> 刷新收藏
+                      </button>
+                      <button
+                        className="btn-primary"
+                        style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
+                        onClick={() => { void handleExportToTdx(); }}
+                        disabled={tdxExporting || bollFavorites.length === 0}
+                        title="写入通达信自定义板块（覆盖该板块成分）"
+                      >
+                        <Download size={14} /> {tdxExporting ? '导入中…' : '导入通达信'}
                       </button>
                     </div>
                     <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '0.6rem' }}>
