@@ -20,8 +20,22 @@ else
   echo "==> skip git pull (SKIP_GIT_PULL=1)"
 fi
 
+# 小规格云主机：并行 build 会把 1～2 核打满并拖慢已在跑的容器。
+# 默认串行（frontend → backend）+ nice；DEPLOY_PARALLEL=1 可恢复并行。
+NICE_CMD=(nice -n "${DEPLOY_NICE:-10}")
+if ! command -v nice >/dev/null 2>&1; then
+  NICE_CMD=()
+fi
+
 echo "==> docker compose build && up"
-docker compose build
+if [[ "${DEPLOY_PARALLEL:-0}" == "1" ]]; then
+  echo "    (parallel build; DEPLOY_PARALLEL=1)"
+  "${NICE_CMD[@]}" docker compose build
+else
+  echo "    (serial: frontend, then backend)"
+  "${NICE_CMD[@]}" docker compose build frontend
+  "${NICE_CMD[@]}" docker compose build backend
+fi
 docker compose up -d --remove-orphans
 
 echo "==> status"
