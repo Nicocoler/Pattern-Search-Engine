@@ -15,7 +15,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import akshare as ak
 from psycopg2.extras import execute_values
 
 from backend.app.core import db
@@ -25,6 +24,45 @@ from backend.app.core.timeutil import now_beijing, today_beijing
 # 日志：仅获取命名空间 logger，输出由 main.py root logger / sync_daemon 统一配置，
 # 不再调用 basicConfig 以免与主进程日志配置互相覆盖。
 logger = logging.getLogger("DataCenter")
+
+
+def _silence_third_party_tqdm():
+    """关闭第三方库内部 0/1 进度条；本模块进度条通过 pse_show=True 显式开启。
+    直接补丁原始类 __init__，即使 akshare 已缓存 tqdm 引用也生效。"""
+    try:
+        import tqdm.std as tqdm_std
+
+        _RealTqdm = tqdm_std.tqdm
+        if getattr(_RealTqdm, "_pse_tqdm_patched", False):
+            return
+        _orig_init = _RealTqdm.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            if not kwargs.pop("pse_show", False):
+                kwargs["disable"] = True
+            return _orig_init(self, *args, **kwargs)
+
+        _RealTqdm.__init__ = _patched_init
+        _RealTqdm._pse_tqdm_patched = True
+    except Exception:
+        pass
+
+
+_silence_third_party_tqdm()
+import akshare as ak  # noqa: E402  — 尽量在 tqdm 补丁之后导入
+
+
+def _progress_bar(total: int, desc: str):
+    """同步总进度条：postfix 显示最近完成的股票代码。"""
+    from tqdm import tqdm
+    return tqdm(
+        total=total,
+        desc=desc,
+        unit="股",
+        dynamic_ncols=True,
+        pse_show=True,
+        mininterval=0.2,
+    )
 
 class DataCenterSync:
     # 全局运行世代 ID，用于支持最新参数热重载、上一任优雅退让停机
@@ -464,32 +502,38 @@ class DataCenterSync:
                 for code in codes
             }
 
-            for i, future in enumerate(as_completed(future_to_code), 1):
-                # 0. 世代比对：一旦检测到最新世代已经起飞，上一任进程立刻优雅 break 自行解散！
-                if self.generation_id != DataCenterSync.get_generation_id():
-                    logger.info("🔓 [Sync Guard] 🏳️ 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步任务优雅自行解散，让出跑道！")
-                    # 尽可能取消尚未开始的 future（已在执行的 in-flight 任务仍会跑完，ThreadPoolExecutor 限制）
-                    for pending in future_to_code:
-                        pending.cancel()
-                    break
+            with _progress_bar(total_stocks, "全市场同步") as pbar:
+                for i, future in enumerate(as_completed(future_to_code), 1):
+                    # 0. 世代比对：一旦检测到最新世代已经起飞，上一任进程立刻优雅 break 自行解散！
+                    if self.generation_id != DataCenterSync.get_generation_id():
+                        logger.info("🔓 [Sync Guard] 🏳️ 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步任务优雅自行解散，让出跑道！")
+                        # 尽可能取消尚未开始的 future（已在执行的 in-flight 任务仍会跑完，ThreadPoolExecutor 限制）
+                        for pending in future_to_code:
+                            pending.cancel()
+                        break
 
-                code = future_to_code[future]
-                try:
-                    success = future.result()
-                    if success:
-                        success_count += 1
-                    else:
+                    code = future_to_code[future]
+                    pbar.set_postfix_str(code, refresh=True)
+                    try:
+                        success = future.result()
+                        if success:
+                            success_count += 1
+                        else:
+                            failure_count += 1
+                    except Exception as e:
+                        logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
                         failure_count += 1
-                except Exception as e:
-                    logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
-                    failure_count += 1
+                    pbar.update(1)
 
-                # 每隔 100 只股票打印一次全局进度，保持盯盘感
-                if i % 100 == 0 or i == total_stocks:
-                    elapsed = time.time() - start_time
-                    speed = i / elapsed if elapsed > 0 else 0
-                    logger.info(f"📊 同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | 成功: {success_count} | 失败: {failure_count} | 耗时: {elapsed:.1f}s | 均速: {speed:.1f}股/秒")
-
+                    # 每隔 100 只股票打印一次全局进度，保持盯盘感
+                    if i % 100 == 0 or i == total_stocks:
+                        elapsed = time.time() - start_time
+                        speed = i / elapsed if elapsed > 0 else 0
+                        logger.info(
+                            f"📊 同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | "
+                            f"最近完成: {code} | 成功: {success_count} | 失败: {failure_count} | "
+                            f"耗时: {elapsed:.1f}s | 均速: {speed:.1f}股/秒"
+                        )
         total_elapsed = time.time() - start_time
         logger.info("="*60)
         logger.info(f"🎉 全市场行情同步大获全胜！")
@@ -564,33 +608,35 @@ class DataCenterSync:
                 ): code
                 for code in stocks_to_sync
             }
-            for i, future in enumerate(as_completed(future_to_code), 1):
-                if self.generation_id != DataCenterSync.get_generation_id():
-                    logger.info("[Sync Guard] 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步工作任务优雅自行解散，让出跑道。")
-                    for pending in future_to_code:
-                        pending.cancel()
-                    break
-                code = future_to_code[future]
-                try:
-                    success = future.result()
-                    if success:
-                        success_count += 1
-                    else:
+            with _progress_bar(total_stocks, "当日同步") as pbar:
+                for i, future in enumerate(as_completed(future_to_code), 1):
+                    if self.generation_id != DataCenterSync.get_generation_id():
+                        logger.info("[Sync Guard] 检测到有新世代参数配置的数据巨轮点火起飞。本上一任同步工作任务优雅自行解散，让出跑道。")
+                        for pending in future_to_code:
+                            pending.cancel()
+                        break
+                    code = future_to_code[future]
+                    pbar.set_postfix_str(code, refresh=True)
+                    try:
+                        success = future.result()
+                        if success:
+                            success_count += 1
+                        else:
+                            failure_count += 1
+                            failed_codes.append(code)
+                    except Exception as e:
+                        logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
                         failure_count += 1
                         failed_codes.append(code)
-                except Exception as e:
-                    logger.error(f"线程执行股票 [{code}] 时发生未捕获异常: {e}")
-                    failure_count += 1
-                    failed_codes.append(code)
-                if i % 100 == 0 or i == total_stocks:
-                    elapsed = time.time() - start_time
-                    speed = i / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        f"当日同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | "
-                        f"成功: {success_count} | 失败: {failure_count} | "
-                        f"耗时: {elapsed:.1f}s | 速度: {speed:.1f}股/秒"
-                    )
-
+                    pbar.update(1)
+                    if i % 100 == 0 or i == total_stocks:
+                        elapsed = time.time() - start_time
+                        speed = i / elapsed if elapsed > 0 else 0
+                        logger.info(
+                            f"当日同步进度: {i}/{total_stocks} ({i/total_stocks*100:.1f}%) | "
+                            f"最近完成: {code} | 成功: {success_count} | 失败: {failure_count} | "
+                            f"耗时: {elapsed:.1f}s | 速度: {speed:.1f}股/秒"
+                        )
         # 失败个股再扫一轮（网络抖动/限流常见），尽量补齐缺口
         if failed_codes and self.generation_id == DataCenterSync.get_generation_id():
             retry_codes = list(dict.fromkeys(failed_codes))
@@ -609,18 +655,21 @@ class DataCenterSync:
                     ): code
                     for code in retry_codes
                 }
-                for future in as_completed(future_to_code):
-                    code = future_to_code[future]
-                    try:
-                        if future.result():
-                            retry_ok += 1
-                            success_count += 1
-                            failure_count -= 1
-                        else:
+                with _progress_bar(len(retry_codes), "失败重试") as pbar:
+                    for future in as_completed(future_to_code):
+                        code = future_to_code[future]
+                        pbar.set_postfix_str(code, refresh=True)
+                        try:
+                            if future.result():
+                                retry_ok += 1
+                                success_count += 1
+                                failure_count -= 1
+                            else:
+                                still_failed.append(code)
+                        except Exception as e:
+                            logger.error(f"重试股票 [{code}] 异常: {e}")
                             still_failed.append(code)
-                    except Exception as e:
-                        logger.error(f"重试股票 [{code}] 异常: {e}")
-                        still_failed.append(code)
+                        pbar.update(1)
             failed_codes = still_failed
             logger.info(f"第二轮重试完成：挽回 {retry_ok} 只，仍失败 {len(failed_codes)} 只")
 
