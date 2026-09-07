@@ -5,6 +5,13 @@
   "gtja_root": "D:\\SoftInstall\\GTJA\\RichEZ\\newVer\\newVer",
   "block_name": "PSE布林",
   "block_abbr": "PSE",
+  "fav_block_name": "PSE收藏",
+  "fav_block_abbr": "PSEFAV",
+  "match_period": "daily",
+  "match_end_within_days": 3,
+  "match_limit": 200,
+  "fav_limit": 200,
+  "auto_sync_min": 0,
   "poll_sec": 10.0,
   "ssl_verify": false
 }

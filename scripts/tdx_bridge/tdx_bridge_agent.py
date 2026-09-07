@@ -10,8 +10,15 @@
 用法:
   python tdx_bridge_agent.py             # 按配置开始同步
   python tdx_bridge_agent.py --setup     # 修改服务器地址 / 口令等
+  python tdx_bridge_agent.py --sync-now  # 手动拉取列表并写入两个板块后退出
   tdx_bridge_agent.exe                   # 托盘后台运行（打包后）
   tdx_bridge_agent.exe --console         # 前台控制台（调试）
+
+手动同步（不依赖网页点击）:
+  - 托盘右键菜单：「立即同步两个板块 / 仅命中列表 / 仅收藏夹」
+  - 命令行：--sync-now [both|matches|favorites]（默认 both，完成后退出）
+  - 配置 auto_sync_min > 0 时，后台每 N 分钟自动执行一次手动同步
+  板块归属：命中列表 → block_name/block_abbr；收藏夹 → fav_block_name/fav_block_abbr
 """
 
 from __future__ import annotations
@@ -23,11 +30,12 @@ import re
 import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 GBK = "gbk"
 RECORD_SIZE = 120
@@ -60,6 +68,16 @@ DEFAULT_CONFIG = {
     "gtja_root": "",
     "block_name": "PSE布林",
     "block_abbr": "PSE",
+    # 收藏夹板块（手动同步 / 网页收藏夹推送均写这里）
+    "fav_block_name": "PSE收藏",
+    "fav_block_abbr": "PSEFAV",
+    # 手动同步：命中列表查询参数（与网页默认一致）
+    "match_period": "daily",  # daily|weekly|monthly|空=全部周期
+    "match_end_within_days": 3,  # 0=全量历史命中
+    "match_limit": 200,
+    "fav_limit": 200,
+    # >0 时后台每 N 分钟自动执行一次「手动同步」（无需网页触发）；0=关闭
+    "auto_sync_min": 0,
     "poll_sec": 2,
     # https 用 IP 访问时证书域名对不上，需关闭校验；域名备案正常后可改 true
     "ssl_verify": True,
@@ -339,8 +357,32 @@ def run_setup(cfg: dict) -> dict:
         str(cfg.get("gtja_root") or ""),
     )
 
-    cfg["block_name"] = _prompt("板块显示名", str(cfg.get("block_name") or "PSE布林"))
-    cfg["block_abbr"] = _prompt("板块简称(.blk名)", str(cfg.get("block_abbr") or "PSE")).upper()
+    cfg["block_name"] = _prompt("命中列表板块显示名", str(cfg.get("block_name") or "PSE布林"))
+    cfg["block_abbr"] = _prompt("命中列表板块简称(.blk名)", str(cfg.get("block_abbr") or "PSE")).upper()
+    cfg["fav_block_name"] = _prompt("收藏夹板块显示名", str(cfg.get("fav_block_name") or "PSE收藏"))
+    cfg["fav_block_abbr"] = _prompt("收藏夹板块简称(.blk名)", str(cfg.get("fav_block_abbr") or "PSEFAV")).upper()
+
+    print("\n  -- 手动同步（不经网页，直接从服务器拉列表写板块）--")
+    period = _prompt(
+        "命中列表周期 match_period (daily/weekly/monthly/空=全部)",
+        str(cfg.get("match_period") or "daily"),
+    ).strip().lower()
+    cfg["match_period"] = period if period in ("daily", "weekly", "monthly") else ""
+    for key, label, default in (
+        ("match_end_within_days", "近端结束根数 (0=全量)", 3),
+        ("match_limit", "命中列表条数上限", 200),
+        ("fav_limit", "收藏夹条数上限", 200),
+    ):
+        val = _prompt(f"{label} {key}", str(cfg.get(key, default)))
+        try:
+            cfg[key] = max(0, int(val))
+        except ValueError:
+            cfg[key] = default
+    auto = _prompt("自动手动同步间隔分钟 auto_sync_min (0=关闭)", str(cfg.get("auto_sync_min") or 0))
+    try:
+        cfg["auto_sync_min"] = max(0, int(auto))
+    except ValueError:
+        cfg["auto_sync_min"] = 0
 
     poll = _prompt("轮询秒数 poll_sec", str(cfg.get("poll_sec") or 2))
     try:
@@ -434,6 +476,128 @@ def _export_to_targets(
     return results
 
 
+# ---- 手动同步：直接从服务器拉列表，不经网页点击 ----
+
+_SYNC_LOCK = threading.Lock()
+_SYNCING = False
+
+
+def _dedup_codes(items: list[dict]) -> list[str]:
+    seen: set[str] = set()
+    codes: list[str] = []
+    for it in items:
+        c = str((it or {}).get("code") or "").strip()
+        if c and c not in seen:
+            seen.add(c)
+            codes.append(c)
+    return codes
+
+
+def fetch_match_codes(api_base: str, cfg: dict, ssl_verify: bool) -> list[str]:
+    """拉取布林编排命中列表（与网页「命中列表」同源接口）。"""
+    period = str(cfg.get("match_period") or "").strip().lower()
+    try:
+        end_within = int(cfg.get("match_end_within_days") or 0)
+    except (TypeError, ValueError):
+        end_within = 3
+    try:
+        limit = max(1, int(cfg.get("match_limit") or 200))
+    except (TypeError, ValueError):
+        limit = 100
+    qs = {"end_within_days": str(end_within), "order_by": "score", "limit": str(limit)}
+    if period in ("daily", "weekly", "monthly"):
+        qs["period"] = period
+    url = f"{api_base}/api/boll-pattern-matches?{urlencode(qs)}"
+    raw = _request("GET", url, str(cfg.get("bridge_token") or ""), ssl_verify=ssl_verify)
+    if not raw.get("success"):
+        raise RuntimeError(f"命中列表接口失败: {raw.get('error')}")
+    return _dedup_codes((raw.get("data") or {}).get("items") or [])
+
+
+def fetch_favorite_codes(api_base: str, cfg: dict, ssl_verify: bool) -> list[str]:
+    """拉取收藏夹列表（与网页「收藏夹」同源接口）。"""
+    try:
+        limit = max(1, int(cfg.get("fav_limit") or 200))
+    except (TypeError, ValueError):
+        limit = 200
+    url = f"{api_base}/api/boll-pattern-favorites?{urlencode({'limit': str(limit)})}"
+    raw = _request("GET", url, str(cfg.get("bridge_token") or ""), ssl_verify=ssl_verify)
+    if not raw.get("success"):
+        raise RuntimeError(f"收藏夹接口失败: {raw.get('error')}")
+    return _dedup_codes((raw.get("data") or {}).get("items") or [])
+
+
+def manual_sync(cfg: dict, which: str = "both") -> str:
+    """
+    手动同步：直接从服务器拉「命中列表 / 收藏夹」，写入对应板块。
+    which: both | matches | favorites。返回一行结果摘要（供托盘气泡/弹窗）。
+    """
+    global _SYNCING
+    with _SYNC_LOCK:
+        if _SYNCING:
+            return "已有手动同步在进行中，稍后再试"
+        _SYNCING = True
+    try:
+        api_base = str(cfg.get("api_base") or "").rstrip("/")
+        if not api_base:
+            raise ValueError("未设置服务器地址 api_base")
+        tdx_root = str(cfg.get("tdx_root") or "") or (detect_tdx_root() or "")
+        gtja_root = str(cfg.get("gtja_root") or "") or (detect_gtja_root() or "")
+        if not tdx_root and not gtja_root:
+            raise ValueError("tdx_root 与 gtja_root 均为空，无处可写")
+        ssl_verify = bool(cfg.get("ssl_verify", True))
+
+        summary: list[str] = []
+        tasks: list[tuple[str, object, str, str]] = []
+        if which in ("both", "matches"):
+            tasks.append((
+                "命中列表",
+                lambda: fetch_match_codes(api_base, cfg, ssl_verify),
+                str(cfg.get("block_name") or "PSE布林"),
+                str(cfg.get("block_abbr") or "PSE").upper(),
+            ))
+        if which in ("both", "favorites"):
+            tasks.append((
+                "收藏夹",
+                lambda: fetch_favorite_codes(api_base, cfg, ssl_verify),
+                str(cfg.get("fav_block_name") or "PSE收藏"),
+                str(cfg.get("fav_block_abbr") or "PSEFAV").upper(),
+            ))
+
+        ok_count = 0
+        for label, fetcher, name, abbr in tasks:
+            try:
+                codes = fetcher()  # type: ignore[operator]
+                if not codes:
+                    log(f"[tdx-bridge] [手动同步] {label} 为空，跳过写入（保留原板块内容）")
+                    summary.append(f"{label}: 空，跳过")
+                    continue
+                infos = _export_to_targets(
+                    codes,
+                    tdx_root=tdx_root,
+                    gtja_root=gtja_root,
+                    block_name=name,
+                    block_abbr=abbr,
+                )
+                ok_count += 1
+                log(f"[tdx-bridge] [手动同步] {label} → {name}({abbr}) · {len(codes)} 只 · {len(infos)} 处目标")
+                summary.append(f"{label}: {len(codes)} 只 → {name}")
+            except Exception as e:
+                log(f"[tdx-bridge] [手动同步] {label} 失败: {type(e).__name__}: {e}")
+                summary.append(f"{label}: 失败 {type(e).__name__}")
+
+        head = "手动同步完成" if ok_count == len(tasks) and tasks else (
+            "手动同步部分完成" if ok_count else "手动同步失败"
+        )
+        return f"{head}\n" + "\n".join(summary)
+    except Exception as e:
+        log(f"[tdx-bridge] [手动同步] 异常: {type(e).__name__}: {e}")
+        return f"手动同步异常: {type(e).__name__}: {e}"
+    finally:
+        with _SYNC_LOCK:
+            _SYNCING = False
+
+
 def run_loop(cfg: dict) -> int:
     api_base = str(cfg.get("api_base") or "").rstrip("/")
     token = str(cfg.get("bridge_token") or "")
@@ -463,6 +627,13 @@ def run_loop(cfg: dict) -> int:
     log(f"[tdx-bridge] poll={poll_sec}s  | 托盘右键可退出 | 日志: {log_path()}")
 
     last_id: str | None = None
+    try:
+        auto_sync_min = float(cfg.get("auto_sync_min") or 0)
+    except (TypeError, ValueError):
+        auto_sync_min = 0.0
+    next_auto = time.time() + auto_sync_min * 60 if auto_sync_min > 0 else None
+    if auto_sync_min > 0:
+        log(f"[tdx-bridge] 自动手动同步: 每 {auto_sync_min:g} 分钟")
     while not _STOP.is_set():
         try:
             raw = _request(
@@ -504,6 +675,9 @@ def run_loop(cfg: dict) -> int:
             log(f"[tdx-bridge] 无法连接后端: {e.reason}")
         except Exception as e:
             log(f"[tdx-bridge] {type(e).__name__}: {e}")
+        if next_auto is not None and time.time() >= next_auto:
+            manual_sync(cfg)
+            next_auto = time.time() + auto_sync_min * 60
         _STOP.wait(max(0.5, poll_sec))
     log("[tdx-bridge] 已停止")
     return 0
@@ -525,6 +699,28 @@ def run_tray(cfg: dict) -> int:
             log_path().write_text("", encoding="utf-8")
         open_path(log_path())
 
+    def _run_manual_sync(icon, which: str) -> None:
+        """在后台线程执行手动同步，完成后托盘气泡提示。"""
+
+        def worker():
+            result = manual_sync(cfg, which)
+            log(f"[tdx-bridge] [手动同步] {result.replace(chr(10), ' | ')}")
+            try:
+                icon.notify(result, "通达信同步助手")
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_sync_both(icon, item):  # noqa: ARG001
+        _run_manual_sync(icon, "both")
+
+    def on_sync_matches(icon, item):  # noqa: ARG001
+        _run_manual_sync(icon, "matches")
+
+    def on_sync_favorites(icon, item):  # noqa: ARG001
+        _run_manual_sync(icon, "favorites")
+
     def on_exit(icon, item):  # noqa: ARG001
         _STOP.set()
         icon.stop()
@@ -532,7 +728,10 @@ def run_tray(cfg: dict) -> int:
     def on_ready(icon):
         icon.visible = True
         try:
-            icon.notify("已在后台运行", "通达信同步助手\n右键托盘图标可打开配置/日志/退出")
+            icon.notify(
+                "已在后台运行",
+                "通达信同步助手\n右键托盘：立即同步两个板块 / 配置 / 日志 / 退出",
+            )
         except Exception:
             pass
 
@@ -541,6 +740,9 @@ def run_tray(cfg: dict) -> int:
         make_tray_image(),
         "通达信同步助手",
         menu=pystray.Menu(
+            Item("立即同步两个板块", on_sync_both),
+            Item("仅同步命中列表", on_sync_matches),
+            Item("仅同步收藏夹", on_sync_favorites),
             Item("打开配置", on_open_config),
             Item("打开日志", on_open_log),
             Item("退出", on_exit),
@@ -563,10 +765,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="前台控制台运行（调试用；打包 exe 默认托盘后台）",
     )
+    parser.add_argument(
+        "--sync-now",
+        nargs="?",
+        const="both",
+        choices=("both", "matches", "favorites"),
+        default=None,
+        metavar="both|matches|favorites",
+        help="立即手动同步两个板块（不经网页点击），完成后退出；默认 both",
+    )
     args = parser.parse_args(argv)
 
     frozen = bool(getattr(sys, "frozen", False))
-    use_tray = frozen and not args.console and not args.setup
+    use_tray = frozen and not args.console and not args.setup and not args.sync_now
 
     cfg = load_config()
     path = config_path()
@@ -593,6 +804,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         open_path(config_path())
         return 0
+
+    if args.sync_now:
+        if frozen and not args.console:
+            ensure_console()
+        result = manual_sync(cfg, args.sync_now)
+        head = result.split("\n", 1)[0]
+        if frozen and not args.console:
+            # 交互场景弹窗展示结果；无人值守请改用托盘或 auto_sync_min
+            message_box(result)
+        return 0 if head == "手动同步完成" else 1
 
     if use_tray:
         return run_tray(cfg)
