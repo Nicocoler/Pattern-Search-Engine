@@ -642,10 +642,16 @@ export default function App() {
   const [delayMax, setDelayMax] = useState(() => Number(localStorage.getItem('delay_max') || '300'));
   const [retryLimit, setRetryLimit] = useState(() => Number(localStorage.getItem('retry_limit') || '3'));
   const [learningRate, setLearningRate] = useState(() => Number(localStorage.getItem('learning_rate') || '0.05'));
-  /** 通达信自定义板块自动导入 */
+  /** 通达信自定义板块自动导入（命中列表与收藏夹各写各的板块） */
   const [tdxRoot, setTdxRoot] = useState(() => localStorage.getItem('tdx_root') || '');
   const [tdxBlockName, setTdxBlockName] = useState(() => localStorage.getItem('tdx_block_name') || 'PSE布林');
   const [tdxBlockAbbr, setTdxBlockAbbr] = useState(() => localStorage.getItem('tdx_block_abbr') || 'PSE');
+  const [tdxFavBlockName, setTdxFavBlockName] = useState(
+    () => localStorage.getItem('tdx_fav_block_name') || 'PSE收藏',
+  );
+  const [tdxFavBlockAbbr, setTdxFavBlockAbbr] = useState(
+    () => (localStorage.getItem('tdx_fav_block_abbr') || 'PSEFAV').toUpperCase(),
+  );
   const [tdxBridgeToken, setTdxBridgeToken] = useState(
     () => localStorage.getItem('tdx_bridge_token') || 'pse-tdx-bridge',
   );
@@ -2483,6 +2489,8 @@ export default function App() {
     localStorage.setItem('tdx_root', tdxRoot.trim());
     localStorage.setItem('tdx_block_name', tdxBlockName.trim() || 'PSE布林');
     localStorage.setItem('tdx_block_abbr', (tdxBlockAbbr.trim() || 'PSE').toUpperCase());
+    localStorage.setItem('tdx_fav_block_name', tdxFavBlockName.trim() || 'PSE收藏');
+    localStorage.setItem('tdx_fav_block_abbr', (tdxFavBlockAbbr.trim() || 'PSEFAV').toUpperCase());
     localStorage.setItem('tdx_bridge_token', tdxBridgeToken.trim() || 'pse-tdx-bridge');
     showToast('⚙️ 系统配置参数一键持久化成功！已应用到全模块。');
   };
@@ -2515,8 +2523,11 @@ export default function App() {
     }
     setTdxExporting(true);
     try {
-      const abbr = (tdxBlockAbbr.trim() || 'PSE').toUpperCase();
-      const name = tdxBlockName.trim() || 'PSE布林';
+      const isFav = bollListMode === 'favorites';
+      const abbr = (
+        (isFav ? tdxFavBlockAbbr : tdxBlockAbbr).trim() || (isFav ? 'PSEFAV' : 'PSE')
+      ).toUpperCase();
+      const name = (isFav ? tdxFavBlockName : tdxBlockName).trim() || (isFav ? 'PSE收藏' : 'PSE布林');
       const bridgeToken = tdxBridgeToken.trim() || 'pse-tdx-bridge';
 
       const pushRes = await fetch(`${apiBase}/api/tdx/bridge/push`, {
@@ -2533,8 +2544,13 @@ export default function App() {
         return;
       }
 
-      localStorage.setItem('tdx_block_name', name);
-      localStorage.setItem('tdx_block_abbr', abbr);
+      if (isFav) {
+        localStorage.setItem('tdx_fav_block_name', name);
+        localStorage.setItem('tdx_fav_block_abbr', abbr);
+      } else {
+        localStorage.setItem('tdx_block_name', name);
+        localStorage.setItem('tdx_block_abbr', abbr);
+      }
       localStorage.setItem('tdx_bridge_token', bridgeToken);
 
       // 本机后端若能直写，额外写一次（助手未开也能用）
@@ -3106,7 +3122,7 @@ export default function App() {
             </div>
 
             <div className="form-item">
-              <label>通达信板块显示名 / 简称</label>
+              <label>通达信板块 · 命中列表（显示名 / 简称）</label>
               <div style={{ display: 'flex', gap: '0.4rem' }}>
                 <input
                   type="text"
@@ -3124,7 +3140,29 @@ export default function App() {
                   title="简称兼 .blk 文件名，仅 A-Z0-9_"
                 />
               </div>
-              <span className="form-item-tip">简称即文件名（如 PSE.blk）。每次导入会覆盖该板块成分股。</span>
+              <span className="form-item-tip">命中列表页的「导入通达信」写入此板块。简称即文件名（如 PSE.blk），每次导入覆盖该板块成分股。</span>
+            </div>
+
+            <div className="form-item">
+              <label>通达信板块 · 收藏夹（显示名 / 简称）</label>
+              <div style={{ display: 'flex', gap: '0.4rem' }}>
+                <input
+                  type="text"
+                  value={tdxFavBlockName}
+                  onChange={(e) => setTdxFavBlockName(e.target.value)}
+                  placeholder="PSE收藏"
+                  style={{ flex: 1 }}
+                />
+                <input
+                  type="text"
+                  value={tdxFavBlockAbbr}
+                  onChange={(e) => setTdxFavBlockAbbr(e.target.value.toUpperCase())}
+                  placeholder="PSEFAV"
+                  style={{ width: 88 }}
+                  title="简称兼 .blk 文件名，仅 A-Z0-9_"
+                />
+              </div>
+              <span className="form-item-tip">收藏夹页的「导入通达信」写入此板块，与命中列表互不覆盖。</span>
             </div>
 
             <div className="form-item">
