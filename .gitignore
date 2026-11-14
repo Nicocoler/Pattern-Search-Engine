@@ -28,6 +28,7 @@ share/python-wheels/
 # PyInstaller
 *.manifest
 *.spec
+*.zip
 
 # Installer logs
 pip-log.txt
@@ -85,3 +86,4 @@ Desktop.ini
 # tdx bridge: local PyInstaller outputs (rebuild via build_tdx_bridge_exe.bat)
 scripts/tdx_bridge/build/
 scripts/tdx_bridge/dist/
+scripts/tdx_bridge.zip
