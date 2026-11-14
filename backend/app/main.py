@@ -1623,8 +1623,8 @@ def get_stock_bars_with_boll(
     forward_bars: int = Query(
         0,
         ge=0,
-        le=60,
-        description="在 end_date 之后再附带最多 N 根同周期 K（命中详情看后续走势；无更多数据则为 0）",
+        le=500,
+        description="在 end_date 之后再附带最多 N 根同周期 K（命中详情看后续至最新；无更多数据则为 0）",
     ),
 ):
     """

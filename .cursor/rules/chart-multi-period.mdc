@@ -1,0 +1,19 @@
+---
+description: Day/week/month chart period conventions for看盘
+globs: frontend/**/*.{tsx,ts},backend/app/**/*bars*,backend/app/market_pipeline.py,backend/app/main.py
+alwaysApply: false
+---
+
+# Chart multi-period (ADR 0005)
+
+Maintained chart surfaces: **个股走势** + **布林编排命中详情**. Shared `chartPeriod`: `daily` | `weekly` | `monthly`.
+
+- Aggregate from `daily_bars` at read time; no weekly/monthly tables.
+- `lookback` = bar count of the **current** period; remember per period (defaults 60 / 104 / 60).
+- Natural week + natural month; include incomplete current bar; label = last trading day in bucket.
+- Compute BOLL/MACD/KDJ on the aggregated series with the same params; warm up then truncate.
+- Events / edge hit markers: **daily only**.
+- Zone verification bar: **all periods** (daily from `stock_state_daily`; weekly/monthly computed on read, not persisted). Pattern edges remain daily-only.
+
+API: `/api/stocks/{symbol}/bars?period=...&lookback_bars=...` (keep `lookback_days` as alias for bar count on this endpoint).
+Optional `forward_bars`: after `end_date`, attach up to N more bars of the same period (布林命中详情默认 500，实际有多少拉多少直到库内最新；已是最新则 0).

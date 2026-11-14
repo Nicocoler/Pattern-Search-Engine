@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 import pandas as pd
@@ -90,6 +90,18 @@ def chart_load_calendar_days(period: ChartPeriod, lookback_bars: int) -> int:
     return max(cal, need * factor)
 
 
+def latest_daily_bar_date(code: str) -> date | None:
+    """该股 daily_bars 最新交易日；无数据则 None。"""
+    code = code.lower().strip()
+    with db.db_cursor(dict_cursor=True) as (conn, cursor):
+        cursor.execute("SELECT MAX(date) AS d FROM daily_bars WHERE code = %s;", (code,))
+        row = cursor.fetchone()
+    if not row or not row.get("d"):
+        return None
+    d = row["d"]
+    return d if isinstance(d, date) else datetime.strptime(str(d), "%Y-%m-%d").date()
+
+
 def resolve_chart_forward_end(
     code: str,
     anchor_end: date,
@@ -100,6 +112,7 @@ def resolve_chart_forward_end(
     """
     在 anchor_end 对应周期 K 之后，最多再取 forward_bars 根，返回扩展截止日与实际根数。
 
+    加载区间直达该股库内最新日 K，避免仅用日历估算导致「看不到最新」。
     若之后没有更多 K（已是最新），返回 (anchor_end, 0)。
     """
     forward_bars = max(0, int(forward_bars))
@@ -109,13 +122,17 @@ def resolve_chart_forward_end(
     code = code.lower().strip()
     period = period if period in ("daily", "weekly", "monthly") else "daily"
     factor = _PERIOD_CALENDAR_FACTOR.get(period, 2)
-    # 向前多取一点，保证周/月桶能正确闭合；向后再取 forward 根所需日历跨度
+    # 向前多取一点，保证周/月桶能正确闭合
     pad_before = max(factor * 2, 14)
-    pad_after = forward_bars * factor + max(factor * 2, 14)
+
+    latest = latest_daily_bar_date(code)
+    if latest is None or latest <= anchor_end:
+        return anchor_end, 0
+
     df_raw = load_daily_bars(
         code,
         anchor_end - timedelta(days=pad_before),
-        anchor_end + timedelta(days=pad_after),
+        latest,
     )
     if df_raw.empty:
         return anchor_end, 0

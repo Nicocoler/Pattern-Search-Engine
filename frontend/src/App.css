@@ -293,11 +293,48 @@ body {
   transform: translateY(1px);
 }
 
-.btn-primary:disabled {
-  opacity: 0.6;
+/* 禁用态必须一眼看出点不了：锁定时的「保存全局尺子」与灰掉的「恢复默认」保持一致 */
+.btn-primary:disabled,
+.btn-primary[disabled] {
+  background: rgba(148, 163, 184, 0.18);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: var(--color-text-muted, #94a3b8);
+  opacity: 0.7;
   cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.btn-primary:disabled:hover,
+.btn-primary[disabled]:hover {
   transform: none;
   box-shadow: none;
+}
+
+/* 次要按钮：与 .btn-primary 同尺寸，描边样式 */
+.btn-secondary {
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: #cbd5e1;
+  padding: 0.65rem 1.2rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  transition: all 0.2s;
+}
+.btn-secondary:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.22);
+  color: #f8fafc;
+}
+.btn-secondary:disabled,
+.btn-secondary[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* 紧凑主按钮：扫描等操作区 */
@@ -1520,3 +1557,383 @@ body {
   color: #e2e8f0;
 }
 
+
+/* ===== 分区尺子（ZoneRuler）+ 右侧抽屉（RulerDrawer） ===== */
+.ruler-entry-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.4rem 0.7rem;
+  font-size: 0.78rem;
+  border-radius: 6px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  background: rgba(59, 130, 246, 0.16);
+  color: #dbeafe;
+  cursor: pointer;
+}
+.ruler-entry-btn:hover {
+  background: rgba(59, 130, 246, 0.3);
+  color: #f8fafc;
+}
+
+.zone-ruler__track {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(148, 163, 184, 0.18);
+}
+.zone-ruler__seg {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  opacity: 0.85;
+}
+.zone-ruler__handle {
+  position: absolute;
+  top: 1.15rem;
+  width: 24px;
+  height: 24px;
+  margin-left: -12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  touch-action: none;
+  outline: none;
+}
+.zone-ruler__handle:focus-visible .zone-ruler__knob {
+  box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.45);
+}
+.zone-ruler__handle.dragging {
+  cursor: grabbing;
+}
+.zone-ruler__knob {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #94a3b8;
+  background: #0f172a;
+  box-shadow: 0 0 0 4px rgba(15, 23, 42, 0.55);
+  transition: transform 0.1s ease;
+}
+.zone-ruler__handle.dragging .zone-ruler__knob {
+  transform: scale(1.18);
+}
+.zone-ruler__handle-label {
+  display: none;
+}
+/* 手柄上方的常显数值：固定两位小数、等宽数字，拖动时不抖不换行 */
+.zone-ruler__handle-value {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  font-size: 0.62rem;
+  line-height: 1.4;
+  font-family: ui-monospace, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+}
+/* 两个端点（0 与 1）的刻度数字、手柄标签都会以中心对齐向两侧各伸出半个标签宽，
+   根容器留出一致的左右内边距，抽屉和编辑面板里都不会被父级裁掉或压到边框上。
+   内边距在根上，轴与刻度行同时收窄，坐标系仍然一致；端点上再按半宽夹取一次
+   （见 App.tsx 的 centerShift），容器再窄也不会露到外面。 */
+.zone-ruler {
+  padding: 0 1.05rem;
+}
+.zone-ruler__ticks {
+  position: relative;
+  height: 0.95rem;
+  margin-top: 0.5rem;
+  font-size: 0.6rem;
+  color: var(--color-text-muted);
+  font-family: ui-monospace, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+/* 刻度按百分比定位（与手柄同一坐标系），translateX(-50%) 让数字中心对准刻度点 */
+.zone-ruler__ticks span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.zone-ruler__summary {
+  margin: 0;
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  font-family: ui-monospace, Consolas, monospace;
+  line-height: 1.5;
+}
+
+.ruler-drawer__mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.55);
+  z-index: 1200;
+}
+.ruler-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 420px;
+  max-width: 100vw;
+  z-index: 1201;
+  display: flex;
+  flex-direction: column;
+  background: #0b1220;
+  border-left: 1px solid rgba(148, 163, 184, 0.28);
+  box-shadow: -24px 0 48px rgba(0, 0, 0, 0.45);
+}
+.ruler-drawer__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1rem 1.1rem 0.8rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+}
+.ruler-drawer__title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+.ruler-drawer__subtitle {
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  margin-top: 0.2rem;
+}
+.ruler-drawer__close {
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 0.2rem;
+  border-radius: 4px;
+  line-height: 0;
+}
+.ruler-drawer__close:hover {
+  background: rgba(148, 163, 184, 0.16);
+  color: #e2e8f0;
+}
+.ruler-drawer__body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 1rem 1.1rem 1.4rem;
+}
+.ruler-drawer__foot {
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  padding: 0.75rem 1.1rem;
+}
+.ruler-drawer__foot-inner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.ruler-drawer__applied {
+  font-size: 0.72rem;
+  color: #34d399;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.ruler-drawer__undo {
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.12);
+  color: #6ee7b7;
+  border-radius: 4px;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+.ruler-drawer__locked {
+  margin-bottom: 0.8rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.12);
+  color: #fbbf24;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.ruler-inherit__status {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-bottom: 0.45rem;
+}
+.ruler-inherit__badge {
+  font-weight: 600;
+  color: #cbd5f5;
+}
+.ruler-inherit__badge--own {
+  color: #60a5fa;
+}
+.ruler-inherit__values {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.72rem;
+  color: #cbd5e1;
+}
+.ruler-inherit__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.55rem;
+}
+.ruler-inherit__btn {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(148, 163, 184, 0.1);
+  color: #cbd5e1;
+  border-radius: 5px;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+.ruler-inherit__btn:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.22);
+  color: #f8fafc;
+}
+.ruler-inherit__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ruler-inherit__hint {
+  font-size: 0.68rem;
+  color: #fbbf24;
+}
+
+/* 分区尺子：三个分界输入框等宽三列，窄抽屉里也不换行 */
+.zone-ruler__inputs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.6rem;
+  /* 编辑面板比抽屉宽很多，限宽避免三个 stepper 被拉得过于松散 */
+  max-width: 480px;
+}
+.zone-ruler__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.zone-ruler__field-label {
+  font-size: 0.65rem;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+.zone-ruler__field .zone-bound-stepper {
+  min-width: 0;
+}
+/* 抽屉窄（420px）：三列 stepper 收窄按钮、输入框弹性，避免 + 按钮被挤出 */
+.zone-ruler__field .zone-bound-stepper { gap: 0.25rem; }
+.zone-ruler__field .zone-bound-stepper__input {
+  width: 100% !important;
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 0 0.15rem !important;
+}
+.zone-ruler__field .zone-bound-stepper__btn {
+  width: 1.5rem !important;
+  height: 1.5rem !important;
+  font-size: 0.9rem !important;
+}
+.zone-ruler__field .zone-bound-stepper__input::-webkit-outer-spin-button,
+.zone-ruler__field .zone-bound-stepper__input::-webkit-inner-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
+/* 命中状态串/zone 串是重复 ASCII 字母，禁掉连字避免被字体合成成异常字形 */
+.boll-zone-string {
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+
+
+
+/* 编排表「值等于全局」时的一键回退入口：必须低调，不能抢主按钮的存在感 */
+.ruler-clear-btn {
+  background: transparent;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 4px;
+  color: var(--color-text-muted, #94a3b8);
+  font-size: 0.66rem;
+  font-weight: 500;
+  line-height: 1.4;
+  padding: 1px 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.ruler-clear-btn:hover {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.12);
+  color: #93c5fd;
+}
+
+/* 抽屉底部的「未保存」角标：只在草稿与库中值不一致时出现 */
+.ruler-drawer__dirty {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.14);
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  border-radius: 4px;
+  padding: 1px 7px;
+  line-height: 1.5;
+}
+
+.ruler-entry-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  border-color: rgba(148, 163, 184, 0.25);
+}
+
+/* 抽屉里的高级折叠区：默认收起，减少第一眼噪音 */
+.ruler-drawer__advanced {
+  margin-top: 0.9rem;
+  border-top: 1px dashed var(--border-color);
+  padding-top: 0.55rem;
+}
+
+.ruler-drawer__advanced > summary {
+  cursor: pointer;
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  list-style: none;
+  user-select: none;
+}
+
+.ruler-drawer__advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ruler-drawer__advanced > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 0.35rem;
+  transition: transform 0.15s;
+}
+
+.ruler-drawer__advanced[open] > summary::before {
+  transform: rotate(90deg);
+}

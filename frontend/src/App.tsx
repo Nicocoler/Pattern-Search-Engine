@@ -3,7 +3,7 @@
 // 职责：实现极速扫描大PK、起始点归零百分比重合 Kline 绘制、高斯事件悬浮气泡标注、滚动无偏回测图表、自适应反馈闭环
 // =============================================================================
 
-import { useState, useEffect, useRef, type CSSProperties, type MutableRefObject } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, type CSSProperties, type MutableRefObject, type ReactNode } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
@@ -25,7 +25,8 @@ import {
   ChevronDown,
   ChevronUp,
   GripVertical,
-  Download
+  Ruler,
+  X
 } from 'lucide-react';
 import './App.css';
 import { DatePickerField } from './components/DatePickerField';
@@ -279,25 +280,73 @@ const bollStatesUrl = (apiBase: string, code: string, period: ChartPeriod, limit
 const CHART_UP_RED = '#ef4444';
 const CHART_DOWN_GREEN = '#54ffff';
 
-/** 布林命中详情：命中结束日后默认再展示的同周期 K 根数（无后续数据则更少） */
-const BOLL_MATCH_FORWARD_BARS = 10;
+/** 布林命中详情：命中结束日后最多再展示的同周期 K 根数（有多少拉多少，直到库内最新） */
+const BOLL_MATCH_FORWARD_BARS = 500;
 
 
+/** %B 轴上的合法分区：0 ≤ m < h < u ≤ 1（越界值一律视为非法，禁止落库） */
 function isZoneBoundsOrdered(b: ZoneBounds): boolean {
   return (
     Number.isFinite(b.m) &&
     Number.isFinite(b.h) &&
     Number.isFinite(b.u) &&
+    b.m >= 0 &&
+    b.u <= 1 &&
     b.m < b.h &&
     b.h < b.u
   );
 }
 
+/** 说清到底哪一项不对：越界 / 倒序 / 间隔过小，给出可直接照做的修正值
+ *  文案统一为「A 的 x 必须小于 B 的 y」句式，拖手柄和手输共用同一句，避免两套说法。 */
+function describeZoneConflict(b: ZoneBounds): string | null {
+  if (!Number.isFinite(b.m) || !Number.isFinite(b.h) || !Number.isFinite(b.u)) {
+    return '三个分界都必须是数字';
+  }
+  if (b.m < 0) return `L↔M 的 ${formatZoneBound(b.m)} 不能小于 0（%B 轴的下限）`;
+  if (b.u > 1) return `H↔U 的 ${formatZoneBound(b.u)} 不能大于 1（%B 轴的上限）`;
+  if (b.m >= b.h) {
+    return `L↔M 的 ${formatZoneBound(b.m)} 必须小于 M↔H 的 ${formatZoneBound(b.h)}（建议把 L↔M 改到 ${formatZoneBound(Math.max(0, b.h - 0.01))} 或更小）`;
+  }
+  if (b.h >= b.u) {
+    return `M↔H 的 ${formatZoneBound(b.h)} 必须小于 H↔U 的 ${formatZoneBound(b.u)}（建议把 M↔H 改到 ${formatZoneBound(Math.max(b.m + 0.01, b.u - 0.01))} 或更小）`;
+  }
+  if (b.h - b.m < 0.01) {
+    return `L↔M 的 ${formatZoneBound(b.m)} 与 M↔H 的 ${formatZoneBound(b.h)} 只差 ${formatZoneBound(b.h - b.m)}，相邻分界至少要差 0.01`;
+  }
+  if (b.u - b.h < 0.01) {
+    return `M↔H 的 ${formatZoneBound(b.h)} 与 H↔U 的 ${formatZoneBound(b.u)} 只差 ${formatZoneBound(b.u - b.h)}，相邻分界至少要差 0.01`;
+  }
+  return null;
+}
+
+/** 冲突文案里的数字与界面统一：固定两位小数（v1.3 全站唯一精度规则） */
 function formatZoneBound(n: number): string {
   if (!Number.isFinite(n)) return '—';
-  // 去掉多余尾零，便于阅读
-  return String(Number(n.toFixed(4)));
+  return n.toFixed(2);
 }
+
+const ZONE_CHAR_LABEL: Record<string, string> = {
+  L: '中轨下方',
+  M: '贴中轨',
+  H: '中轨↔上轨',
+  U: '触及/突破上轨',
+  N: '无效',
+};
+
+/** 把 "MUUHMM" 这类 zone 串折成「贴中轨×1 → 触及/突破上轨×2 → …」，供 tooltip 与图例使用 */
+function expandZoneString(s: string | null | undefined): string {
+  if (!s) return '';
+  const runs: { ch: string; n: number }[] = [];
+  for (const ch of s) {
+    const last = runs[runs.length - 1];
+    if (last && last.ch === ch) last.n += 1;
+    else runs.push({ ch, n: 1 });
+  }
+  return runs.map(r => `${ZONE_CHAR_LABEL[r.ch] ?? r.ch}×${r.n}`).join(' → ');
+}
+
+const ZONE_LEGEND = 'L 中轨下方 · M 贴中轨 · H 中轨与上轨之间 · U 触及/突破上轨（悬停可看中文展开）';
 
 /** 与 backend zone.py 一致：左闭右开 L/M/H/U；无效 → N */
 function zoneFromPctB(pctB: number | null | undefined, bounds: ZoneBounds): string {
@@ -384,17 +433,29 @@ function ZoneBoundStepper({
   onChange,
   invalid = false,
   title,
+  disabled = false,
 }: {
   value: number;
   onChange: (n: number) => void;
   invalid?: boolean;
   title?: string;
+  disabled?: boolean;
 }) {
   const step = 0.01;
-  const bump = (dir: 1 | -1) => {
-    const next = Math.round((value + dir * step) * 10000) / 10000;
-    onChange(next);
+  /** 输入中的原样文本：不在这里补零，否则用户打 0.5 会被撑成 0.50、光标乱跳 */
+  const [draft, setDraft] = useState<string | null>(null);
+  /** %B 轴是 0–1：± 按钮是常态操作，必须自己夹住，不能把越界值交给用户去发现 */
+  const clampBound = (n: number) => {
+    if (!Number.isFinite(n)) return 0;
+    return Math.min(1, Math.max(0, Math.round(n * 10000) / 10000));
   };
+  const bump = (dir: 1 | -1) => {
+    if (disabled) return;
+    setDraft(null);
+    onChange(clampBound(value + dir * step));
+  };
+  const atMin = value <= 0;
+  const atMax = value >= 1;
   const border = invalid ? '#ef4444' : 'rgba(96, 165, 250, 0.55)';
   const btnStyle: CSSProperties = {
     width: '1.7rem',
@@ -407,21 +468,29 @@ function ZoneBoundStepper({
     fontSize: '1rem',
     fontWeight: 700,
     lineHeight: 1,
-    cursor: 'pointer',
+    cursor: disabled ? 'not-allowed' : 'pointer',
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
+    opacity: disabled ? 0.45 : 1,
   };
 
   return (
     <div className="zone-bound-stepper" style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }} title={title}>
-      <button type="button" aria-label="减小" className="zone-bound-stepper__btn" style={btnStyle} onClick={() => bump(-1)}>−</button>
+      <button type="button" aria-label="减小" className="zone-bound-stepper__btn" disabled={disabled || atMin} style={{ ...btnStyle, opacity: disabled || atMin ? 0.45 : 1, cursor: disabled || atMin ? 'not-allowed' : 'pointer' }} onClick={() => bump(-1)}>−</button>
       <input
         type="number"
         step={step}
-        value={value}
-        onChange={e => onChange(Number(e.target.value))}
+        value={draft ?? formatZoneBound(value)}
+        disabled={disabled}
+        onChange={e => {
+          setDraft(e.target.value);
+          if (e.target.value.trim() === '') return;
+          const n = Number(e.target.value);
+          if (Number.isFinite(n)) onChange(n);
+        }}
+        onBlur={() => setDraft(null)}
         className="zone-bound-stepper__input"
         style={{
           width: '4.2rem',
@@ -434,9 +503,10 @@ function ZoneBoundStepper({
           color: '#f8fafc',
           fontFamily: 'monospace',
           fontSize: '0.82rem',
+          opacity: disabled ? 0.55 : 1,
         }}
       />
-      <button type="button" aria-label="增大" className="zone-bound-stepper__btn" style={btnStyle} onClick={() => bump(1)}>+</button>
+      <button type="button" aria-label="增大" className="zone-bound-stepper__btn" disabled={disabled || atMax} style={{ ...btnStyle, opacity: disabled || atMax ? 0.45 : 1, cursor: disabled || atMax ? 'not-allowed' : 'pointer' }} onClick={() => bump(1)}>+</button>
     </div>
   );
 }
@@ -511,111 +581,318 @@ function IntStepper({
   );
 }
 
-/** 四行分区编辑器：行上展示含义/区间/贴轨锚点；L/M/H 行编辑交界分界点 */
-function ZoneBoundsEditor({
+/** 分区尺子：一条 %B 轴（0→1，两端 ±∞）+ 3 个可拖手柄 + 3 个数字框（双向同步）。
+ *  手柄拖动时由控件自身保证 单调不交叉（不需要用户思考约束）；数字框允许输入非法值，交给保存校验拦截。 */
+const RULER_MIN_GAP = 0.01;
+
+/** 分区尺子的出厂默认值：仅用于「库里还没有全局值」这种情况，不能拿未保存的草稿顶替 */
+const DEFAULT_ZONE_BOUNDS: ZoneBounds = { m: 0.35, h: 0.65, u: 0.95 };
+
+function sameZoneBounds(a: ZoneBounds, b: ZoneBounds): boolean {
+  return (
+    Math.abs(a.m - b.m) < 1e-9 &&
+    Math.abs(a.h - b.h) < 1e-9 &&
+    Math.abs(a.u - b.u) < 1e-9
+  );
+}
+
+function ZoneRuler({
   bounds,
   onChange,
   showInvalid = false,
+  disabled = false,
 }: {
   bounds: ZoneBounds;
   onChange: (next: ZoneBounds) => void;
   showInvalid?: boolean;
+  disabled?: boolean;
 }) {
-  const invalid = showInvalid && !isZoneBoundsOrdered(bounds);
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const [dragKey, setDragKey] = useState<keyof ZoneBounds | null>(null);
+  // 输入即校验：只要三个分界不满足 m < h < u 就红框 + 内联提示，不等点保存
+  const invalid = showInvalid || !isZoneBoundsOrdered(bounds);
 
-  const rows: Array<{
-    key: 'L' | 'M' | 'H' | 'U';
-    title: string;
-    rangeText: string;
-    anchor: string;
-    editKey?: keyof ZoneBounds;
-    editHint?: string;
-  }> = [
-    {
-      key: 'L',
-      title: 'L · 中轨下方',
-      rangeText: `−∞ ≤ %B < ${formatZoneBound(bounds.m)}`,
-      anchor: '贴下轨 = 0',
-      editKey: 'm',
-      editHint: 'L↔M 分界',
-    },
-    {
-      key: 'M',
-      title: 'M · 贴中轨',
-      rangeText: `${formatZoneBound(bounds.m)} ≤ %B < ${formatZoneBound(bounds.h)}`,
-      anchor: '贴中轨 = 0.5',
-      editKey: 'h',
-      editHint: 'M↔H 分界',
-    },
-    {
-      key: 'H',
-      title: 'H · 中轨与上轨之间',
-      rangeText: `${formatZoneBound(bounds.h)} ≤ %B < ${formatZoneBound(bounds.u)}`,
-      anchor: '过渡区',
-      editKey: 'u',
-      editHint: 'H↔U 分界',
-    },
-    {
-      key: 'U',
-      title: 'U · 触及/突破上轨',
-      rangeText: `${formatZoneBound(bounds.u)} ≤ %B < +∞`,
-      anchor: '贴上轨 = 1',
-    },
+  const clampAt = (key: keyof ZoneBounds, raw: number) => {
+    const v = Math.min(1, Math.max(0, raw));
+    if (key === 'm') return Math.round(Math.min(v, bounds.h - RULER_MIN_GAP) * 10000) / 10000;
+    if (key === 'u') return Math.round(Math.max(v, bounds.h + RULER_MIN_GAP) * 10000) / 10000;
+    const lo = bounds.m + RULER_MIN_GAP;
+    const hi = bounds.u - RULER_MIN_GAP;
+    const clamped = lo <= hi ? Math.min(Math.max(v, lo), hi) : v;
+    return Math.round(clamped * 10000) / 10000;
+  };
+
+  const ratioAt = (clientX: number) => {
+    const el = trackRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    return (clientX - rect.left) / rect.width;
+  };
+
+  const dragTo = (key: keyof ZoneBounds, clientX: number) => {
+    if (disabled) return;
+    onChange({ ...bounds, [key]: clampAt(key, ratioAt(clientX)) });
+  };
+
+  /** 键盘/步进走这里：直接给比例值，不经过 clientX 通道 */
+  const stepTo = (key: keyof ZoneBounds, delta: number) => {
+    if (disabled) return;
+    onChange({ ...bounds, [key]: clampAt(key, bounds[key] + delta) });
+  };
+
+  const pct = (n: number) => `${Math.min(100, Math.max(0, n * 100))}%`;
+  const segments = [
+    { key: 'L', from: 0, to: bounds.m, color: '#64748b', label: 'L' },
+    { key: 'M', from: bounds.m, to: bounds.h, color: '#3b82f6', label: 'M' },
+    { key: 'H', from: bounds.h, to: bounds.u, color: '#f59e0b', label: 'H' },
+    { key: 'U', from: bounds.u, to: 1, color: '#ef4444', label: 'U' },
   ];
+  const handles: Array<{ key: keyof ZoneBounds; label: string; color: string }> = [
+    { key: 'm', label: 'L↔M', color: '#94a3b8' },
+    { key: 'h', label: 'M↔H', color: '#60a5fa' },
+    { key: 'u', label: 'H↔U', color: '#fbbf24' },
+  ];
+  // 数值标签常显：相邻太近会互相压住。分行阈值必须用实测像素，不能写死比例——
+  // 抽屉里轴约 350px、编辑面板里更窄，同一个百分比对应的像素宽度差很多。
+  const [metrics, setMetrics] = useState({ axisW: 0, labelW: 0, tickW: 0, padX: 0 });
+  const firstValueRef = useRef<HTMLSpanElement | null>(null);
+  const firstTickRef = useRef<HTMLSpanElement | null>(null);
+  useLayoutEffect(() => {
+    const track = trackRef.current;
+    if (!track) return;
+    const root = track.closest('.zone-ruler');
+    const measure = () => {
+      const axisW = track.getBoundingClientRect().width;
+      const labelW = firstValueRef.current?.getBoundingClientRect().width ?? 0;
+      const tickW = firstTickRef.current?.getBoundingClientRect().width ?? 0;
+      const padX = root ? parseFloat(getComputedStyle(root).paddingLeft) || 0 : 0;
+      setMetrics(prev =>
+        Math.abs(prev.axisW - axisW) < 0.5 &&
+        Math.abs(prev.labelW - labelW) < 0.5 &&
+        Math.abs(prev.tickW - tickW) < 0.5 &&
+        Math.abs(prev.padX - padX) < 0.5
+          ? prev
+          : { axisW, labelW, tickW, padX }
+      );
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(track);
+    if (firstValueRef.current) ro.observe(firstValueRef.current);
+    if (firstTickRef.current) ro.observe(firstTickRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  /**
+   * 半宽夹取：值落在 0 或 1 时标签会伸出轴外。可用的边界不是轴本身，
+   * 而是带内边距的根容器（轨道两侧各有 padX 的留白），否则端点刻度会被
+   * 推离手柄，出现「上下两个 0.00 不在同一点」的错觉。内边距够宽时位移为 0。
+   */
+  const centerShift = (v: number, width: number) => {
+    const half = width / 2;
+    if (metrics.axisW <= 1 || width <= 0) return 0;
+    const cx = v * metrics.axisW;
+    const lo = half - metrics.padX;
+    const hi = metrics.axisW - half + metrics.padX;
+    if (lo >= hi) return 0;
+    const clamped = Math.min(Math.max(cx, lo), hi);
+    return clamped - cx;
+  };
+  const labelOffset = (v: number) => centerShift(v, metrics.labelW);
+  const tickOffset = (v: number) => centerShift(v, metrics.tickW);
+
+  const minLabelGap =
+    metrics.axisW > 1 && metrics.labelW > 0 ? (metrics.labelW + 4) / metrics.axisW : 0.11;
+  const labelRows = (() => {
+    const MIN_GAP = minLabelGap;
+    const rows: Record<keyof ZoneBounds, number> = { m: 0, h: 0, u: 0 };
+    const lastInRow: number[] = [bounds.m, -Infinity, -Infinity];
+    (['h', 'u'] as Array<keyof ZoneBounds>).forEach(key => {
+      const v = bounds[key];
+      let row = 0;
+      while (row < lastInRow.length && v - lastInRow[row] < MIN_GAP) row += 1;
+      rows[key] = row;
+      lastInRow[row] = v;
+    });
+    return rows;
+  })();
+  const maxLabelRow = Math.max(labelRows.m, labelRows.h, labelRows.u);
+  const rulerTop = `${(2.25 + maxLabelRow * 1.05).toFixed(2)}rem`;
+  const labelRowStyle = (key: keyof ZoneBounds): CSSProperties =>
+    labelRows[key] === 0 ? {} : { bottom: `calc(100% + ${(0.375 + labelRows[key] * 1.05).toFixed(2)}rem)` };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', maxWidth: '420px', width: '100%' }}>
-      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: 0, lineHeight: 1.45 }}>
-        %B = (close − lower) / (upper − lower)；左闭右开。跌破下轨 &lt;0，突破上轨 &gt;1。
-      </p>
-      {rows.map(row => (
+    <div className="zone-ruler" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', width: '100%' }}>
+      <div
+        className="zone-ruler__track-wrap"
+        style={{
+          position: 'relative',
+          paddingTop: rulerTop,
+          paddingBottom: '0.2rem',
+          transition: 'padding-top 120ms ease',
+        }}
+      >
         <div
-          key={row.key}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '0.75rem',
-            padding: '0.5rem 0.65rem',
-            border: `1px solid ${invalid && row.editKey ? '#ef4444' : 'var(--border-color)'}`,
-            borderRadius: '6px',
-            background: 'rgba(148, 163, 184, 0.06)',
-          }}
+          ref={trackRef}
+          className="zone-ruler__track"
+          style={{ opacity: disabled ? 0.5 : 1, cursor: disabled ? 'not-allowed' : 'default' }}
         >
-          <div style={{ minWidth: 0, flex: '1 1 auto' }}>
-            <div style={{ fontSize: '0.78rem', color: 'var(--color-text-main)', fontWeight: 600 }}>
-              {row.title}
-            </div>
-            <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', fontFamily: 'monospace', marginTop: '0.12rem' }}>
-              {row.rangeText}
-            </div>
-            <div style={{ fontSize: '0.68rem', color: 'var(--color-text-muted)', marginTop: '0.1rem' }}>
-              {row.anchor}
-            </div>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.2rem', flexShrink: 0 }}>
-            {row.editKey ? (
-              <>
-                <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)' }}>{row.editHint}</span>
-                <ZoneBoundStepper
-                  value={bounds[row.editKey]}
-                  invalid={invalid}
-                  title={row.editHint}
-                  onChange={n => onChange({ ...bounds, [row.editKey!]: n })}
-                />
-              </>
-            ) : (
-              <span style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', fontFamily: 'monospace' }}>+∞</span>
-            )}
-          </div>
+          {segments.map(seg => (
+            <div
+              key={seg.key}
+              className={`zone-ruler__seg zone-ruler__seg--${seg.key}`}
+              title={`${seg.label}: ${formatZoneBound(seg.from)} → ${formatZoneBound(seg.to)}`}
+              style={{
+                left: pct(seg.from),
+                width: pct(Math.max(0, seg.to - seg.from)),
+                background: seg.color,
+              }}
+            />))}
         </div>
-      ))}
+        {handles.map(h => (
+          <div
+            key={h.key}
+            className={`zone-ruler__handle ${dragKey === h.key ? 'dragging' : ''}`}
+            style={{ left: pct(bounds[h.key]), top: rulerTop }}
+            role="slider"
+            aria-label={h.label}
+            aria-valuemin={0}
+            aria-valuemax={1}
+            aria-valuenow={bounds[h.key]}
+            aria-disabled={disabled}
+            tabIndex={disabled ? -1 : 0}
+            onPointerDown={e => {
+              if (disabled) return;
+              e.currentTarget.setPointerCapture(e.pointerId);
+              setDragKey(h.key);
+              dragTo(h.key, e.clientX);
+            }}
+            onPointerMove={e => {
+              if (dragKey !== h.key) return;
+              dragTo(h.key, e.clientX);
+            }}
+            onPointerUp={e => {
+              if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+              }
+              setDragKey(null);
+            }}
+            onPointerCancel={() => setDragKey(null)}
+            onKeyDown={e => {
+              if (disabled) return;
+              if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+              e.preventDefault();
+              const delta = (e.key === 'ArrowLeft' ? -0.01 : 0.01) * (e.shiftKey ? 10 : 1);
+              stepTo(h.key, delta);
+            }}
+          >
+            <span className="zone-ruler__knob" style={{ borderColor: h.color }} />
+            <span
+              ref={h.key === 'm' ? firstValueRef : undefined}
+              className="zone-ruler__handle-value"
+              style={{
+                color: '#e2e8f0',
+                ...labelRowStyle(h.key),
+                /* 端点上按半宽夹取，避免数值露到容器外 */
+                transform: `translateX(calc(-50% + ${labelOffset(bounds[h.key]).toFixed(2)}px))`,
+              }}
+              title={`${h.label} 分界 = ${formatZoneBound(bounds[h.key])}`}
+            >
+              {formatZoneBound(bounds[h.key])}
+            </span>
+            <span className="zone-ruler__handle-label">{h.label}</span>
+          </div>
+        ))}
+        <div className="zone-ruler__ticks">
+          {/* 与手柄同一套坐标系：直接按百分比定位，±∞ 由摘要行表达，不占轨道 */}
+          {[0, 0.25, 0.5, 0.75, 1].map(v => (
+            <span
+              key={v}
+              ref={v === 0 ? firstTickRef : undefined}
+              style={{
+                left: pct(v),
+                transform: `translateX(calc(-50% + ${tickOffset(v).toFixed(2)}px))`,
+              }}
+            >
+              {v.toFixed(2)}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div className="zone-ruler__inputs">
+        {handles.map(h => (
+          <div key={h.key} className="zone-ruler__field">
+            <span className="zone-ruler__field-label">{h.label} 分界</span>
+            <ZoneBoundStepper
+              value={bounds[h.key]}
+              invalid={invalid}
+              disabled={disabled}
+              title={`${h.label} 分界（0–1）`}
+              onChange={n => onChange({ ...bounds, [h.key]: n })}
+            />
+          </div>
+        ))}
+      </div>
+
+      <p className="zone-ruler__summary">
+        L &lt;{formatZoneBound(bounds.m)} · M {formatZoneBound(bounds.m)}–{formatZoneBound(bounds.h)} ·
+        H {formatZoneBound(bounds.h)}–{formatZoneBound(bounds.u)} · U &gt;{formatZoneBound(bounds.u)}
+      </p>
       {invalid && (
-        <p style={{ fontSize: '0.7rem', color: '#f87171', margin: 0 }}>
-          分界须满足 L↔M &lt; M↔H &lt; H↔U（即 m &lt; h &lt; u）
+        <p style={{ fontSize: '0.7rem', color: '#f87171', margin: 0, lineHeight: 1.45 }}>
+          {describeZoneConflict(bounds) ??
+            '分界须满足 L↔M < M↔H < H↔U（即 m < h < u，且相邻分界至少相差 0.01）；把冲突项改到相邻分界之外再保存。'}
         </p>
       )}
     </div>
+  );
+}
+
+/** 右侧抽屉容器：全局入口，ESC/点遮罩关闭，420px */
+function RulerDrawer({
+  open,
+  onClose,
+  title,
+  subtitle,
+  children,
+  footer,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  subtitle?: string;
+  children: ReactNode;
+  footer?: ReactNode;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <>
+      <div className="ruler-drawer__mask" onClick={onClose} />
+      <aside className="ruler-drawer" role="dialog" aria-modal="true" aria-label={title}>
+        <header className="ruler-drawer__head">
+          <div style={{ minWidth: 0 }}>
+            <div className="ruler-drawer__title"><Ruler size={16} /> {title}</div>
+            {subtitle && <div className="ruler-drawer__subtitle">{subtitle}</div>}
+          </div>
+          <button type="button" className="ruler-drawer__close" aria-label="关闭分区尺子" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </header>
+        <div className="ruler-drawer__body">{children}</div>
+        {footer && <footer className="ruler-drawer__foot">{footer}</footer>}
+      </aside>
+    </>
   );
 }
 
@@ -642,21 +919,6 @@ export default function App() {
   const [delayMax, setDelayMax] = useState(() => Number(localStorage.getItem('delay_max') || '300'));
   const [retryLimit, setRetryLimit] = useState(() => Number(localStorage.getItem('retry_limit') || '3'));
   const [learningRate, setLearningRate] = useState(() => Number(localStorage.getItem('learning_rate') || '0.05'));
-  /** 通达信自定义板块自动导入（命中列表与收藏夹各写各的板块） */
-  const [tdxRoot, setTdxRoot] = useState(() => localStorage.getItem('tdx_root') || '');
-  const [tdxBlockName, setTdxBlockName] = useState(() => localStorage.getItem('tdx_block_name') || 'PSE布林');
-  const [tdxBlockAbbr, setTdxBlockAbbr] = useState(() => localStorage.getItem('tdx_block_abbr') || 'PSE');
-  const [tdxFavBlockName, setTdxFavBlockName] = useState(
-    () => localStorage.getItem('tdx_fav_block_name') || 'PSE收藏',
-  );
-  const [tdxFavBlockAbbr, setTdxFavBlockAbbr] = useState(
-    () => (localStorage.getItem('tdx_fav_block_abbr') || 'PSEFAV').toUpperCase(),
-  );
-  const [tdxBridgeToken, setTdxBridgeToken] = useState(
-    () => localStorage.getItem('tdx_bridge_token') || 'pse-tdx-bridge',
-  );
-  const [tdxExporting, setTdxExporting] = useState(false);
-
   // 数据库及同步日志全局状态
   const [dbStats, setDbStats] = useState({ total_stocks: 0, total_bars: 0, latest_bar_date: 'N/A' });
   const [liveLogs, setLiveLogs] = useState<string[]>(['⚙️ 等待一键同步命令激活...']);
@@ -769,6 +1031,16 @@ export default function App() {
     denoise_min_len: number;
   } | null>(null);
 
+  // 清扫：B 降级前那条「覆盖值基线」已经无人读写，老用户 localStorage 里可能还留着一份，进来顺手删掉。
+  // 键名在这里拼出来而不是写字面量，免得它被当成「又被引用了」。
+  useEffect(() => {
+    try {
+      window.localStorage.removeItem(['pse', 'boll', 'zoneBaseline', 'v1'].join(':'));
+    } catch {
+      // 隐私模式下拿不到 storage，跳过即可，不影响主流程
+    }
+  }, []);
+
   // 个股走势（独立看盘页）
   const [stockSearchQuery, setStockSearchQuery] = useState('');
   const [stockSearchItems, setStockSearchItems] = useState<StockSearchItem[]>([]);
@@ -826,7 +1098,34 @@ export default function App() {
   const [bollGlobalDenoise, setBollGlobalDenoise] = useState(0);
   const [bollGlobalBounds, setBollGlobalBounds] = useState({ m: 0.35, h: 0.65, u: 0.95 });
   const [bollGlobalBoundsInvalid, setBollGlobalBoundsInvalid] = useState(false);
+  // 库中已生效的全局尺子：判「与全局相同 / 圆点 / 页底摘要 / 继承种子」一律只看这一份，
+  // 抽屉里改而未存的值（bollGlobalBounds）不算数，否则用户会以为已经生效。
+  const bollSavedGlobalBounds: ZoneBounds = (() => {
+    const zt = bollSettings?.zone_thresholds;
+    const num = (v: string | number | undefined, fb: number) => {
+      if (v === undefined || v === null || v === '-inf' || v === 'inf') return fb;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fb;
+    };
+    if (!zt) return DEFAULT_ZONE_BOUNDS;
+    return {
+      m: num(zt.M?.[0] ?? zt.L?.[1], DEFAULT_ZONE_BOUNDS.m),
+      h: num(zt.H?.[0] ?? zt.M?.[1], DEFAULT_ZONE_BOUNDS.h),
+      u: num(zt.U?.[0] ?? zt.H?.[1], DEFAULT_ZONE_BOUNDS.u),
+    };
+  })();
+  const bollGlobalDirty =
+    bollGlobalBounds.m !== bollSavedGlobalBounds.m ||
+    bollGlobalBounds.h !== bollSavedGlobalBounds.h ||
+    bollGlobalBounds.u !== bollSavedGlobalBounds.u ||
+    bollGlobalDenoise !== Number(bollSettings?.denoise_min_len ?? 0);
   const [bollFormBoundsInvalid, setBollFormBoundsInvalid] = useState(false);
+  // 分区尺子抽屉：全局入口；编辑编排时锁定全局尺子；保存后 5s 内可撤销
+  const [rulerDrawerOpen, setRulerDrawerOpen] = useState(false);
+  const [bollGlobalUndo, setBollGlobalUndo] = useState<{ bounds: ZoneBounds; denoise: number } | null>(null);
+  const bollGlobalUndoTimer = useRef<number | null>(null);
+  // 关掉「单独定义分区阈值」时暂存已填值，再次打开时预填（不删值）
+  const [bollZoneDraft, setBollZoneDraft] = useState<ZoneBounds | null>(null);
   const [bollTryCode, setBollTryCode] = useState('');
   const [bollTrySearchItems, setBollTrySearchItems] = useState<StockSearchItem[]>([]);
   const [bollTrySearchOpen, setBollTrySearchOpen] = useState(false);
@@ -1088,7 +1387,7 @@ export default function App() {
   const parseZoneBounds = (
     zt?: Record<string, [string | number, string | number]> | null,
   ) => {
-    const fallback = { m: bollGlobalBounds.m, h: bollGlobalBounds.h, u: bollGlobalBounds.u };
+    const fallback = { ...DEFAULT_ZONE_BOUNDS };
     if (!zt) return fallback;
     const num = (v: string | number | undefined, fb: number) => {
       if (v === undefined || v === null) return fb;
@@ -1103,7 +1402,10 @@ export default function App() {
     };
   };
 
-  const buildZoneThresholds = (bounds: { m: number; h: number; u: number }) => ({
+  // 返回类型显式写成二元组：调用方要把它塞回 bollSettings.zone_thresholds（PUT 的 body 同款结构）
+  const buildZoneThresholds = (
+    bounds: { m: number; h: number; u: number }
+  ): Record<string, [string | number, string | number]> => ({
     L: ['-inf', bounds.m],
     M: [bounds.m, bounds.h],
     H: [bounds.h, bounds.u],
@@ -1128,6 +1430,7 @@ export default function App() {
     });
     setBollShowManage(true);
     setBollFormBoundsInvalid(false);
+    setBollZoneDraft(null);
   };
 
   const openEditBollForm = (p: BollPatternMeta) => {
@@ -1152,13 +1455,14 @@ export default function App() {
     });
     setBollShowManage(true);
     setBollFormBoundsInvalid(false);
+    setBollZoneDraft(hasZoneOverride ? parseZoneBounds(p.zone_thresholds) : null);
   };
 
   const handleSaveBollPattern = async () => {
     try {
       if (bollForm.override_zone && !isZoneBoundsOrdered(bollForm.bounds)) {
         setBollFormBoundsInvalid(true);
-        showToast('本编排分区边界须满足 m < h < u');
+        showToast(describeZoneConflict(bollForm.bounds) ?? '本编排分区边界须满足 0 ≤ m < h < u ≤ 1');
         return;
       }
       setBollFormBoundsInvalid(false);
@@ -1224,6 +1528,32 @@ export default function App() {
       void fetchBollPatterns();
     } catch {
       showToast('保存编排失败');
+    }
+  };
+
+  /**
+   * 一键把「自定义但与全局相同」的编排恢复为继承全局。
+   * 只清 zone 覆盖，denoise 覆盖保持不动（两个开关本就独立）。
+   */
+  const handleClearBollZoneOverride = async (p: BollPatternMeta) => {
+    if (!window.confirm(`把「${p.name}」的分区尺子恢复为沿用全局？本编排已填的三个阈值会被清除。`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`${apiBase}/api/boll-patterns/${p.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clear_zone_override: true }),
+      });
+      const json = await res.json();
+      if (!json.success) {
+        showToast('恢复为继承失败：' + (json.error || ''));
+        return;
+      }
+      showToast('已恢复为沿用全局尺子');
+      void fetchBollPatterns();
+    } catch {
+      showToast('恢复为继承异常');
     }
   };
 
@@ -1299,33 +1629,95 @@ export default function App() {
     void persistBollPatternOrder(next);
   };
 
-  const handleSaveBollSettings = async () => {
+  const persistBollGlobalSettings = async (bounds: ZoneBounds, denoise: number): Promise<boolean> => {
+    // 兜底：所有落库路径都从这里走，越界/倒序直接拒绝，绝不把非法尺子写进库
+    const conflict = describeZoneConflict(bounds);
+    if (conflict) {
+      setBollGlobalBoundsInvalid(true);
+      showToast(conflict);
+      return false;
+    }
+    if (!Number.isInteger(denoise) || denoise < 0) {
+      showToast('denoise_min_len 必须是不小于 0 的整数');
+      return false;
+    }
     try {
-      if (!isZoneBoundsOrdered(bollGlobalBounds)) {
-        setBollGlobalBoundsInvalid(true);
-        showToast('全局分区边界须满足 m < h < u');
-        return;
-      }
-      setBollGlobalBoundsInvalid(false);
-      const zone_thresholds = buildZoneThresholds(bollGlobalBounds);
       const res = await fetch(`${apiBase}/api/boll-pattern-settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          zone_thresholds,
-          denoise_min_len: bollGlobalDenoise,
+          zone_thresholds: buildZoneThresholds(bounds),
+          denoise_min_len: denoise,
         }),
       });
       const json = await res.json();
       if (!json.success) {
         showToast('保存全局尺子失败：' + (json.error || ''));
-        return;
+        return false;
       }
-      showToast('全局尺子已保存（下次扫描生效）');
-      void fetchBollPatterns();
+      return true;
     } catch {
       showToast('保存全局尺子异常');
+      return false;
     }
+  };
+
+  // 保存/撤销成功后，以提交成功的值为准回写本地：摘要、橙点、继承种子都读 bollSettings，
+  // 而 fetchBollPatterns 会用后端返回的 settings 覆盖一遍，所以必须放在它之后调用。
+  const applyBollGlobalLocal = (bounds: ZoneBounds, denoise: number) => {
+    setBollSettings(s => ({
+      ...(s ?? { zone_thresholds: {}, denoise_min_len: 0 }),
+      zone_thresholds: buildZoneThresholds(bounds),
+      denoise_min_len: denoise,
+    }));
+    setBollGlobalBounds({ ...bounds });
+    setBollGlobalDenoise(denoise);
+    setBollGlobalBoundsInvalid(false);
+  };
+
+  const armBollGlobalUndo = (prev: { bounds: ZoneBounds; denoise: number }) => {
+    if (bollGlobalUndoTimer.current != null) window.clearTimeout(bollGlobalUndoTimer.current);
+    setBollGlobalUndo(prev);
+    bollGlobalUndoTimer.current = window.setTimeout(() => setBollGlobalUndo(null), 5000);
+  };
+
+  const handleSaveBollSettings = async () => {
+    if (!isZoneBoundsOrdered(bollGlobalBounds)) {
+      setBollGlobalBoundsInvalid(true);
+      showToast(describeZoneConflict(bollGlobalBounds) ?? '全局分区边界须满足 0 ≤ m < h < u ≤ 1');
+      return;
+    }
+    setBollGlobalBoundsInvalid(false);
+    // 整表提交（D2）：撤销 = 用上一份快照再提交一次，不涉及单字段保存
+    const submittedBounds = { ...bollGlobalBounds };
+    const submittedDenoise = bollGlobalDenoise;
+    // 撤销快照必须取「库里已保存的值」，不能取抽屉里的草稿：保存时草稿就等于提交值，
+    // 拿草稿当快照会让「撤销」原地再提交一次同样的值。
+    const prev = {
+      bounds: { ...bollSavedGlobalBounds },
+      denoise: Number(bollSettings?.denoise_min_len ?? 0),
+    };
+    const ok = await persistBollGlobalSettings(submittedBounds, submittedDenoise);
+    if (!ok) return;
+    showToast('全局尺子已保存（下次扫描生效）');
+    armBollGlobalUndo(prev);
+    await fetchBollPatterns();
+    // 必须在拉取之后回写：否则会被后端返回的旧 settings 盖回保存前的值
+    applyBollGlobalLocal(submittedBounds, submittedDenoise);
+  };
+
+  const handleUndoBollGlobal = async () => {
+    if (!bollGlobalUndo) return;
+    const prev = bollGlobalUndo;
+    setBollGlobalUndo(null);
+    if (bollGlobalUndoTimer.current != null) window.clearTimeout(bollGlobalUndoTimer.current);
+    setBollGlobalBounds(prev.bounds);
+    setBollGlobalDenoise(prev.denoise);
+    const ok = await persistBollGlobalSettings(prev.bounds, prev.denoise);
+    showToast(ok ? '已撤销，恢复保存前的尺子' : '撤销失败');
+    if (!ok) return;
+    await fetchBollPatterns();
+    applyBollGlobalLocal(prev.bounds, prev.denoise);
   };
 
   const bollMatchNaturalKey = (m: {
@@ -1753,12 +2145,12 @@ export default function App() {
     }
     if (bollForm.override_zone && !isZoneBoundsOrdered(bollForm.bounds)) {
       setBollFormBoundsInvalid(true);
-      showToast('本编排分区边界须满足 m < h < u');
+      showToast(describeZoneConflict(bollForm.bounds) ?? '本编排分区边界须满足 0 ≤ m < h < u ≤ 1');
       return;
     }
-    if (!bollForm.override_zone && !isZoneBoundsOrdered(bollGlobalBounds)) {
+    if (!bollForm.override_zone && !isZoneBoundsOrdered(bollSavedGlobalBounds)) {
       setBollGlobalBoundsInvalid(true);
-      showToast('全局分区边界须满足 m < h < u（试跑会使用页面上的全局草稿）');
+      showToast(describeZoneConflict(bollSavedGlobalBounds) ?? '库中全局分区边界须满足 0 ≤ m < h < u ≤ 1');
       return;
     }
 
@@ -2486,109 +2878,7 @@ export default function App() {
     localStorage.setItem('delay_max', String(delayMax));
     localStorage.setItem('retry_limit', String(retryLimit));
     localStorage.setItem('learning_rate', String(learningRate));
-    localStorage.setItem('tdx_root', tdxRoot.trim());
-    localStorage.setItem('tdx_block_name', tdxBlockName.trim() || 'PSE布林');
-    localStorage.setItem('tdx_block_abbr', (tdxBlockAbbr.trim() || 'PSE').toUpperCase());
-    localStorage.setItem('tdx_fav_block_name', tdxFavBlockName.trim() || 'PSE收藏');
-    localStorage.setItem('tdx_fav_block_abbr', (tdxFavBlockAbbr.trim() || 'PSEFAV').toUpperCase());
-    localStorage.setItem('tdx_bridge_token', tdxBridgeToken.trim() || 'pse-tdx-bridge');
     showToast('⚙️ 系统配置参数一键持久化成功！已应用到全模块。');
-  };
-
-  const ensureTdxRoot = async (): Promise<string | null> => {
-    const existing = tdxRoot.trim();
-    if (existing) return existing;
-    try {
-      const res = await fetch(`${apiBase}/api/tdx/detect`);
-      const json = await res.json();
-      const detected = json?.data?.tdx_root as string | undefined;
-      if (json.success && detected) {
-        setTdxRoot(detected);
-        localStorage.setItem('tdx_root', detected);
-        return detected;
-      }
-    } catch {
-      /* ignore */
-    }
-    return null;
-  };
-
-  /** 导入通达信：优先桥接推送（云部署+本机助手）；本机后端可顺带直写 */
-  const handleExportToTdx = async () => {
-    const source = bollListMode === 'favorites' ? bollFavorites : bollMatches;
-    const codes = Array.from(new Set(source.map((x) => String(x.code || '').trim()).filter(Boolean)));
-    if (codes.length === 0) {
-      showToast(bollListMode === 'favorites' ? '收藏夹为空，无法导入通达信' : '命中列表为空，无法导入通达信');
-      return;
-    }
-    setTdxExporting(true);
-    try {
-      const isFav = bollListMode === 'favorites';
-      const abbr = (
-        (isFav ? tdxFavBlockAbbr : tdxBlockAbbr).trim() || (isFav ? 'PSEFAV' : 'PSE')
-      ).toUpperCase();
-      const name = (isFav ? tdxFavBlockName : tdxBlockName).trim() || (isFav ? 'PSE收藏' : 'PSE布林');
-      const bridgeToken = tdxBridgeToken.trim() || 'pse-tdx-bridge';
-
-      const pushRes = await fetch(`${apiBase}/api/tdx/bridge/push`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-TDX-Bridge-Token': bridgeToken,
-        },
-        body: JSON.stringify({ codes, block_name: name, block_abbr: abbr }),
-      });
-      const pushJson = await pushRes.json();
-      if (!pushJson.success) {
-        showToast('推送失败：' + (pushJson.error || '未知错误'));
-        return;
-      }
-
-      if (isFav) {
-        localStorage.setItem('tdx_fav_block_name', name);
-        localStorage.setItem('tdx_fav_block_abbr', abbr);
-      } else {
-        localStorage.setItem('tdx_block_name', name);
-        localStorage.setItem('tdx_block_abbr', abbr);
-      }
-      localStorage.setItem('tdx_bridge_token', bridgeToken);
-
-      // 本机后端若能直写，额外写一次（助手未开也能用）
-      let localWrote = false;
-      const root = await ensureTdxRoot();
-      if (root) {
-        try {
-          const res = await fetch(`${apiBase}/api/tdx/export-block`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              codes,
-              tdx_root: root,
-              block_name: name,
-              block_abbr: abbr,
-            }),
-          });
-          const json = await res.json();
-          if (json.success) {
-            localWrote = true;
-            localStorage.setItem('tdx_root', root);
-          }
-        } catch {
-          /* 云端后端直写失败属正常 */
-        }
-      }
-
-      const n = pushJson.data?.code_count ?? codes.length;
-      if (localWrote) {
-        showToast(`已写入通达信「${name}」· ${n} 只（本机直写）。若软件已开，请重新打开该板块。`);
-      } else {
-        showToast(`已推送 ${n} 只到桥接队列。请保持本机「通达信助手」运行，约 2 秒内自动写入。`);
-      }
-    } catch {
-      showToast('导入通达信异常，请检查后端与桥接口令');
-    } finally {
-      setTdxExporting(false);
-    }
   };
 
   // 点击外部关闭「更多」下拉
@@ -3082,101 +3372,6 @@ export default function App() {
                 max={0.5}
               />
               <span className="form-item-tip">人工 👍极品 / 👎不像 标签对模板特征权重的微调偏置步伐大小。</span>
-            </div>
-
-            <div className="form-item">
-              <label>通达信安装目录</label>
-              <div style={{ display: 'flex', gap: '0.4rem' }}>
-                <input
-                  type="text"
-                  value={tdxRoot}
-                  onChange={(e) => setTdxRoot(e.target.value)}
-                  placeholder="例如 D:\SoftInstall\new_tdx"
-                  style={{ flex: 1 }}
-                />
-                <button
-                  type="button"
-                  className="btn-primary btn-sm"
-                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid var(--border-color)', boxShadow: 'none', whiteSpace: 'nowrap' }}
-                  onClick={() => { void (async () => {
-                    try {
-                      const res = await fetch(`${apiBase}/api/tdx/detect`);
-                      const json = await res.json();
-                      if (json.success && json.data?.tdx_root) {
-                        setTdxRoot(json.data.tdx_root);
-                        showToast('已探测到：' + json.data.tdx_root);
-                      } else {
-                        showToast('未自动找到通达信，请手动填写安装目录');
-                      }
-                    } catch {
-                      showToast('探测失败，请确认后端在本机运行');
-                    }
-                  })(); }}
-                >
-                  自动探测
-                </button>
-              </div>
-              <span className="form-item-tip">
-                仅本机后端直写时需要。云部署请忽略此项，改跑本机助手 scripts\tdx_bridge\start_tdx_bridge.bat。
-              </span>
-            </div>
-
-            <div className="form-item">
-              <label>通达信板块 · 命中列表（显示名 / 简称）</label>
-              <div style={{ display: 'flex', gap: '0.4rem' }}>
-                <input
-                  type="text"
-                  value={tdxBlockName}
-                  onChange={(e) => setTdxBlockName(e.target.value)}
-                  placeholder="PSE布林"
-                  style={{ flex: 1 }}
-                />
-                <input
-                  type="text"
-                  value={tdxBlockAbbr}
-                  onChange={(e) => setTdxBlockAbbr(e.target.value.toUpperCase())}
-                  placeholder="PSE"
-                  style={{ width: 88 }}
-                  title="简称兼 .blk 文件名，仅 A-Z0-9_"
-                />
-              </div>
-              <span className="form-item-tip">命中列表页的「导入通达信」写入此板块。简称即文件名（如 PSE.blk），每次导入覆盖该板块成分股。</span>
-            </div>
-
-            <div className="form-item">
-              <label>通达信板块 · 收藏夹（显示名 / 简称）</label>
-              <div style={{ display: 'flex', gap: '0.4rem' }}>
-                <input
-                  type="text"
-                  value={tdxFavBlockName}
-                  onChange={(e) => setTdxFavBlockName(e.target.value)}
-                  placeholder="PSE收藏"
-                  style={{ flex: 1 }}
-                />
-                <input
-                  type="text"
-                  value={tdxFavBlockAbbr}
-                  onChange={(e) => setTdxFavBlockAbbr(e.target.value.toUpperCase())}
-                  placeholder="PSEFAV"
-                  style={{ width: 88 }}
-                  title="简称兼 .blk 文件名，仅 A-Z0-9_"
-                />
-              </div>
-              <span className="form-item-tip">收藏夹页的「导入通达信」写入此板块，与命中列表互不覆盖。</span>
-            </div>
-
-            <div className="form-item">
-              <label>通达信桥接口令（云部署用）</label>
-              <input
-                type="text"
-                value={tdxBridgeToken}
-                onChange={(e) => setTdxBridgeToken(e.target.value)}
-                placeholder="pse-tdx-bridge"
-              />
-              <span className="form-item-tip">
-                与服务器 .env 的 TDX_BRIDGE_TOKEN、本机助手配置一致。其它电脑拷贝 scripts\tdx_bridge 下的
-                tdx_bridge_agent.exe + start_tdx_bridge.bat；助手可同时写入通达信与国泰海通富易（gtja_root）。
-              </span>
             </div>
 
             <button
@@ -4230,6 +4425,8 @@ export default function App() {
     ? bollPatterns.filter(p => p.enabled)
     : bollPatterns;
   const bollReorderLocked = bollReorderBusy || bollManageOnlyEnabled;
+  // 编辑编排态下锁定全局尺子：防止误点左侧按钮改掉全部编排的全局阈值
+  const bollRulerLocked = bollShowManage && Boolean(bollEditId);
 
   return (
     <div className="dashboard-container">
@@ -4299,6 +4496,14 @@ export default function App() {
                 onClick={() => { setActiveTab('templates'); setMoreTabsOpen(false); }}
               >
                 <Sliders size={16} /> 形态模板与权重参数自进化
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="tab-more-item"
+                onClick={() => { setRulerDrawerOpen(true); setMoreTabsOpen(false); }}
+              >
+                <Ruler size={16} /> 分区尺子
               </button>
             </div>
           )}
@@ -4840,15 +5045,6 @@ export default function App() {
                   >
                     <RotateCcw size={13} /> 刷新列表
                   </button>
-                  <button
-                    className="btn-primary btn-sm"
-                    style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
-                    onClick={() => { void handleExportToTdx(); }}
-                    disabled={tdxExporting || bollMatches.length === 0}
-                    title="写入通达信自定义板块（覆盖该板块成分）"
-                  >
-                    <Download size={13} /> {tdxExporting ? '导入中…' : '导入通达信'}
-                  </button>
                 </div>
                 {(bollScanning || (bollScanProgress && bollScanProgress.phase !== 'idle')) && bollScanProgress && (
                   <div className="boll-scan-progress" style={{ marginBottom: '0.8rem' }}>
@@ -4979,15 +5175,6 @@ export default function App() {
                       >
                         <RotateCcw size={14} /> 刷新收藏
                       </button>
-                      <button
-                        className="btn-primary"
-                        style={{ background: 'rgba(255,255,255,0.04)', color: '#fff', border: '1px solid var(--border-color)', boxShadow: 'none' }}
-                        onClick={() => { void handleExportToTdx(); }}
-                        disabled={tdxExporting || bollFavorites.length === 0}
-                        title="写入通达信自定义板块（覆盖该板块成分）"
-                      >
-                        <Download size={14} /> {tdxExporting ? '导入中…' : '导入通达信'}
-                      </button>
                     </div>
                     <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: '0.6rem' }}>
                       共 {bollFavoriteTotal} 条 · 按收藏时间倒序
@@ -5086,7 +5273,10 @@ export default function App() {
                     {bollChartSource === 'preview' && bollStateString && (
                       <div style={{ marginTop: '0.8rem', width: '100%', textAlign: 'left' }}>
                         <b style={{ color: '#cbd5e1', fontSize: '0.75rem' }}>试跑窗口 zone</b>
-                        <div className="boll-zone-string">{bollStateString}</div>
+                        <div className="boll-zone-string" title={expandZoneString(bollStateString)}>
+                          {bollStateString}
+                        </div>
+                        <p style={{ margin: '0.25rem 0 0', fontSize: '0.7rem', color: '#64748b' }}>{ZONE_LEGEND}</p>
                       </div>
                     )}
                   </div>
@@ -5190,7 +5380,12 @@ export default function App() {
                       {selectedBollMatch?.matched_states ? (
                         <div style={{ marginBottom: '0.45rem' }}>
                           <b style={{ color: '#cbd5e1' }}>命中状态串</b>
-                          <div className="boll-zone-string">{selectedBollMatch.matched_states}</div>
+                          <div className="boll-zone-string" title={expandZoneString(selectedBollMatch.matched_states)}>
+                            {selectedBollMatch.matched_states}
+                          </div>
+                          <p style={{ margin: '0.2rem 0 0', fontSize: '0.7rem', color: '#64748b' }}>
+                            {expandZoneString(selectedBollMatch.matched_states)}
+                          </p>
                         </div>
                       ) : null}
                       {chartPeriod === 'daily' && selectedBollMatch?.edge_hits && selectedBollMatch.edge_hits.length > 0 ? (
@@ -5232,7 +5427,10 @@ export default function App() {
                               ? '试跑窗口 zone'
                               : `近 60 ${CHART_PERIOD_LABEL[chartPeriod]} zone`}
                           </b>
-                          <div className="boll-zone-string">{bollStateString}</div>
+                          <div className="boll-zone-string" title={expandZoneString(bollStateString)}>
+                            {bollStateString}
+                          </div>
+                          <p style={{ margin: '0.2rem 0 0', fontSize: '0.7rem', color: '#64748b' }}>{ZONE_LEGEND}</p>
                         </div>
                       )}
                       {chartPeriod !== 'daily' &&
@@ -5411,7 +5609,68 @@ export default function App() {
                           />
                         </td>
                         <td style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
-                          {p.zone_thresholds != null || p.denoise_min_len != null ? '自定义' : '全局'}
+                          {(() => {
+                            // denoise 只在"覆盖值与全局不同"时才值得显示，否则 ·d0 会让人误以为有差异
+                            const denoiseOverridden =
+                              p.denoise_min_len != null && p.denoise_min_len !== bollGlobalDenoise;
+                            const denoiseTag = denoiseOverridden ? (
+                              <span title="本编排单独定义 denoise_min_len" style={{ marginLeft: 4 }}>
+                                ·d{p.denoise_min_len}
+                              </span>
+                            ) : null;
+                            if (p.zone_thresholds == null) {
+                              return (
+                                <span title={denoiseOverridden ? '分区沿用全局，仅 denoise 单独覆盖' : '沿用全局尺子'}>
+                                  全局{denoiseTag}
+                                </span>
+                              );
+                            }
+                            const zb = parseZoneBounds(p.zone_thresholds);
+                            const sameAsGlobal = sameZoneBounds(zb, bollSavedGlobalBounds);
+                            return (
+                              <div>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                  <span
+                                    style={{ fontFamily: 'monospace' }}
+                                    title={
+                                      sameAsGlobal
+                                        ? '自定义但与全局相同，可不开覆盖'
+                                        : `自定义值，与当前全局 ${formatZoneBound(bollSavedGlobalBounds.m)}/${formatZoneBound(bollSavedGlobalBounds.h)}/${formatZoneBound(bollSavedGlobalBounds.u)} 不同`
+                                    }
+                                  >
+                                    自定义 {formatZoneBound(zb.m)}/{formatZoneBound(zb.h)}/{formatZoneBound(zb.u)}
+                                    {!sameAsGlobal && (
+                                      <span
+                                        style={{
+                                          display: 'inline-block',
+                                          width: 6,
+                                          height: 6,
+                                          borderRadius: '50%',
+                                          background: '#f59e0b',
+                                          marginLeft: 4,
+                                          verticalAlign: 'middle',
+                                        }}
+                                      />
+                                    )}
+                                    {denoiseTag}
+                                  </span>
+                                  {sameAsGlobal && (
+                                    <button
+                                      type="button"
+                                      className="ruler-clear-btn"
+                                      title="值与全局完全一致，可直接改为沿用全局（后续全局变更会自动跟随）"
+                                      onClick={e => {
+                                        e.stopPropagation();
+                                        void handleClearBollZoneOverride(p);
+                                      }}
+                                    >
+                                      恢复为继承
+                                    </button>
+                                  )}
+                                </span>
+                              </div>
+                            );
+                          })()}
                         </td>
                         <td style={{ fontSize: '0.7rem', maxWidth: 260 }}>
                           <div style={{ fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -5466,40 +5725,32 @@ export default function App() {
               >
                 <div>
                   <h3 style={{ fontSize: '0.85rem', marginBottom: '0.5rem', color: 'var(--color-text-main)' }}>全局尺子</h3>
-                  <div className="form-group">
-                    <label>分区（按 L/M/H/U 行编辑交界）</label>
-                    <ZoneBoundsEditor
-                      bounds={bollGlobalBounds}
-                      showInvalid={bollGlobalBoundsInvalid}
-                      onChange={next => {
-                        setBollGlobalBounds(next);
-                        if (bollGlobalBoundsInvalid && isZoneBoundsOrdered(next)) {
-                          setBollGlobalBoundsInvalid(false);
-                        }
-                      }}
-                    />
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="ruler-entry-btn"
+                      disabled={bollRulerLocked}
+                      title={bollRulerLocked ? '正在编辑编排，全局尺子已锁定，关闭编辑面板后可修改' : '打开分区尺子'}
+                      onClick={() => setRulerDrawerOpen(true)}
+                    >
+                      <Ruler size={14} /> 打开分区尺子
+                    </button>
+                    <span style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)', fontFamily: 'monospace' }}>
+                      L&lt;{formatZoneBound(bollSavedGlobalBounds.m)} · M {formatZoneBound(bollSavedGlobalBounds.m)}–{formatZoneBound(bollSavedGlobalBounds.h)}
+                      {' '}· H {formatZoneBound(bollSavedGlobalBounds.h)}–{formatZoneBound(bollSavedGlobalBounds.u)}
+                      {' '}· U&gt;{formatZoneBound(bollSavedGlobalBounds.u)} · denoise={bollSettings?.denoise_min_len ?? 0}
+                      {bollGlobalDirty && (
+                        <span style={{ color: '#fbbf24' }} title="抽屉里有改动还没保存，库里的值仍是左边这份">
+                          {' · 未保存'}
+                        </span>
+                      )}
+                    </span>
                   </div>
-                  <div className="form-group">
-                    <label>denoise_min_len（最短持续天数去抖，0=关闭）</label>
-                    <IntStepper
-                      min={0}
-                      value={bollGlobalDenoise}
-                      onChange={n => setBollGlobalDenoise(n)}
-                      title="全局去抖最短持续天数"
-                    />
-                    <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
-                      匹配正则前，把 zone 游程里短于该天数的段并入相邻段，用来抹掉单日误穿轨等噪声。
-                      例：设为 2 会吃掉只持续 1 天的尖刺；过大可能抹掉真实短促突破。不确定时保持 0。
-                    </p>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.85rem', flexWrap: 'wrap' }}>
-                    <button className="btn-primary" onClick={handleSaveBollSettings}>保存全局尺子</button>
-                  </div>
-                  {bollSettings && (
-                    <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', marginTop: '0.4rem' }}>
-                      当前 denoise={bollSettings.denoise_min_len}
-                    </p>
-                  )}
+                  <p style={{ fontSize: '0.68rem', color: 'var(--color-text-muted)', margin: '0.4rem 0 0', lineHeight: 1.5 }}>
+                    控件已移入右侧抽屉（顶栏「更多」→ 分区尺子），这里只显示库中已生效的值。
+                    {bollEditId ? ' 正在编辑编排，全局尺子已锁定。' : ''}
+                    {bollGlobalDirty ? ' 抽屉里有未保存的改动。' : ''}
+                  </p>
                 </div>
 
                 {bollShowManage && (
@@ -5735,47 +5986,98 @@ export default function App() {
                         marginBottom: '0.5rem',
                       }}
                     >
-                      尺子覆盖（可选）：不勾选则沿用左侧全局尺子
+                      尺子覆盖（可选）：不勾选则沿用全局尺子
                     </div>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.45rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={bollForm.override_zone}
-                        onChange={e => {
-                          const checked = e.target.checked;
-                          setBollForm(f => ({
-                            ...f,
-                            override_zone: checked,
-                            bounds: checked ? f.bounds : { ...bollGlobalBounds },
-                          }));
-                          if (!checked) setBollFormBoundsInvalid(false);
-                        }}
-                      />
-                      单独定义分区阈值（覆盖全局）
-                    </label>
-                    {bollForm.override_zone ? (
-                      <div className="form-group">
-                        <label>本编排分区（覆盖全局）</label>
-                        <ZoneBoundsEditor
-                          bounds={bollForm.bounds}
-                          showInvalid={bollFormBoundsInvalid}
-                          onChange={next => {
-                            setBollForm(f => ({ ...f, bounds: next }));
-                            if (bollFormBoundsInvalid && isZoneBoundsOrdered(next)) {
-                              setBollFormBoundsInvalid(false);
-                            }
-                          }}
-                        />
-                      </div>
-                    ) : (
-                      <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0 0 0.55rem', lineHeight: 1.45 }}>
-                        当前沿用全局：
-                        L&lt;{formatZoneBound(bollGlobalBounds.m)} ·
-                        M[{formatZoneBound(bollGlobalBounds.m)},{formatZoneBound(bollGlobalBounds.h)}) ·
-                        H[{formatZoneBound(bollGlobalBounds.h)},{formatZoneBound(bollGlobalBounds.u)}) ·
-                        U≥{formatZoneBound(bollGlobalBounds.u)}
-                      </p>
-                    )}
+                    {(() => {
+                      const gm = formatZoneBound(bollSavedGlobalBounds.m);
+                      const gh = formatZoneBound(bollSavedGlobalBounds.h);
+                      const gu = formatZoneBound(bollSavedGlobalBounds.u);
+                      const om = formatZoneBound(bollForm.bounds.m);
+                      const oh = formatZoneBound(bollForm.bounds.h);
+                      const ou = formatZoneBound(bollForm.bounds.u);
+                      const sameAsGlobal =
+                        Math.abs(bollForm.bounds.m - bollSavedGlobalBounds.m) < 1e-9 &&
+                        Math.abs(bollForm.bounds.h - bollSavedGlobalBounds.h) < 1e-9 &&
+                        Math.abs(bollForm.bounds.u - bollSavedGlobalBounds.u) < 1e-9;
+                      return (
+                        <div className="ruler-inherit">
+                          <div className="ruler-inherit__status">
+                            当前使用：
+                            {bollForm.override_zone ? (
+                              <>
+                                <span className="ruler-inherit__badge ruler-inherit__badge--own">本编排</span>
+                                <span className="ruler-inherit__values">
+                                  L&lt;{om} · M {om}–{oh} · H {oh}–{ou} · U&gt;{ou}
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <span className="ruler-inherit__badge">全局</span>
+                                <span className="ruler-inherit__values">
+                                  L&lt;{gm} · M {gm}–{gh} · H {gh}–{gu} · U&gt;{gu}
+                                </span>
+                              </>
+                            )}
+                          </div>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.4rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={bollForm.override_zone}
+                              onChange={e => {
+                                const checked = e.target.checked;
+                                if (checked) {
+                                  // 关闭期间保留的已填值优先；没有则以全局当前值为起点
+                                  const seed = bollZoneDraft ?? { ...bollSavedGlobalBounds };
+                                  setBollForm(f => ({ ...f, override_zone: true, bounds: seed }));
+                                } else {
+                                  setBollZoneDraft(bollForm.bounds);
+                                  setBollForm(f => ({ ...f, override_zone: false }));
+                                  setBollFormBoundsInvalid(false);
+                                }
+                              }}
+                            />
+                            单独定义分区阈值（覆盖全局）
+                          </label>
+                          {bollForm.override_zone && (
+                            <div className="ruler-inherit__actions">
+                              <button
+                                type="button"
+                                className="ruler-inherit__btn"
+                                onClick={() => setBollForm(f => ({ ...f, bounds: { ...bollSavedGlobalBounds } }))}
+                              >
+                                复制全局值
+                              </button>
+                              <button
+                                type="button"
+                                className="ruler-inherit__btn"
+                                onClick={() => {
+                                  setBollZoneDraft(bollForm.bounds);
+                                  setBollForm(f => ({ ...f, override_zone: false }));
+                                  setBollFormBoundsInvalid(false);
+                                }}
+                              >
+                                恢复为沿用全局
+                              </button>
+                              {sameAsGlobal && (
+                                <span className="ruler-inherit__hint">与全局相同，可不开覆盖</span>
+                              )}
+                            </div>
+                          )}
+                          {bollForm.override_zone && (
+                            <ZoneRuler
+                              bounds={bollForm.bounds}
+                              showInvalid={bollFormBoundsInvalid}
+                              onChange={next => {
+                                setBollForm(f => ({ ...f, bounds: next }));
+                                if (bollFormBoundsInvalid && isZoneBoundsOrdered(next)) {
+                                  setBollFormBoundsInvalid(false);
+                                }
+                              }}
+                            />
+                          )}
+                        </div>
+                      );
+                    })()}
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', marginBottom: '0.45rem' }}>
                       <input
                         type="checkbox"
@@ -6121,6 +6423,117 @@ export default function App() {
 
         </section>
       </main>
+
+      {/* 6.9 分区尺子抽屉：任何 tab 都能打开，ESC/点遮罩关闭 */}
+      <RulerDrawer
+        open={rulerDrawerOpen}
+        onClose={() => {
+          if (bollGlobalDirty && !window.confirm('分区尺子有未保存的改动，关闭后这些改动会丢弃（库里的值不变）。确认关闭？')) {
+            return;
+          }
+          // 关闭即丢弃草稿：抽屉里的输入框直接绑 bollGlobalBounds，不还原就会污染下次打开和预填种子
+          if (bollGlobalDirty) {
+            setBollGlobalBounds({ ...bollSavedGlobalBounds });
+            setBollGlobalDenoise(bollSettings?.denoise_min_len ?? 0);
+            setBollGlobalBoundsInvalid(false);
+          }
+          setRulerDrawerOpen(false);
+        }}
+        title="分区尺子"
+        subtitle={bollRulerLocked
+          ? '正在编辑编排 · 全局尺子已锁定'
+          : '全局默认 · 所有未覆盖的编排共用'}
+        footer={
+          <div className="ruler-drawer__foot-inner">
+            {bollGlobalUndo && (
+              <span className="ruler-drawer__applied">
+                已应用
+                <button type="button" className="ruler-drawer__undo" onClick={() => { void handleUndoBollGlobal(); }}>
+                  撤销
+                </button>
+              </span>
+            )}
+            <span style={{ flex: '1 1 auto' }} />
+            {bollGlobalDirty && !bollRulerLocked && (
+              <span className="ruler-drawer__dirty" title="改动只在输入框里，还没写进库">
+                未保存
+              </span>
+            )}
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={bollRulerLocked}
+              onClick={() => {
+                if (bollRulerLocked) return;
+                if (!window.confirm('把分区恢复为 0.35 / 0.65 / 0.95 并保存？')) return;
+                setBollGlobalBounds({ m: 0.35, h: 0.65, u: 0.95 });
+                setBollGlobalBoundsInvalid(false);
+                showToast('已恢复默认值，点「保存全局尺子」落库');
+              }}
+            >
+              恢复默认
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={bollRulerLocked}
+              title={bollRulerLocked ? '正在编辑编排，先关闭编辑面板' : '保存全局尺子'}
+              onClick={() => { void handleSaveBollSettings(); }}
+            >
+              保存全局尺子
+            </button>
+          </div>
+        }
+      >
+        {bollRulerLocked && (
+          <div className="ruler-drawer__locked">
+            正在编辑编排 {bollEditId}，全局尺子暂时锁定。关闭右侧编辑面板后可修改。
+          </div>
+        )}
+        <div className="form-group">
+          <label>分区（拖动 3 个手柄，或直接输入分界值）</label>
+          <p style={{ fontSize: '0.68rem', color: 'var(--color-text-muted)', margin: '0 0 0.45rem', lineHeight: 1.5 }}>
+            轴是 %B 的 0–1；三个分界必须递增，相邻至少相差 0.01（手柄拖不动时会自动停在相邻分界外 0.01 处），
+            键盘方向键微调 0.01、Shift+方向键 0.1。
+          </p>
+          <ZoneRuler
+            bounds={bollGlobalBounds}
+            showInvalid={bollGlobalBoundsInvalid}
+            disabled={bollRulerLocked}
+            onChange={next => {
+              setBollGlobalBounds(next);
+              if (bollGlobalBoundsInvalid && isZoneBoundsOrdered(next)) {
+                setBollGlobalBoundsInvalid(false);
+              }
+            }}
+          />
+        </div>
+        <details className="ruler-drawer__advanced" open={bollGlobalDenoise > 0 || bollRulerLocked}>
+          <summary>高级 · 去抖 denoise_min_len（默认 0，多数情况不用碰）</summary>
+          <div className="form-group" style={{ marginTop: '0.6rem' }}>
+            <label>denoise_min_len（最短持续天数去抖，0=关闭）</label>
+          <IntStepper
+            min={0}
+            value={bollGlobalDenoise}
+            onChange={n => setBollGlobalDenoise(n)}
+            title="全局去抖最短持续天数"
+            disabled={bollRulerLocked}
+          />
+          <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.35rem 0 0', lineHeight: 1.5 }}>
+            匹配正则前，把 zone 游程里短于该天数的段并入相邻段，用来抹掉单日误穿轨等噪声。
+            例：设为 2 会吃掉只持续 1 天的尖刺；过大可能抹掉真实短促突破。不确定时保持 0。
+          </p>
+          </div>
+        </details>
+        {bollSettings && (
+          <p style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)', margin: '0.5rem 0 0' }}>
+            库中当前 denoise={bollSettings.denoise_min_len}；
+            全局 L&lt;{formatZoneBound(bollSavedGlobalBounds.m)} · M {formatZoneBound(bollSavedGlobalBounds.m)}–{formatZoneBound(bollSavedGlobalBounds.h)}
+            {' '}· H {formatZoneBound(bollSavedGlobalBounds.h)}–{formatZoneBound(bollSavedGlobalBounds.u)} · U&gt;{formatZoneBound(bollSavedGlobalBounds.u)}
+          </p>
+        )}
+      </RulerDrawer>
     </div>
   );
 }
+
