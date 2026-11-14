@@ -1,0 +1,22 @@
+---
+description: Do not extend deprecated scan / backtest / templates tabs
+alwaysApply: true
+---
+
+# Deprecated legacy tabs
+
+These UI areas are **legacy and unmaintained** (ADR 0005). They may still open from the「更多」menu, but **do not add features, refactors, or bugfix scope** there unless the user explicitly asks to revive them:
+
+- `scan` — 极速形态每日扫描大 PK
+- `backtest` — 回测
+- `templates` — 模板
+
+```tsx
+// ❌ BAD — new capability on a deprecated tab
+if (activeTab === 'scan') { /* add new filter UI */ }
+
+// ✅ GOOD — work on maintained surfaces
+// boll_pattern | stock_view | settings
+```
+
+Default new chart/period/indicator work goes to **布林编排** and **个股走势** only. If a change would touch deprecated tab code only to keep it compiling, keep the diff minimal and do not improve that UX.

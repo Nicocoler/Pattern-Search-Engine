@@ -1,0 +1,16 @@
+---
+description: Boll pattern scan is period-bound (ADR 0006)
+globs: backend/app/boll_pattern/**/*,frontend/**/*.{tsx,ts},backend/app/main.py
+alwaysApply: false
+---
+
+# Boll pattern multi-period scan (ADR 0006)
+
+- Each Pattern has exactly one `period` (`daily` | `weekly` | `monthly`); set at create; **immutable**.
+- One scan job = one period + window in **bars of that period**; only enabled patterns with that period.
+- Weekly/monthly: aggregate from `daily_bars`, compute zone in memory; **do not** persist weekly/monthly zone tables; **do** persist `pattern_match_result`.
+- Edges (`limit_up`, etc.): **daily patterns only**; reject edges on weekly/monthly.
+- Indicators (KDJ hard filters, ADR 0007): **all periods**; opt-in `indicators[]`; filter after edges; reuse `chart_subpane.apply_kdj`.
+- Selecting a match forces chart `chartPeriod` to the pattern's period.
+- End-within filter = last N **bars** of the list's period, not raw calendar days for all periods.
+- Post-sync auto scan: **daily only**. Preview uses the pattern's period.
