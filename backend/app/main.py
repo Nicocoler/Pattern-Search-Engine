@@ -90,6 +90,12 @@ async def lifespan(app: FastAPI):
         logger.info("⚡ 股票拼音首字母列检查完成: %s", py_info)
     except Exception as ex:
         logger.warning("股票拼音首字母列补缺跳过（库可能未就绪）: %s", ex)
+    try:
+        from backend.app.stock_favorites import ensure_stock_favorite_table
+        ensure_stock_favorite_table()
+        logger.info("⚡ 个股收藏表检查完成")
+    except Exception as ex:
+        logger.warning("个股收藏表补缺跳过（库可能未就绪）: %s", ex)
     logger.info("⚡ 预设特征模板状态检查通过，准备对外倾泄行情计算服务！")
     yield
     db.closeall()
@@ -245,6 +251,13 @@ class BollFavoriteCreatePayload(BaseModel):
 
 class BollFavoriteNotePayload(BaseModel):
     note: str = ""
+
+
+class StockFavoriteCreatePayload(BaseModel):
+    """个股收藏；按 code 去重，供通达信 PSE收藏板块同步。"""
+    code: str
+    name: str | None = None
+    note: str | None = None
 
 
 class BollPatternSettingsPayload(BaseModel):
@@ -1606,6 +1619,63 @@ def delete_boll_pattern_favorite(favorite_id: int):
         return {"success": True, "data": {"id": favorite_id}, "error": None, "message": "已取消收藏"}
     except Exception as e:
         logger.error(f"取消布林收藏异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+# -------------------------------------------------------------------------
+# 4.8b 个股收藏（通达信 PSE收藏板块）
+# -------------------------------------------------------------------------
+@app.get("/api/stock-favorites")
+def get_stock_favorites(
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    code: str | None = Query(None, description="若传入则只查该代码是否已收藏"),
+):
+    """个股收藏列表；传 code 时返回单条状态。"""
+    try:
+        from backend.app.stock_favorites import get_stock_favorite, list_stock_favorites
+
+        if code and str(code).strip():
+            item = get_stock_favorite(code)
+            return {
+                "success": True,
+                "data": {"favorited": item is not None, "item": item},
+                "error": None,
+            }
+        items, total = list_stock_favorites(limit=limit, offset=offset)
+        return {"success": True, "data": {"items": items, "total": total}, "error": None}
+    except Exception as e:
+        logger.error(f"查询个股收藏异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.post("/api/stock-favorites")
+def create_stock_favorite(payload: StockFavoriteCreatePayload):
+    """收藏一只股票（按 code upsert）。"""
+    try:
+        from backend.app.stock_favorites import add_stock_favorite
+
+        item = add_stock_favorite(code=payload.code, name=payload.name, note=payload.note)
+        return {"success": True, "data": item, "error": None, "message": "已收藏"}
+    except ValueError as e:
+        return {"success": False, "data": None, "error": str(e)}
+    except Exception as e:
+        logger.error(f"收藏个股异常: {e}")
+        return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
+
+
+@app.delete("/api/stock-favorites/{code}")
+def delete_stock_favorite_api(code: str):
+    """取消个股收藏。"""
+    try:
+        from backend.app.stock_favorites import delete_stock_favorite
+
+        ok = delete_stock_favorite(code)
+        if not ok:
+            return {"success": False, "data": None, "error": "收藏不存在"}
+        return {"success": True, "data": {"code": code}, "error": None, "message": "已取消收藏"}
+    except Exception as e:
+        logger.error(f"取消个股收藏异常: {e}")
         return {"success": False, "data": None, "error": f"操作失败: {type(e).__name__}"}
 
 

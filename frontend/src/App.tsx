@@ -139,7 +139,7 @@ interface BollPatternMatch {
   favorite_note?: string;
 }
 
-/** 布林命中收藏快照（与扫描结果脱钩） */
+/** 布林命中收藏快照（与扫描结果脱钩）；source=stock 为个股走势收藏 */
 interface BollPatternFavorite {
   id: number;
   code: string;
@@ -158,7 +158,11 @@ interface BollPatternFavorite {
   source_match_id?: number | null;
   note: string;
   favorited_at?: string | null;
+  /** pattern=布林命中快照；stock=个股走势收藏（通达信 PSE收藏） */
+  source?: 'pattern' | 'stock';
 }
+
+const STOCK_FAVORITE_PATTERN_ID = '__stock__';
 
 interface BollPatternMeta {
   id: string;
@@ -1048,6 +1052,8 @@ export default function App() {
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
   const [stockSearchHighlightIndex, setStockSearchHighlightIndex] = useState(0);
   const [selectedStockView, setSelectedStockView] = useState<StockSearchItem | null>(null);
+  const [stockViewFavorited, setStockViewFavorited] = useState(false);
+  const [stockViewFavoriteBusy, setStockViewFavoriteBusy] = useState(false);
   const [stockViewEndDate, setStockViewEndDate] = useState('');
   /** ①② 共用周期；默认日线，不持久化（ADR 0005） */
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('daily');
@@ -1789,26 +1795,65 @@ export default function App() {
   const fetchBollFavorites = async (opts?: { selectFirst?: boolean }) => {
     setBollLoading(true);
     try {
-      const res = await fetch(`${apiBase}/api/boll-pattern-favorites?limit=200`);
-      const json = await res.json();
-      if (json.success) {
-        const items: BollPatternFavorite[] = json.data.items || [];
-        setBollFavorites(items);
-        setBollFavoriteTotal(json.data.total || 0);
-        if (opts?.selectFirst || bollListMode === 'favorites') {
-          if (items.length > 0) {
-            const view = favoriteToMatchView(items[0]);
-            setBollFavoriteNoteDraft(items[0].note || '');
-            void handleSelectBollMatch(view);
-          } else {
-            setSelectedBollMatch(null);
-            setBollBars([]);
-            setBollStateString('');
-            setBollFavoriteNoteDraft('');
-          }
+      const [bollRes, stockRes] = await Promise.all([
+        fetch(`${apiBase}/api/boll-pattern-favorites?limit=200`),
+        fetch(`${apiBase}/api/stock-favorites?limit=500`),
+      ]);
+      const bollJson = await bollRes.json();
+      const stockJson = await stockRes.json();
+      if (!bollJson.success) {
+        showToast('拉取收藏夹失败：' + (bollJson.error || ''));
+        return;
+      }
+      const patternItems: BollPatternFavorite[] = (bollJson.data?.items || []).map(
+        (f: BollPatternFavorite) => ({ ...f, source: 'pattern' as const }),
+      );
+      const stockItems: BollPatternFavorite[] = stockJson.success
+        ? (stockJson.data?.items || []).map(
+            (
+              s: { code: string; name?: string; note?: string; favorited_at?: string | null },
+              i: number,
+            ) => ({
+              id: -1 - i,
+              code: s.code,
+              name: s.name || '',
+              pattern_id: STOCK_FAVORITE_PATTERN_ID,
+              pattern_name: '个股收藏',
+              start_date: '',
+              end_date: '',
+              matched_states: '',
+              score: null,
+              scan_date: null,
+              window_days: null,
+              note: s.note || '',
+              favorited_at: s.favorited_at || null,
+              source: 'stock' as const,
+            }),
+          )
+        : [];
+      const items = [...patternItems, ...stockItems].sort((a, b) =>
+        String(b.favorited_at || '').localeCompare(String(a.favorited_at || '')),
+      );
+      const total =
+        Number(bollJson.data?.total || patternItems.length) +
+        Number(stockJson.success ? stockJson.data?.total || stockItems.length : 0);
+      setBollFavorites(items);
+      setBollFavoriteTotal(total);
+      if (opts?.selectFirst || bollListMode === 'favorites') {
+        const firstPattern = items.find((x) => x.source !== 'stock');
+        if (opts?.selectFirst && items[0]?.source === 'stock') {
+          handleSelectStockView({ code: items[0].code, name: items[0].name || '' });
+          setActiveTab('stock_view');
+        } else if (firstPattern) {
+          const view = favoriteToMatchView(firstPattern);
+          setBollFavoriteNoteDraft(firstPattern.note || '');
+          void handleSelectBollMatch(view);
+        } else if (items.length === 0) {
+          setSelectedBollMatch(null);
+          setBollBars([]);
+          setBollStateString('');
+          setBollFavoriteNoteDraft('');
         }
-      } else {
-        showToast('拉取收藏夹失败：' + (json.error || ''));
       }
     } catch {
       showToast('拉取收藏夹异常，请检查后端。');
@@ -2293,10 +2338,118 @@ export default function App() {
     setStockSearchOpen(false);
     setStockSearchItems([]);
     setStockSearchHighlightIndex(0);
+    setStockViewFavorited(false);
     setStockViewZoneOpen(false);
     setStockViewZoneString('');
     stockViewReqKeyRef.current = '';
     setStockViewEndDate('');
+  };
+
+  /** 合并布林收藏 + 个股收藏代码，经桥接推送到通达信 PSE收藏板块 */
+  const pushStockFavoritesToTdx = async (codes: string[]) => {
+    const unique = Array.from(new Set(codes.map((c) => String(c || '').trim()).filter(Boolean)));
+    if (unique.length === 0) return { pushed: false, error: '收藏列表为空' };
+    const bridgeToken =
+      (localStorage.getItem('tdx_bridge_token') || 'pse-tdx-bridge').trim() || 'pse-tdx-bridge';
+    const name = (localStorage.getItem('tdx_fav_block_name') || 'PSE收藏').trim() || 'PSE收藏';
+    const abbr = (
+      (localStorage.getItem('tdx_fav_block_abbr') || 'PSEFAV').trim() || 'PSEFAV'
+    ).toUpperCase();
+    const pushRes = await fetch(`${apiBase}/api/tdx/bridge/push`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-TDX-Bridge-Token': bridgeToken,
+      },
+      body: JSON.stringify({ codes: unique, block_name: name, block_abbr: abbr }),
+    });
+    const pushJson = await pushRes.json();
+    if (!pushJson.success) {
+      return { pushed: false, error: String(pushJson.error || '桥接推送失败') };
+    }
+    return { pushed: true, error: null as string | null, name, abbr, count: unique.length };
+  };
+
+  const collectFavoriteCodesForTdx = async (): Promise<string[]> => {
+    const codes: string[] = [];
+    try {
+      const [bollRes, stockRes] = await Promise.all([
+        fetch(`${apiBase}/api/boll-pattern-favorites?limit=500`),
+        fetch(`${apiBase}/api/stock-favorites?limit=500`),
+      ]);
+      const bollJson = await bollRes.json();
+      const stockJson = await stockRes.json();
+      if (bollJson.success) {
+        for (const it of bollJson.data?.items || []) {
+          if (it?.code) codes.push(String(it.code));
+        }
+      }
+      if (stockJson.success) {
+        for (const it of stockJson.data?.items || []) {
+          if (it?.code) codes.push(String(it.code));
+        }
+      }
+    } catch {
+      /* 推送失败由调用方 toast */
+    }
+    return codes;
+  };
+
+  const handleToggleStockViewFavorite = async () => {
+    if (!selectedStockView?.code || stockViewFavoriteBusy) return;
+    setStockViewFavoriteBusy(true);
+    const code = selectedStockView.code;
+    try {
+      if (stockViewFavorited) {
+        const res = await fetch(`${apiBase}/api/stock-favorites/${encodeURIComponent(code)}`, {
+          method: 'DELETE',
+        });
+        const json = await res.json();
+        if (!json.success) {
+          showToast('取消收藏失败：' + (json.error || ''));
+          return;
+        }
+        setStockViewFavorited(false);
+        setBollFavoriteTotal((n) => Math.max(0, n - 1));
+        if (bollListMode === 'favorites') void fetchBollFavorites({ selectFirst: false });
+        const codes = await collectFavoriteCodesForTdx();
+        if (codes.length === 0) {
+          showToast('已取消收藏（收藏夹已空，本机助手同步时将跳过写入）');
+        } else {
+          const push = await pushStockFavoritesToTdx(codes);
+          if (push.pushed) {
+            showToast(`已取消收藏，并同步通达信 ${push.name || 'PSE收藏'}（${push.count} 只）`);
+          } else {
+            showToast(`已取消收藏；通达信同步失败：${push.error || '请确认本机助手在线'}`);
+          }
+        }
+      } else {
+        const res = await fetch(`${apiBase}/api/stock-favorites`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name: selectedStockView.name || '' }),
+        });
+        const json = await res.json();
+        if (!json.success) {
+          showToast('收藏失败：' + (json.error || ''));
+          return;
+        }
+        setStockViewFavorited(true);
+        setBollFavoriteTotal((n) => n + 1);
+        if (bollListMode === 'favorites') void fetchBollFavorites({ selectFirst: false });
+        const codes = await collectFavoriteCodesForTdx();
+        const push = await pushStockFavoritesToTdx(codes);
+        if (push.pushed) {
+          showToast(`已收藏，并推送到通达信 ${push.name || 'PSE收藏'}（${push.count} 只）`);
+        } else {
+          showToast(`已收藏；通达信推送失败：${push.error || '请确认本机助手在线'}`);
+        }
+      }
+    } catch {
+      showToast('收藏操作异常');
+    } finally {
+      setStockViewFavoriteBusy(false);
+    }
   };
 
   const handleStockSearchKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
@@ -2962,12 +3115,19 @@ export default function App() {
     } else {
       void fetchBollMatches();
     }
-    // 预取收藏数量，供「收藏夹 N」角标
+    // 预取收藏数量，供「收藏夹 N」角标（布林命中 + 个股）
     void (async () => {
       try {
-        const res = await fetch(`${apiBase}/api/boll-pattern-favorites?limit=1`);
-        const json = await res.json();
-        if (json.success) setBollFavoriteTotal(json.data.total || 0);
+        const [bollRes, stockRes] = await Promise.all([
+          fetch(`${apiBase}/api/boll-pattern-favorites?limit=1`),
+          fetch(`${apiBase}/api/stock-favorites?limit=1`),
+        ]);
+        const bollJson = await bollRes.json();
+        const stockJson = await stockRes.json();
+        const n =
+          (bollJson.success ? Number(bollJson.data?.total || 0) : 0) +
+          (stockJson.success ? Number(stockJson.data?.total || 0) : 0);
+        setBollFavoriteTotal(n);
       } catch {
         /* ignore */
       }
@@ -3030,6 +3190,31 @@ export default function App() {
       clearTimeout(t);
     };
   }, [activeTab, apiBase, stockSearchQuery, selectedStockView]);
+
+  // 个股走势：查询是否已收藏
+  useEffect(() => {
+    if (activeTab !== 'stock_view' || !selectedStockView?.code) {
+      setStockViewFavorited(false);
+      return;
+    }
+    let cancelled = false;
+    const code = selectedStockView.code;
+    (async () => {
+      try {
+        const res = await fetch(
+          `${apiBase}/api/stock-favorites?code=${encodeURIComponent(code)}`,
+        );
+        const json = await res.json();
+        if (cancelled) return;
+        setStockViewFavorited(Boolean(json.success && json.data?.favorited));
+      } catch {
+        if (!cancelled) setStockViewFavorited(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, apiBase, selectedStockView?.code]);
 
   // 布林编排试跑：模糊搜索联想
   useEffect(() => {
@@ -5212,7 +5397,9 @@ export default function App() {
                     ) : bollFavorites.length === 0 ? (
                       <div className="empty-wrapper" style={{ padding: '1.5rem 0' }}>
                         <Star size={24} color="#fbbf24" />
-                        <p style={{ fontSize: '0.85rem' }}>暂无收藏。在命中列表点星标，或打开详情后点「收藏」。</p>
+                        <p style={{ fontSize: '0.85rem' }}>
+                          暂无收藏。在命中列表点星标，或在个股走势点「收藏」。
+                        </p>
                       </div>
                     ) : (
                       <div className="table-wrapper" style={{ maxHeight: '42vh', overflow: 'auto' }}>
@@ -5228,17 +5415,24 @@ export default function App() {
                           </thead>
                           <tbody>
                             {bollFavorites.map((f) => {
-                              const view = favoriteToMatchView(f);
+                              const isStock = f.source === 'stock' || f.pattern_id === STOCK_FAVORITE_PATTERN_ID;
+                              const view = isStock ? null : favoriteToMatchView(f);
                               const selected =
+                                !isStock &&
                                 selectedBollMatch &&
                                 bollMatchNaturalKey(selectedBollMatch) === bollMatchNaturalKey(f);
                               return (
                                 <tr
-                                  key={f.id}
+                                  key={isStock ? `stock:${f.code}` : f.id}
                                   className={selected ? 'active-row' : ''}
                                   onClick={() => {
+                                    if (isStock) {
+                                      handleSelectStockView({ code: f.code, name: f.name || '' });
+                                      setActiveTab('stock_view');
+                                      return;
+                                    }
                                     setBollFavoriteNoteDraft(f.note || '');
-                                    void handleSelectBollMatch(view);
+                                    void handleSelectBollMatch(view!);
                                   }}
                                   style={{ cursor: 'pointer' }}
                                 >
@@ -5248,8 +5442,41 @@ export default function App() {
                                       className="boll-fav-star-btn"
                                       title="取消收藏"
                                       aria-label="取消收藏"
-                                      disabled={bollFavoriteBusy}
-                                      onClick={(e) => { void handleToggleBollFavorite(view, e); }}
+                                      disabled={bollFavoriteBusy || stockViewFavoriteBusy}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        if (isStock) {
+                                          void (async () => {
+                                            if (stockViewFavoriteBusy) return;
+                                            setStockViewFavoriteBusy(true);
+                                            try {
+                                              const res = await fetch(
+                                                `${apiBase}/api/stock-favorites/${encodeURIComponent(f.code)}`,
+                                                { method: 'DELETE' },
+                                              );
+                                              const json = await res.json();
+                                              if (!json.success) {
+                                                showToast('取消收藏失败：' + (json.error || ''));
+                                                return;
+                                              }
+                                              showToast('已取消个股收藏');
+                                              if (
+                                                selectedStockView &&
+                                                selectedStockView.code.toLowerCase() === f.code.toLowerCase()
+                                              ) {
+                                                setStockViewFavorited(false);
+                                              }
+                                              void fetchBollFavorites({ selectFirst: false });
+                                            } catch {
+                                              showToast('取消收藏异常');
+                                            } finally {
+                                              setStockViewFavoriteBusy(false);
+                                            }
+                                          })();
+                                          return;
+                                        }
+                                        void handleToggleBollFavorite(view!, e);
+                                      }}
                                     >
                                       <Star size={14} fill="#fbbf24" color="#fbbf24" />
                                     </button>
@@ -5267,7 +5494,13 @@ export default function App() {
                                     ) : null}
                                   </td>
                                   <td style={{ fontSize: '0.72rem', fontFamily: 'monospace' }}>
-                                    {f.start_date}<br />~ {f.end_date}
+                                    {isStock ? (
+                                      <span style={{ opacity: 0.45 }}>—</span>
+                                    ) : (
+                                      <>
+                                        {f.start_date}<br />~ {f.end_date}
+                                      </>
+                                    )}
                                   </td>
                                   <td style={{ fontSize: '0.7rem', color: '#94a3b8', maxWidth: 120 }}>
                                     {f.note ? (
@@ -6387,22 +6620,40 @@ export default function App() {
                   <Info size={28} color="#94a3b8" />
                   <p>输入名称、代码或拼音首字母搜索股票，查看日/周/月 K + 布林走势。</p>
                 </div>
-              ) : stockViewLoading && stockViewBars.length === 0 ? (
-                <div className="loading-wrapper" style={{ padding: '2rem 0' }}>
-                  <div className="spinner" />
-                </div>
-              ) : stockViewBars.length === 0 ? (
-                <div className="empty-wrapper" style={{ padding: '2rem 0' }}>
-                  <AlertTriangle size={24} color="#f59e0b" />
-                  <p>暂无行情数据，请换截止日或确认该股已同步。</p>
-                </div>
               ) : (
                 <>
                   <div style={{ marginBottom: '0.45rem' }}>
-                    <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f1f5f9', lineHeight: 1.3 }}>
-                      {selectedStockView.code.toUpperCase()} {selectedStockView.name || ''}
+                    <div
+                      style={{
+                        fontSize: '0.85rem',
+                        fontWeight: 600,
+                        color: '#f1f5f9',
+                        lineHeight: 1.3,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <span>
+                        {selectedStockView.code.toUpperCase()} {selectedStockView.name || ''}
+                      </span>
+                      <button
+                        type="button"
+                        className={`boll-fav-action-btn${stockViewFavorited ? ' is-on' : ''}`}
+                        disabled={stockViewFavoriteBusy}
+                        title={stockViewFavorited ? '取消收藏并同步通达信 PSE收藏' : '收藏并推送到通达信 PSE收藏'}
+                        onClick={() => { void handleToggleStockViewFavorite(); }}
+                      >
+                        <Star
+                          size={13}
+                          fill={stockViewFavorited ? '#fbbf24' : 'none'}
+                          color={stockViewFavorited ? '#fbbf24' : 'currentColor'}
+                        />
+                        {stockViewFavorited ? '已收藏' : '收藏'}
+                      </button>
                       {stockViewLoading ? (
-                        <span style={{ marginLeft: '0.5rem', fontSize: '0.72rem', color: '#94a3b8', fontWeight: 400 }}>
+                        <span style={{ fontSize: '0.72rem', color: '#94a3b8', fontWeight: 400 }}>
                           刷新中…
                         </span>
                       ) : null}
@@ -6411,35 +6662,48 @@ export default function App() {
                       截止 {stockViewEndDate || '—'} · {CHART_PERIOD_LABEL[chartPeriod]}K · 回看 {stockViewLookback} 根 · BOLL(20,2)
                     </div>
                   </div>
-                  <ReactECharts
-                    key={`stock-view-${chartPeriod}`}
-                    option={getStockViewChartOption()}
-                    style={{ height: '640px', width: '100%' }}
-                    notMerge
-                    opts={{ renderer: 'canvas' }}
-                  />
-                  <div style={{ marginTop: '0.75rem' }}>
-                    <button
-                      type="button"
-                      className="stock-zone-toggle"
-                      onClick={() => setStockViewZoneOpen((v) => !v)}
-                    >
-                      {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                      {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
-                    </button>
-                    {stockViewZoneOpen && (
-                      <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
-                        <b style={{ color: '#cbd5e1' }}>
-                          近 60 {CHART_PERIOD_LABEL[chartPeriod]} zone
-                        </b>
-                        {stockViewZoneLoading ? (
-                          <div style={{ marginTop: '0.35rem' }}>加载中…</div>
-                        ) : (
-                          <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
+                  {stockViewLoading && stockViewBars.length === 0 ? (
+                    <div className="loading-wrapper" style={{ padding: '2rem 0' }}>
+                      <div className="spinner" />
+                    </div>
+                  ) : stockViewBars.length === 0 ? (
+                    <div className="empty-wrapper" style={{ padding: '2rem 0' }}>
+                      <AlertTriangle size={24} color="#f59e0b" />
+                      <p>暂无行情数据，请换截止日或确认该股已同步。</p>
+                    </div>
+                  ) : (
+                    <>
+                      <ReactECharts
+                        key={`stock-view-${chartPeriod}`}
+                        option={getStockViewChartOption()}
+                        style={{ height: '640px', width: '100%' }}
+                        notMerge
+                        opts={{ renderer: 'canvas' }}
+                      />
+                      <div style={{ marginTop: '0.75rem' }}>
+                        <button
+                          type="button"
+                          className="stock-zone-toggle"
+                          onClick={() => setStockViewZoneOpen((v) => !v)}
+                        >
+                          {stockViewZoneOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                          {stockViewZoneOpen ? '收起 zone' : '显示 zone'}
+                        </button>
+                        {stockViewZoneOpen && (
+                          <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                            <b style={{ color: '#cbd5e1' }}>
+                              近 60 {CHART_PERIOD_LABEL[chartPeriod]} zone
+                            </b>
+                            {stockViewZoneLoading ? (
+                              <div style={{ marginTop: '0.35rem' }}>加载中…</div>
+                            ) : (
+                              <div className="boll-zone-string">{stockViewZoneString || '—'}</div>
+                            )}
+                          </div>
                         )}
                       </div>
-                    )}
-                  </div>
+                    </>
+                  )}
                 </>
               )}
             </div>

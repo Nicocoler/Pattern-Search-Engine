@@ -515,16 +515,31 @@ def fetch_match_codes(api_base: str, cfg: dict, ssl_verify: bool) -> list[str]:
 
 
 def fetch_favorite_codes(api_base: str, cfg: dict, ssl_verify: bool) -> list[str]:
-    """拉取收藏夹列表（与网页「收藏夹」同源接口）。"""
+    """拉取收藏夹：布林命中收藏 ∪ 个股收藏（通达信 PSE收藏板块）。"""
     try:
         limit = max(1, int(cfg.get("fav_limit") or 200))
     except (TypeError, ValueError):
         limit = 200
+    token = str(cfg.get("bridge_token") or "")
     url = f"{api_base}/api/boll-pattern-favorites?{urlencode({'limit': str(limit)})}"
-    raw = _request("GET", url, str(cfg.get("bridge_token") or ""), ssl_verify=ssl_verify)
+    raw = _request("GET", url, token, ssl_verify=ssl_verify)
     if not raw.get("success"):
         raise RuntimeError(f"收藏夹接口失败: {raw.get('error')}")
-    return _dedup_codes((raw.get("data") or {}).get("items") or [])
+    codes = _dedup_codes((raw.get("data") or {}).get("items") or [])
+
+    stock_url = f"{api_base}/api/stock-favorites?{urlencode({'limit': str(limit)})}"
+    try:
+        stock_raw = _request("GET", stock_url, token, ssl_verify=ssl_verify)
+        if stock_raw.get("success"):
+            codes = _dedup_codes(
+                [{"code": c} for c in codes]
+                + ((stock_raw.get("data") or {}).get("items") or [])
+            )
+        else:
+            log(f"[tdx-bridge] 个股收藏接口失败（忽略）: {stock_raw.get('error')}")
+    except Exception as e:
+        log(f"[tdx-bridge] 个股收藏拉取异常（忽略）: {type(e).__name__}: {e}")
+    return codes
 
 
 def manual_sync(cfg: dict, which: str = "both") -> str:
