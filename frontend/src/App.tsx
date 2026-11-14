@@ -4,7 +4,7 @@
 // =============================================================================
 
 import { useState, useEffect, useLayoutEffect, useRef, type CSSProperties, type MutableRefObject, type ReactNode } from 'react';
-import type { MouseEvent as ReactMouseEvent } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
 import ReactECharts from 'echarts-for-react';
 import {
   TrendingUp,
@@ -1046,6 +1046,7 @@ export default function App() {
   const [stockSearchItems, setStockSearchItems] = useState<StockSearchItem[]>([]);
   const [stockSearchOpen, setStockSearchOpen] = useState(false);
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
+  const [stockSearchHighlightIndex, setStockSearchHighlightIndex] = useState(0);
   const [selectedStockView, setSelectedStockView] = useState<StockSearchItem | null>(null);
   const [stockViewEndDate, setStockViewEndDate] = useState('');
   /** ①② 共用周期；默认日线，不持久化（ADR 0005） */
@@ -2291,10 +2292,31 @@ export default function App() {
     setStockSearchQuery(`${item.code.toUpperCase()} ${item.name || ''}`.trim());
     setStockSearchOpen(false);
     setStockSearchItems([]);
+    setStockSearchHighlightIndex(0);
     setStockViewZoneOpen(false);
     setStockViewZoneString('');
     stockViewReqKeyRef.current = '';
     setStockViewEndDate('');
+  };
+
+  const handleStockSearchKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (!stockSearchOpen || stockSearchItems.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setStockSearchHighlightIndex((i) => (i + 1) % stockSearchItems.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setStockSearchHighlightIndex(
+        (i) => (i - 1 + stockSearchItems.length) % stockSearchItems.length,
+      );
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const item = stockSearchItems[stockSearchHighlightIndex] ?? stockSearchItems[0];
+      if (item) handleSelectStockView(item);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setStockSearchOpen(false);
+    }
   };
 
   // 4.5 点击股票拉取核心同屏对齐比对数据
@@ -2967,6 +2989,7 @@ export default function App() {
     if (q.length < 1) {
       setStockSearchItems([]);
       setStockSearchOpen(false);
+      setStockSearchHighlightIndex(0);
       return;
     }
     // 已选中且输入框仍是「代码 名称」展示时，不重复搜
@@ -2987,12 +3010,17 @@ export default function App() {
         if (cancelled) return;
         if (json.success) {
           setStockSearchItems(json.data?.items || []);
+          setStockSearchHighlightIndex(0);
           setStockSearchOpen(true);
         } else {
           setStockSearchItems([]);
+          setStockSearchHighlightIndex(0);
         }
       } catch {
-        if (!cancelled) setStockSearchItems([]);
+        if (!cancelled) {
+          setStockSearchItems([]);
+          setStockSearchHighlightIndex(0);
+        }
       } finally {
         if (!cancelled) setStockSearchLoading(false);
       }
@@ -6289,20 +6317,28 @@ export default function App() {
                       onChange={(e) => {
                         setStockSearchQuery(e.target.value);
                         setStockSearchOpen(true);
+                        setStockSearchHighlightIndex(0);
                       }}
                       onFocus={() => {
                         if (stockSearchItems.length > 0) setStockSearchOpen(true);
                       }}
+                      onKeyDown={handleStockSearchKeyDown}
                       autoComplete="off"
                     />
                     {stockSearchLoading && <span className="stock-search-hint">搜索中…</span>}
                   </div>
                   {stockSearchOpen && stockSearchItems.length > 0 && (
-                    <ul className="stock-search-dropdown">
-                      {stockSearchItems.map((item) => (
-                        <li key={item.code}>
+                    <ul className="stock-search-dropdown" role="listbox">
+                      {stockSearchItems.map((item, index) => (
+                        <li key={item.code} role="option" aria-selected={index === stockSearchHighlightIndex}>
                           <button
                             type="button"
+                            className={
+                              index === stockSearchHighlightIndex
+                                ? 'stock-search-item-active'
+                                : undefined
+                            }
+                            onMouseEnter={() => setStockSearchHighlightIndex(index)}
                             onClick={() => handleSelectStockView(item)}
                           >
                             <span className="stock-search-code">{item.code.toUpperCase()}</span>

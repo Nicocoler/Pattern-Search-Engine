@@ -1504,7 +1504,8 @@ body {
   cursor: pointer;
 }
 
-.stock-search-dropdown button:hover {
+.stock-search-dropdown button:hover,
+.stock-search-dropdown button.stock-search-item-active {
   background: rgba(56, 189, 248, 0.12);
 }
 
